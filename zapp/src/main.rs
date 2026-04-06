@@ -11,7 +11,7 @@ use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 
 #[derive(Parser)]
-#[command(name = "zapp", version, about = "⚡ Flash ZSA keyboards")]
+#[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -20,11 +20,29 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Flash firmware from a local file or Oryx URL
+    #[command(
+        long_about = "Flash firmware from a local file or Oryx URL.\n\n\
+            Supports .bin (DFU) and .hex (Intel HEX) firmware files, as well as \
+            Oryx layout URLs. When given a URL, the firmware is downloaded and \
+            flashed directly.",
+        after_long_help = "Examples:\n  \
+            zapp flash firmware.bin\n  \
+            zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
+            zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
+    )]
     Flash {
-        /// Path to firmware file (.bin or .hex), or an Oryx URL (e.g. https://configure.zsa.io/voyager/layouts/default/latest/0)
+        /// Path to firmware file (.bin or .hex), or an Oryx URL.
         firmware: String,
     },
-    /// Check Oryx for updates and flash if available. Note that this only works if your keyboard is currently flashed with a firmware coming from Oryx and is not currently in bootloader mode.
+    /// Check Oryx for updates on your layout and flash if available
+    #[command(
+        long_about = "Check Oryx for updates on your layout and flash if available.\n\n\
+            Detects a connected ZSA keyboard, reads its layout and revision from the \
+            USB serial number, and checks Oryx for a newer firmware revision. If an \
+            update is available, it is downloaded and flashed automatically. \n\
+            Note: This only works if your keyboard is currently flashed with a firmware \
+            coming from Oryx and is not currently in bootloader mode."
+    )]
     Update,
 }
 
