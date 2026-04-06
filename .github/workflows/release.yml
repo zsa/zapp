@@ -104,7 +104,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           codesign --force --options runtime \
-            --sign "Developer ID Application: ZSA Technology Labs Inc ($APPLE_TEAM_ID)" \
+            --sign "Developer ID Application: ZSA Technology Labs Inc. ($APPLE_TEAM_ID)" \
             target/${{ matrix.target }}/release/zapp
 
       - name: Sign macOS binary (universal)
@@ -113,7 +113,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           codesign --force --options runtime \
-            --sign "Developer ID Application: ZSA Technology Labs Inc ($APPLE_TEAM_ID)" \
+            --sign "Developer ID Application: ZSA Technology Labs Inc. ($APPLE_TEAM_ID)" \
             target/universal/zapp
 
       - name: Notarize macOS binary
