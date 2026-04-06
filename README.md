@@ -1,4 +1,4 @@
-# ⚡ Zapp! Flash ZSA keyboards from the command line
+# ⚡ Zapp!
 
 A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 
@@ -57,7 +57,7 @@ All standard Oryx URL forms are supported:
 
 ### Update your current layout
 
-If your keyboard is already running an Oryx firmware, `zapp update` will check for a newer revision and flash it:
+If your keyboard is already running a firmware built with Oryx, `zapp update` will check for a newer revision and flash it:
 
 ```sh
 zapp update
