@@ -94,6 +94,10 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH
 
+      - name: Verify signing identity
+        if: runner.os == 'macOS'
+        run: security find-identity -v -p codesigning $RUNNER_TEMP/signing.keychain-db
+
       - name: Sign macOS binary
         if: runner.os == 'macOS' && matrix.target != 'universal-apple-darwin'
         env:
