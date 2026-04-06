@@ -1,0 +1,3 @@
+[workspace]
+members = ["zapp-core", "zapp"]
+resolver = "2"

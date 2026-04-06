@@ -1,0 +1,10 @@
+[package]
+name = "zapp-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures-lite = "2"
+log = "0.4"
+nusb = "0.2"
+thiserror = "2"
