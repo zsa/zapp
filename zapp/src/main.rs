@@ -83,7 +83,7 @@ fn cmd_flash_file(path: &PathBuf) -> Result<()> {
 ///   /voyager/layouts/:layoutId/latest
 ///   /voyager/layouts/:layoutId/latest/0
 ///   /voyager/layouts/:layoutId/:revisionId
-fn parse_oryx_url(url: &str) -> Result<(&str, Option<&str>)> {
+fn parse_oryx_url(url: &str) -> Result<(&str, &str, Option<&str>)> {
     let path = url
         .strip_prefix("https://configure.zsa.io/")
         .context("Not a valid Oryx URL")?;
@@ -95,6 +95,7 @@ fn parse_oryx_url(url: &str) -> Result<(&str, Option<&str>)> {
         bail!("Not a valid Oryx layout URL");
     }
 
+    let geometry = segments[0];
     let layout_id = segments[2];
 
     let revision_id = match segments.get(3) {
@@ -103,15 +104,20 @@ fn parse_oryx_url(url: &str) -> Result<(&str, Option<&str>)> {
         Some(rev) => Some(*rev),
     };
 
-    Ok((layout_id, revision_id))
+    Ok((geometry, layout_id, revision_id))
 }
 
-fn resolve_revision(layout_id: &str, revision_id: Option<&str>) -> Result<String> {
+fn resolve_revision(geometry: &str, layout_id: &str, revision_id: Option<&str>) -> Result<String> {
     if let Some(rev) = revision_id {
         return Ok(rev.to_string());
     }
 
-    let url = format!("https://oryx.zsa.io/firmware/latest/{layout_id}");
+    let url = if layout_id == "default" {
+        format!("https://oryx.zsa.io/firmware/latest/{geometry}/default")
+    } else {
+        format!("https://oryx.zsa.io/firmware/latest/{layout_id}")
+    };
+
     let resp: LatestResponse = reqwest::blocking::get(&url)
         .and_then(|r| r.error_for_status())
         .context("Failed to fetch latest revision")?
@@ -123,6 +129,22 @@ fn resolve_revision(layout_id: &str, revision_id: Option<&str>) -> Result<String
 
 fn download_firmware(revision_id: &str) -> Result<Firmware> {
     download_firmware_with_alt(revision_id, false)
+}
+
+fn download_firmware_collated(revision_id: &str) -> Result<Firmware> {
+    let download_url = format!("https://oryx.zsa.io/firmware/{revision_id}?collate=true");
+
+    let spinner = new_spinner("Downloading firmware...");
+
+    let fw_bytes = reqwest::blocking::get(&download_url)
+        .and_then(|r| r.error_for_status())
+        .context("Failed to download firmware")?
+        .bytes()
+        .context("Failed to read firmware bytes")?;
+
+    spinner.finish_and_clear();
+
+    firmware::load_firmware_from_bytes(&fw_bytes).context("Failed to parse downloaded firmware")
 }
 
 fn download_firmware_with_alt(revision_id: &str, alt: bool) -> Result<Firmware> {
@@ -145,12 +167,16 @@ fn download_firmware_with_alt(revision_id: &str, alt: bool) -> Result<Firmware> 
 }
 
 fn cmd_flash_url(url: &str) -> Result<()> {
-    let (layout_id, revision_id) = parse_oryx_url(url)?;
-    let revision = resolve_revision(layout_id, revision_id)?;
+    let (geometry, layout_id, revision_id) = parse_oryx_url(url)?;
+    let revision = resolve_revision(geometry, layout_id, revision_id)?;
 
     println!("Layout: {layout_id}, revision: {revision}");
 
-    let fw = download_firmware(&revision)?;
+    let fw = if geometry == "moonlander" {
+        download_firmware_collated(&revision)?
+    } else {
+        download_firmware(&revision)?
+    };
     print_firmware_info(&fw);
     wait_and_flash(&fw)
 }
@@ -286,39 +312,44 @@ mod tests {
 
     #[test]
     fn test_parse_oryx_url_bare_layout() {
-        let (layout, rev) = parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde").unwrap();
+        let (geo, layout, rev) = parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde").unwrap();
+        assert_eq!(geo, "voyager");
         assert_eq!(layout, "abcde");
         assert_eq!(rev, None);
     }
 
     #[test]
     fn test_parse_oryx_url_latest() {
-        let (layout, rev) =
+        let (geo, layout, rev) =
             parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/latest").unwrap();
+        assert_eq!(geo, "voyager");
         assert_eq!(layout, "abcde");
         assert_eq!(rev, None);
     }
 
     #[test]
     fn test_parse_oryx_url_latest_with_zero() {
-        let (layout, rev) =
+        let (geo, layout, rev) =
             parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/latest/0").unwrap();
+        assert_eq!(geo, "voyager");
         assert_eq!(layout, "abcde");
         assert_eq!(rev, None);
     }
 
     #[test]
     fn test_parse_oryx_url_specific_revision() {
-        let (layout, rev) =
+        let (geo, layout, rev) =
             parse_oryx_url("https://configure.zsa.io/moonlander/layouts/AbCdE/abc123").unwrap();
+        assert_eq!(geo, "moonlander");
         assert_eq!(layout, "AbCdE");
         assert_eq!(rev, Some("abc123"));
     }
 
     #[test]
     fn test_parse_oryx_url_trailing_slash() {
-        let (layout, rev) =
+        let (geo, layout, rev) =
             parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/").unwrap();
+        assert_eq!(geo, "voyager");
         assert_eq!(layout, "abcde");
         assert_eq!(rev, None);
     }
