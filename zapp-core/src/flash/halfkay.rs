@@ -32,21 +32,21 @@ pub fn flash_halfkay(
         }
     };
 
-    let interface = device.device.claim_interface(0).wait()?;
+    let interface = device.device.detach_and_claim_interface(0).wait()?;
 
     // Write firmware in 128-byte sectors
     let mut addr: u32 = 0;
     while addr < ERGODOX_MEM_SIZE as u32 {
-        // Build packet: [report_id=0x00, addr_lo, addr_hi, ...128 bytes of firmware...]
-        let mut buf = vec![0u8; ERGODOX_SECTOR_SIZE + 3];
-        buf[0] = 0x00; // report ID
-        buf[1] = (addr & 0xFF) as u8;
-        buf[2] = ((addr >> 8) & 0xFF) as u8;
+        // Build packet: [addr_lo, addr_hi, ...128 bytes of firmware...]
+        // Report ID 0 is already encoded in wValue (0x0200) of the control transfer.
+        let mut buf = vec![0u8; ERGODOX_SECTOR_SIZE + 2];
+        buf[0] = (addr & 0xFF) as u8;
+        buf[1] = ((addr >> 8) & 0xFF) as u8;
 
         // Fill sector data from firmware (pad with 0xFF if beyond firmware end)
         let start = addr as usize;
         for i in 0..ERGODOX_SECTOR_SIZE {
-            buf[i + 3] = if start + i < firmware_data.len() {
+            buf[i + 2] = if start + i < firmware_data.len() {
                 firmware_data[start + i]
             } else {
                 0xFF
@@ -77,10 +77,9 @@ pub fn flash_halfkay(
 
     // Send reboot packet (addr = 0xFFFF)
     on_progress(FlashProgress::Resetting);
-    let mut reboot_buf = vec![0u8; ERGODOX_SECTOR_SIZE + 3];
-    reboot_buf[0] = 0x00;
+    let mut reboot_buf = vec![0u8; ERGODOX_SECTOR_SIZE + 2];
+    reboot_buf[0] = 0xFF;
     reboot_buf[1] = 0xFF;
-    reboot_buf[2] = 0xFF;
     // Reboot errors are non-fatal (device disconnects)
     let _ = send_with_retries(&interface, &reboot_buf, true);
 

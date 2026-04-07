@@ -92,7 +92,7 @@ pub fn flash_dfu(
         )));
     }
 
-    let interface = device.device.claim_interface(0).wait()?;
+    let interface = device.device.detach_and_claim_interface(0).wait()?;
 
     let mut status = DfuStatus::default();
 
