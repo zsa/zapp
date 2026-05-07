@@ -1,4 +1,4 @@
-# ⚡ Zapp!
+# ⚡ Zapp
 
 A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 
@@ -11,6 +11,14 @@ A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 - Planck EZ (including Standard and Glow variants)
 
 ## Installation
+
+You can download the latest version of zapp from the [releases](https://github.com/zsa/zapp/releases) page.
+
+### macOS with Homebrew
+
+```sh
+brew install zapp
+```
 
 ### From source
 
@@ -48,11 +56,11 @@ zapp flash https://configure.zsa.io/moonlander/layouts/AbCdE/abc123
 
 All standard Oryx URL forms are supported:
 
-| URL form | Behavior |
-|---|---|
-| `.../layouts/:layoutId` | Fetches the latest revision |
-| `.../layouts/:layoutId/latest` | Fetches the latest revision |
-| `.../layouts/:layoutId/latest/0` | Fetches the latest revision |
+| URL form                            | Behavior                       |
+| ----------------------------------- | ------------------------------ |
+| `.../layouts/:layoutId`             | Fetches the latest revision    |
+| `.../layouts/:layoutId/latest`      | Fetches the latest revision    |
+| `.../layouts/:layoutId/latest/0`    | Fetches the latest revision    |
 | `.../layouts/:layoutId/:revisionId` | Fetches that specific revision |
 
 ### Update your current layout
@@ -79,10 +87,10 @@ _ Waiting for keyboard in bootloader mode...
 
 ## Firmware formats
 
-| Format | Extension | Keyboards |
-|---|---|---|
-| DFU binary | `.bin` | Voyager, Moonlander, Planck EZ, Ergodox EZ (Ignition) |
-| Intel HEX | `.hex` | Ergodox EZ (original, HALFKAY) |
+| Format     | Extension | Keyboards                                             |
+| ---------- | --------- | ----------------------------------------------------- |
+| DFU binary | `.bin`    | Voyager, Moonlander, Planck EZ, Ergodox EZ (Ignition) |
+| Intel HEX  | `.hex`    | Ergodox EZ (original, HALFKAY)                        |
 
 Dual-firmware files (e.g., Moonlander rev A + rev B, Voyager STM32 + GD32) are detected and handled automatically.
 
