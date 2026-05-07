@@ -12,6 +12,8 @@ A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 
 ## Installation
 
+You can download the latest version of zapp from the [releases](https://github.com/zsa/zapp/releases) page.
+
 ### macOS with Homebrew
 
 ```sh
