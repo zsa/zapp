@@ -1,4 +1,4 @@
-# ⚡ Zapp!
+# ⚡ Zapp
 
 A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 
@@ -12,11 +12,81 @@ A cross-platform CLI tool for flashing [ZSA](https://www.zsa.io) keyboards.
 
 ## Installation
 
+You can download the latest version of zapp from the [releases](https://github.com/zsa/zapp/releases) page.
+
+### macOS with Homebrew
+
+```sh
+brew install zapp
+```
+
 ### From source
 
 ```sh
 cargo install --path zapp
 ```
+
+### Nix
+
+#### Flakes
+
+Run without installing:
+
+```sh
+nix run github:zsa/zapp -- flash firmware.bin
+```
+
+Install into a profile:
+
+```sh
+nix profile install github:zsa/zapp
+```
+
+On NixOS, the flake exposes a module that installs the binary and registers the udev rules system-wide:
+
+```nix
+{
+  inputs.zapp.url = "github:zsa/zapp";
+
+  outputs = { self, nixpkgs, zapp, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        zapp.nixosModules.default
+        { programs.zapp.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+An overlay is also available (`zapp.overlays.default`) which adds `pkgs.zapp` to nixpkgs.
+
+A `nix develop` shell with the Rust toolchain and `nixfmt` is provided for hacking on the flake itself.
+
+#### Without flakes
+
+The repository ships a top-level `default.nix` and `shell.nix`, so `nix-build` / `nix-shell` work directly against a checkout:
+
+```sh
+nix-build      # builds the package, symlinked at ./result
+nix-shell      # dev shell with the Rust toolchain
+```
+
+To consume from another non-flake config, import the overlay or the package directly:
+
+```nix
+# configuration.nix
+{ pkgs, ... }:
+let
+  zapp = import (builtins.fetchTarball "https://github.com/zsa/zapp/archive/main.tar.gz") { inherit pkgs; };
+in {
+  environment.systemPackages = [ zapp ];
+  services.udev.packages = [ zapp ];
+}
+```
+
+Or pin via `niv` / `npins` and import `nix/overlay.nix` into your nixpkgs config.
 
 ### Linux: udev rules
 
@@ -48,11 +118,11 @@ zapp flash https://configure.zsa.io/moonlander/layouts/AbCdE/abc123
 
 All standard Oryx URL forms are supported:
 
-| URL form | Behavior |
-|---|---|
-| `.../layouts/:layoutId` | Fetches the latest revision |
-| `.../layouts/:layoutId/latest` | Fetches the latest revision |
-| `.../layouts/:layoutId/latest/0` | Fetches the latest revision |
+| URL form                            | Behavior                       |
+| ----------------------------------- | ------------------------------ |
+| `.../layouts/:layoutId`             | Fetches the latest revision    |
+| `.../layouts/:layoutId/latest`      | Fetches the latest revision    |
+| `.../layouts/:layoutId/latest/0`    | Fetches the latest revision    |
 | `.../layouts/:layoutId/:revisionId` | Fetches that specific revision |
 
 ### Update your current layout
@@ -79,10 +149,10 @@ _ Waiting for keyboard in bootloader mode...
 
 ## Firmware formats
 
-| Format | Extension | Keyboards |
-|---|---|---|
-| DFU binary | `.bin` | Voyager, Moonlander, Planck EZ, Ergodox EZ (Ignition) |
-| Intel HEX | `.hex` | Ergodox EZ (original, HALFKAY) |
+| Format     | Extension | Keyboards                                             |
+| ---------- | --------- | ----------------------------------------------------- |
+| DFU binary | `.bin`    | Voyager, Moonlander, Planck EZ, Ergodox EZ (Ignition) |
+| Intel HEX  | `.hex`    | Ergodox EZ (original, HALFKAY)                        |
 
 Dual-firmware files (e.g., Moonlander rev A + rev B, Voyager STM32 + GD32) are detected and handled automatically.
 
