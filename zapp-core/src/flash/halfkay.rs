@@ -1,15 +1,11 @@
 use std::time::Duration;
 
-use nusb::transfer::ControlOut;
-use nusb::transfer::ControlType;
-use nusb::transfer::Recipient;
-use nusb::MaybeFuture;
+use hidapi::{HidApi, HidDevice};
 
 use crate::device::BootloaderDevice;
+use crate::device::ids::{HALFKAY_PID, HALFKAY_VID};
 use crate::firmware::Firmware;
 use crate::ZappError;
-
-const USB_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::FlashProgress;
 
@@ -18,8 +14,12 @@ const ERGODOX_SECTOR_SIZE: usize = 128;
 const PACKET_RETRIES: usize = 5;
 
 /// Flash a device using the HALFKAY protocol (legacy Ergodox EZ).
+///
+/// Uses hidapi instead of the device's nusb handle so the transport works on
+/// Windows, where the HALFKAY bootloader enumerates as HID and the kernel HID
+/// driver prevents libusb-style access.
 pub fn flash_halfkay(
-    device: &BootloaderDevice,
+    _device: &BootloaderDevice,
     firmware: &Firmware,
     on_progress: &dyn Fn(FlashProgress),
 ) -> Result<(), ZappError> {
@@ -32,21 +32,22 @@ pub fn flash_halfkay(
         }
     };
 
-    let interface = device.device.detach_and_claim_interface(0).wait()?;
+    let api = HidApi::new()?;
+    let hid = api.open(HALFKAY_VID, HALFKAY_PID)?;
 
     // Write firmware in 128-byte sectors
     let mut addr: u32 = 0;
     while addr < ERGODOX_MEM_SIZE as u32 {
-        // Build packet: [addr_lo, addr_hi, ...128 bytes of firmware...]
-        // Report ID 0 is already encoded in wValue (0x0200) of the control transfer.
-        let mut buf = vec![0u8; ERGODOX_SECTOR_SIZE + 2];
-        buf[0] = (addr & 0xFF) as u8;
-        buf[1] = ((addr >> 8) & 0xFF) as u8;
+        // HID output report: [report_id=0, addr_lo, addr_hi, ...128 firmware bytes]
+        let mut buf = vec![0u8; ERGODOX_SECTOR_SIZE + 3];
+        buf[0] = 0; // report ID (unnumbered)
+        buf[1] = (addr & 0xFF) as u8;
+        buf[2] = ((addr >> 8) & 0xFF) as u8;
 
         // Fill sector data from firmware (pad with 0xFF if beyond firmware end)
         let start = addr as usize;
         for i in 0..ERGODOX_SECTOR_SIZE {
-            buf[i + 2] = if start + i < firmware_data.len() {
+            buf[i + 3] = if start + i < firmware_data.len() {
                 firmware_data[start + i]
             } else {
                 0xFF
@@ -55,8 +56,7 @@ pub fn flash_halfkay(
 
         log::debug!("HALFKAY: writing sector at {:#06x}", addr);
 
-        // Send with retries via HID SET_REPORT control transfer
-        send_with_retries(&interface, &buf, false)?;
+        send_with_retries(&hid, &buf, false)?;
 
         // First block needs extra time for erase
         if addr == 0 {
@@ -77,36 +77,20 @@ pub fn flash_halfkay(
 
     // Send reboot packet (addr = 0xFFFF)
     on_progress(FlashProgress::Resetting);
-    let mut reboot_buf = vec![0u8; ERGODOX_SECTOR_SIZE + 2];
-    reboot_buf[0] = 0xFF;
+    let mut reboot_buf = vec![0u8; ERGODOX_SECTOR_SIZE + 3];
+    reboot_buf[0] = 0;
     reboot_buf[1] = 0xFF;
-    // Reboot errors are non-fatal (device disconnects)
-    let _ = send_with_retries(&interface, &reboot_buf, true);
+    reboot_buf[2] = 0xFF;
+    // Reboot errors are non-fatal (device disconnects mid-transfer)
+    let _ = send_with_retries(&hid, &reboot_buf, true);
 
     on_progress(FlashProgress::Complete);
     Ok(())
 }
 
-fn send_with_retries(
-    interface: &nusb::Interface,
-    buf: &[u8],
-    silent: bool,
-) -> Result<(), ZappError> {
+fn send_with_retries(hid: &HidDevice, buf: &[u8], silent: bool) -> Result<(), ZappError> {
     for attempt in 0..PACKET_RETRIES {
-        // HID SET_REPORT: bmRequestType=0x21 (class, host-to-device, interface)
-        // bRequest=0x09 (SET_REPORT), wValue=0x0200 (output report, report ID 0)
-        let result = interface
-            .control_out(ControlOut {
-                control_type: ControlType::Class,
-                recipient: Recipient::Interface,
-                request: 0x09, // HID SET_REPORT
-                value: 0x0200, // Output report, report ID 0
-                index: 0,
-                data: buf,
-            }, USB_TIMEOUT)
-            .wait();
-
-        match result {
+        match hid.write(buf) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if !silent {

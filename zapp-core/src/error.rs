@@ -8,6 +8,9 @@ pub enum ZappError {
     #[error("USB transfer error: {0}")]
     Transfer(#[from] nusb::transfer::TransferError),
 
+    #[error("HID error: {0}")]
+    Hid(#[from] hidapi::HidError),
+
     #[error("DFU error: {0}")]
     Dfu(String),
 
