@@ -26,6 +26,68 @@ brew install zapp
 cargo install --path zapp
 ```
 
+### Nix
+
+#### Flakes
+
+Run without installing:
+
+```sh
+nix run github:zsa/zapp -- flash firmware.bin
+```
+
+Install into a profile:
+
+```sh
+nix profile install github:zsa/zapp
+```
+
+On NixOS, the flake exposes a module that installs the binary and registers the udev rules system-wide:
+
+```nix
+{
+  inputs.zapp.url = "github:zsa/zapp";
+
+  outputs = { self, nixpkgs, zapp, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        zapp.nixosModules.default
+        { programs.zapp.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+An overlay is also available (`zapp.overlays.default`) which adds `pkgs.zapp` to nixpkgs.
+
+A `nix develop` shell with the Rust toolchain and `nixfmt` is provided for hacking on the flake itself.
+
+#### Without flakes
+
+The repository ships a top-level `default.nix` and `shell.nix`, so `nix-build` / `nix-shell` work directly against a checkout:
+
+```sh
+nix-build      # builds the package, symlinked at ./result
+nix-shell      # dev shell with the Rust toolchain
+```
+
+To consume from another non-flake config, import the overlay or the package directly:
+
+```nix
+# configuration.nix
+{ pkgs, ... }:
+let
+  zapp = import (builtins.fetchTarball "https://github.com/zsa/zapp/archive/main.tar.gz") { inherit pkgs; };
+in {
+  environment.systemPackages = [ zapp ];
+  services.udev.packages = [ zapp ];
+}
+```
+
+Or pin via `niv` / `npins` and import `nix/overlay.nix` into your nixpkgs config.
+
 ### Linux: udev rules
 
 On Linux, you need udev rules to access USB devices without root:

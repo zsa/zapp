@@ -5,3 +5,7 @@
 *~
 .idea/
 .vscode/
+
+# nix
+result
+.direnv
