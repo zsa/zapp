@@ -20,6 +20,13 @@ You can download the latest version of zapp from the [releases](https://github.c
 brew install zapp
 ```
 
+### openSUSE
+
+```sh
+zypper ar obs://hardware obs-hardware
+zypper in zapp
+```
+
 ### From source
 
 ```sh
