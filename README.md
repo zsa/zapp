@@ -27,6 +27,14 @@ zypper ar obs://hardware obs-hardware
 zypper in zapp
 ```
 
+### Arch Linux
+
+Using an AUR helper like `yay` or `paru` *(handles udev rules)*:
+
+```sh
+paru -Sy zsa-zapp-git   # build from latest commit
+```
+
 ### From source
 
 ```sh
