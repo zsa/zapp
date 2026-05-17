@@ -38,7 +38,7 @@
       nixosModules.default =
         { pkgs, ... }:
         {
-          imports = [ ./nix/nixos-module.nix ];
+          imports = [ ./nix/module.nix ];
           programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
         };
     };
