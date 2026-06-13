@@ -41,6 +41,12 @@ paru -Sy zsa-zapp-git   # build from latest commit
 cargo install --path zapp
 ```
 
+### As pre-built binaries from GitHub Releases with mise
+
+```sh
+mise use -g github:zsa/zapp
+```
+
 ### Nix
 
 #### Flakes
