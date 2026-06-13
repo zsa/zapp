@@ -39,7 +39,7 @@
         { pkgs, ... }:
         {
           imports = [ ./nix/module.nix ];
-          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
     };
 }
