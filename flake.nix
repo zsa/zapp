@@ -39,14 +39,14 @@
       nixosModules.default =
         { pkgs, ... }:
         {
-          imports = [ ./nix/module.nix ];
+          imports = [ ./nix/module/nixos ];
           programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
         };
 
       darwinModules.default =
         { pkgs, ... }:
         {
-          imports = [ ./nix/module.nix ];
+          imports = [ ./nix/module/darwin ];
           programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
         };
     };

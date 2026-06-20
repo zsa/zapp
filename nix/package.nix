@@ -31,7 +31,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ libusb1 ];
 
-  postInstall = lib.optionalString (!stdenv.isDarwin) ''
+  postInstall = lib.optionalString stdenv.isLinux ''
     install -Dm644 udev/50-zsa.rules $out/lib/udev/rules.d/50-zsa.rules
   '';
 
