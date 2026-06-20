@@ -20,6 +20,8 @@ You can download the latest version of zapp from the [releases](https://github.c
 brew install zapp
 ```
 
+nix-darwin is also supported. See the [Nix flakes](#flakes) section below for details.
+
 ### openSUSE
 
 ```sh
