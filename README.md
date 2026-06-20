@@ -75,6 +75,26 @@ On NixOS, the flake exposes a module that installs the binary and registers the 
 }
 ```
 
+On nix-darwin, the flake exposes a module that installs the binary:
+
+```nix
+{
+  inputs.zapp.url = "github:zsa/zapp";
+
+  outputs = { self, nixpkgs, zapp, ... }: {
+    darwinConfigurations.my-host = nix-darwin.lib.darwinSystem {
+      system = "aarch64-darwin";
+      modules = [
+        zapp.darwinModules.default
+        { programs.zapp.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+(Adjust nix-darwin.lib.darwinSystem to match your nix-darwin input.)
+
 An overlay is also available (`zapp.overlays.default`) which adds `pkgs.zapp` to nixpkgs.
 
 A `nix develop` shell with the Rust toolchain and `nixfmt` is provided for hacking on the flake itself.
