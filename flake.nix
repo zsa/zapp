@@ -9,6 +9,7 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
@@ -36,6 +37,13 @@
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
 
       nixosModules.default =
+        { pkgs, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+
+      darwinModules.default =
         { pkgs, ... }:
         {
           imports = [ ./nix/module.nix ];
