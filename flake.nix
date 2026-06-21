@@ -23,7 +23,7 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.system}.zapp ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.zapp ];
           packages = [
             pkgs.cargo
             pkgs.rustc
@@ -40,14 +40,14 @@
         { pkgs, ... }:
         {
           imports = [ ./nix/module/nixos ];
-          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
 
       darwinModules.default =
         { pkgs, ... }:
         {
           imports = [ ./nix/module/darwin ];
-          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
     };
 }
