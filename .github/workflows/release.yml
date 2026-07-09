@@ -189,6 +189,10 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
@@ -198,6 +202,11 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "artifacts/*"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
