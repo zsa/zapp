@@ -1,3 +1,3 @@
 [workspace]
-members = ["zapp-core", "zapp"]
+members = ["zapp-core", "zapp", "zapp-oryx"]
 resolver = "2"

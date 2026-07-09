@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use hidapi::{HidApi, HidDevice};
 
+use crate::ZappError;
 use crate::device::BootloaderDevice;
 use crate::device::ids::{HALFKAY_PID, HALFKAY_VID};
 use crate::firmware::Firmware;
-use crate::ZappError;
 
 use super::FlashProgress;
 

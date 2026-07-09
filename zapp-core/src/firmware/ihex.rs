@@ -5,8 +5,8 @@ use crate::ZappError;
 /// The result is a byte vector covering addresses 0 through the highest
 /// address found in the HEX records, with gaps filled with 0xFF.
 pub fn parse_ihex(data: &[u8]) -> Result<Vec<u8>, ZappError> {
-    let text =
-        std::str::from_utf8(data).map_err(|_| ZappError::InvalidFirmware("invalid UTF-8 in HEX file".into()))?;
+    let text = std::str::from_utf8(data)
+        .map_err(|_| ZappError::InvalidFirmware("invalid UTF-8 in HEX file".into()))?;
 
     let mut result: Vec<u8> = Vec::new();
     let mut base_address: u32 = 0;
@@ -63,15 +63,13 @@ pub fn parse_ihex(data: &[u8]) -> Result<Vec<u8>, ZappError> {
             // Extended linear address
             0x04 => {
                 if byte_count == 2 {
-                    base_address =
-                        (u16::from_be_bytes([bytes[4], bytes[5]]) as u32) << 16;
+                    base_address = (u16::from_be_bytes([bytes[4], bytes[5]]) as u32) << 16;
                 }
             }
             // Extended segment address
             0x02 => {
                 if byte_count == 2 {
-                    base_address =
-                        (u16::from_be_bytes([bytes[4], bytes[5]]) as u32) << 4;
+                    base_address = (u16::from_be_bytes([bytes[4], bytes[5]]) as u32) << 4;
                 }
             }
             // Start linear address / start segment address — ignored

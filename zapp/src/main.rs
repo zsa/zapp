@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Deserialize;
 
 use zapp_core::device::ids::{is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
+use zapp_oryx::FirmwareVariant;
 
 #[derive(Parser)]
 #[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
@@ -46,11 +46,6 @@ enum Commands {
     Update,
 }
 
-#[derive(Deserialize)]
-struct LatestResponse {
-    latest: String,
-}
-
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp(None)
@@ -60,7 +55,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Flash { firmware } => {
-            if firmware.starts_with("https://configure.zsa.io/") {
+            if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
             } else {
                 cmd_flash_file(&PathBuf::from(firmware))
@@ -76,107 +71,30 @@ fn cmd_flash_file(path: &PathBuf) -> Result<()> {
     wait_and_flash(&fw)
 }
 
-/// Parse an Oryx URL into (layoutId, Option<revisionId>).
-///
-/// Accepted forms:
-///   /voyager/layouts/:layoutId
-///   /voyager/layouts/:layoutId/latest
-///   /voyager/layouts/:layoutId/latest/0
-///   /voyager/layouts/:layoutId/:revisionId
-fn parse_oryx_url(url: &str) -> Result<(&str, &str, Option<&str>)> {
-    let path = url
-        .strip_prefix("https://configure.zsa.io/")
-        .context("Not a valid Oryx URL")?;
-
-    // segments: ["voyager", "layouts", ":layoutId", ...optional...]
-    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
-
-    if segments.len() < 3 || segments[1] != "layouts" {
-        bail!("Not a valid Oryx layout URL");
-    }
-
-    let geometry = segments[0];
-    let layout_id = segments[2];
-
-    let revision_id = match segments.get(3) {
-        None => None,
-        Some(&"latest") => None,
-        Some(rev) => Some(*rev),
-    };
-
-    Ok((geometry, layout_id, revision_id))
-}
-
-fn resolve_revision(geometry: &str, layout_id: &str, revision_id: Option<&str>) -> Result<String> {
-    if let Some(rev) = revision_id {
-        return Ok(rev.to_string());
-    }
-
-    let url = if layout_id == "default" {
-        format!("https://oryx.zsa.io/firmware/latest/{geometry}/default")
-    } else {
-        format!("https://oryx.zsa.io/firmware/latest/{layout_id}")
-    };
-
-    let resp: LatestResponse = reqwest::blocking::get(&url)
-        .and_then(|r| r.error_for_status())
-        .context("Failed to fetch latest revision")?
-        .json()
-        .context("Failed to parse latest revision response")?;
-
-    Ok(resp.latest)
-}
-
-fn download_firmware(revision_id: &str) -> Result<Firmware> {
-    download_firmware_with_alt(revision_id, false)
-}
-
-fn download_firmware_collated(revision_id: &str) -> Result<Firmware> {
-    let download_url = format!("https://oryx.zsa.io/firmware/{revision_id}?collate=true");
-
+/// Download a revision's firmware, showing a spinner while it transfers.
+fn download_firmware(revision_id: &str, variant: FirmwareVariant) -> Result<Firmware> {
     let spinner = new_spinner("Downloading firmware...");
-
-    let fw_bytes = reqwest::blocking::get(&download_url)
-        .and_then(|r| r.error_for_status())
-        .context("Failed to download firmware")?
-        .bytes()
-        .context("Failed to read firmware bytes")?;
-
+    let fw = zapp_oryx::download_firmware(revision_id, variant);
     spinner.finish_and_clear();
 
-    firmware::load_firmware_from_bytes(&fw_bytes).context("Failed to parse downloaded firmware")
-}
-
-fn download_firmware_with_alt(revision_id: &str, alt: bool) -> Result<Firmware> {
-    let mut download_url = format!("https://oryx.zsa.io/firmware/{revision_id}");
-    if alt {
-        download_url.push_str("?alt=true");
-    }
-
-    let spinner = new_spinner("Downloading firmware...");
-
-    let fw_bytes = reqwest::blocking::get(&download_url)
-        .and_then(|r| r.error_for_status())
-        .context("Failed to download firmware")?
-        .bytes()
-        .context("Failed to read firmware bytes")?;
-
-    spinner.finish_and_clear();
-
-    firmware::load_firmware_from_bytes(&fw_bytes).context("Failed to parse downloaded firmware")
+    fw.context("Failed to download firmware")
 }
 
 fn cmd_flash_url(url: &str) -> Result<()> {
-    let (geometry, layout_id, revision_id) = parse_oryx_url(url)?;
-    let revision = resolve_revision(geometry, layout_id, revision_id)?;
+    let (geometry, layout_id, revision_id) = zapp_oryx::parse_url(url)?;
+    let revision = zapp_oryx::resolve_revision(geometry, layout_id, revision_id)
+        .context("Failed to fetch latest revision")?;
 
     println!("Layout: {layout_id}, revision: {revision}");
 
-    let fw = if geometry == "moonlander" {
-        download_firmware_collated(&revision)?
+    // The Moonlander's two halves ship as one collated image.
+    let variant = if geometry == "moonlander" {
+        FirmwareVariant::Collated
     } else {
-        download_firmware(&revision)?
+        FirmwareVariant::Standard
     };
+
+    let fw = download_firmware(&revision, variant)?;
     print_firmware_info(&fw);
     wait_and_flash(&fw)
 }
@@ -200,27 +118,45 @@ fn cmd_update() -> Result<()> {
 
     println!("Layout: {layout_id}, revision: {revision_id}");
 
-    // Check for latest revision
-    let url = format!("https://oryx.zsa.io/firmware/latest/{layout_id}");
-    let resp: LatestResponse = reqwest::blocking::get(&url)
-        .and_then(|r| r.error_for_status())
-        .context("Failed to check for updates")?
-        .json()
-        .context("Failed to parse update response")?;
+    let latest =
+        zapp_oryx::fetch_latest_revision(layout_id).context("Failed to check for updates")?;
 
-    if revision_id == resp.latest {
+    if revision_id == latest {
         println!("Firmware is already up to date.");
         return Ok(());
     }
 
-    println!(
-        "Update available: {} → {}",
-        revision_id, resp.latest
-    );
+    println!("Update available: {revision_id} → {latest}");
 
-    let fw = download_firmware_with_alt(&resp.latest, is_moonlander_revb(connected.pid))?;
+    let geometry = zapp_oryx::geometry_for(connected.keyboard, connected.pid);
+    print_revision_note("current", layout_id, revision_id, geometry);
+    print_revision_note("update", layout_id, &latest, geometry);
+
+    let variant = if is_moonlander_revb(connected.pid) {
+        FirmwareVariant::Alternate
+    } else {
+        FirmwareVariant::Standard
+    };
+
+    let fw = download_firmware(&latest, variant)?;
     print_firmware_info(&fw);
     wait_and_flash(&fw)
+}
+
+/// Print the commit message attached to a revision. A revision may carry no
+/// message, and a note is never worth failing an update over, so both cases
+/// print the same placeholder.
+fn print_revision_note(label: &str, layout_id: &str, revision_id: &str, geometry: &str) {
+    let note = match zapp_oryx::fetch_revision_note(layout_id, revision_id, geometry) {
+        Ok(note) => note,
+        Err(e) => {
+            log::debug!("Could not fetch note for revision {revision_id}: {e}");
+            None
+        }
+    };
+
+    let note = note.as_deref().unwrap_or("(no note)");
+    println!("  {label:<7} {revision_id}: {note}");
 }
 
 fn print_firmware_info(fw: &Firmware) {
@@ -304,63 +240,4 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
     .context("Flash failed")?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_oryx_url_bare_layout() {
-        let (geo, layout, rev) = parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde").unwrap();
-        assert_eq!(geo, "voyager");
-        assert_eq!(layout, "abcde");
-        assert_eq!(rev, None);
-    }
-
-    #[test]
-    fn test_parse_oryx_url_latest() {
-        let (geo, layout, rev) =
-            parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/latest").unwrap();
-        assert_eq!(geo, "voyager");
-        assert_eq!(layout, "abcde");
-        assert_eq!(rev, None);
-    }
-
-    #[test]
-    fn test_parse_oryx_url_latest_with_zero() {
-        let (geo, layout, rev) =
-            parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/latest/0").unwrap();
-        assert_eq!(geo, "voyager");
-        assert_eq!(layout, "abcde");
-        assert_eq!(rev, None);
-    }
-
-    #[test]
-    fn test_parse_oryx_url_specific_revision() {
-        let (geo, layout, rev) =
-            parse_oryx_url("https://configure.zsa.io/moonlander/layouts/AbCdE/abc123").unwrap();
-        assert_eq!(geo, "moonlander");
-        assert_eq!(layout, "AbCdE");
-        assert_eq!(rev, Some("abc123"));
-    }
-
-    #[test]
-    fn test_parse_oryx_url_trailing_slash() {
-        let (geo, layout, rev) =
-            parse_oryx_url("https://configure.zsa.io/voyager/layouts/abcde/").unwrap();
-        assert_eq!(geo, "voyager");
-        assert_eq!(layout, "abcde");
-        assert_eq!(rev, None);
-    }
-
-    #[test]
-    fn test_parse_oryx_url_invalid_prefix() {
-        assert!(parse_oryx_url("https://example.com/voyager/layouts/abcde").is_err());
-    }
-
-    #[test]
-    fn test_parse_oryx_url_missing_layouts_segment() {
-        assert!(parse_oryx_url("https://configure.zsa.io/voyager/abcde").is_err());
-    }
 }

@@ -1,10 +1,13 @@
 use std::time::Duration;
 
 use futures_lite::StreamExt;
-use nusb::hotplug::HotplugEvent;
 use nusb::MaybeFuture;
+use nusb::hotplug::HotplugEvent;
 
-use super::ids::{identify_bootloader, identify_keyboard, keyboard_for_bootloader, BootloaderDevice, BootloaderKind, Keyboard};
+use super::ids::{
+    BootloaderDevice, BootloaderKind, Keyboard, identify_bootloader, identify_keyboard,
+    keyboard_for_bootloader,
+};
 use crate::ZappError;
 
 /// A ZSA keyboard detected in normal (non-bootloader) mode.

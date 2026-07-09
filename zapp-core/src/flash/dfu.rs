@@ -1,14 +1,14 @@
 use std::time::Duration;
 
+use nusb::MaybeFuture;
 use nusb::transfer::ControlIn;
 use nusb::transfer::ControlOut;
 use nusb::transfer::ControlType;
 use nusb::transfer::Recipient;
-use nusb::MaybeFuture;
 
+use crate::ZappError;
 use crate::device::BootloaderDevice;
 use crate::firmware::Firmware;
-use crate::ZappError;
 
 use super::FlashProgress;
 
@@ -131,10 +131,7 @@ pub fn flash_dfu(
     }
 
     // Write firmware
-    log::info!(
-        "DFU: writing {} bytes of firmware",
-        firmware_data.len()
-    );
+    log::info!("DFU: writing {} bytes of firmware", firmware_data.len());
     let mut written = 0usize;
     while written < firmware_data.len() {
         let page_addr = start_address + written as u32;
@@ -146,7 +143,11 @@ pub fn flash_dfu(
         dfu_command(&interface, &mut status, DFU_SET_ADDRESS, page_addr)?;
 
         // Download data block (wValue=2)
-        dfu_download(&interface, &mut status, &firmware_data[written..written + chunk_size])?;
+        dfu_download(
+            &interface,
+            &mut status,
+            &firmware_data[written..written + chunk_size],
+        )?;
 
         written += chunk_size;
         on_progress(FlashProgress::Writing {
@@ -170,28 +171,29 @@ pub fn flash_dfu(
     Ok(())
 }
 
-fn dfu_get_status(
-    interface: &nusb::Interface,
-    status: &mut DfuStatus,
-) -> Result<(), ZappError> {
+fn dfu_get_status(interface: &nusb::Interface, status: &mut DfuStatus) -> Result<(), ZappError> {
     let buf = interface
-        .control_in(ControlIn {
-            control_type: ControlType::Class,
-            recipient: Recipient::Interface,
-            request: DFU_GETSTATUS,
-            value: 0,
-            index: 0,
-            length: 6,
-        }, USB_TIMEOUT)
+        .control_in(
+            ControlIn {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: DFU_GETSTATUS,
+                value: 0,
+                index: 0,
+                length: 6,
+            },
+            USB_TIMEOUT,
+        )
         .wait()?;
 
     if buf.len() < 6 {
-        return Err(ZappError::Dfu("GETSTATUS returned fewer than 6 bytes".into()));
+        return Err(ZappError::Dfu(
+            "GETSTATUS returned fewer than 6 bytes".into(),
+        ));
     }
 
     status.b_status = buf[0];
-    status.bw_poll_timeout =
-        buf[1] as u32 | (buf[2] as u32) << 8 | (buf[3] as u32) << 16;
+    status.bw_poll_timeout = buf[1] as u32 | (buf[2] as u32) << 8 | (buf[3] as u32) << 16;
     status.b_state = buf[4];
 
     Ok(())
@@ -199,14 +201,17 @@ fn dfu_get_status(
 
 fn dfu_clear_status(interface: &nusb::Interface) -> Result<(), ZappError> {
     interface
-        .control_out(ControlOut {
-            control_type: ControlType::Class,
-            recipient: Recipient::Interface,
-            request: DFU_CLRSTATUS,
-            value: 0,
-            index: 0,
-            data: &[],
-        }, USB_TIMEOUT)
+        .control_out(
+            ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: DFU_CLRSTATUS,
+                value: 0,
+                index: 0,
+                data: &[],
+            },
+            USB_TIMEOUT,
+        )
         .wait()?;
     Ok(())
 }
@@ -245,14 +250,17 @@ fn dfu_command(
     }
 
     interface
-        .control_out(ControlOut {
-            control_type: ControlType::Class,
-            recipient: Recipient::Interface,
-            request: DFU_DNLOAD,
-            value: 0,
-            index: 0,
-            data: &buf,
-        }, USB_TIMEOUT)
+        .control_out(
+            ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: DFU_DNLOAD,
+                value: 0,
+                index: 0,
+                data: &buf,
+            },
+            USB_TIMEOUT,
+        )
         .wait()?;
 
     dfu_get_status(interface, status)?;
@@ -267,14 +275,17 @@ fn dfu_download(
     data: &[u8],
 ) -> Result<(), ZappError> {
     interface
-        .control_out(ControlOut {
-            control_type: ControlType::Class,
-            recipient: Recipient::Interface,
-            request: DFU_DNLOAD,
-            value: 2,
-            index: 0,
-            data,
-        }, USB_TIMEOUT)
+        .control_out(
+            ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: DFU_DNLOAD,
+                value: 2,
+                index: 0,
+                data,
+            },
+            USB_TIMEOUT,
+        )
         .wait()?;
 
     dfu_get_status(interface, status)?;
@@ -283,20 +294,20 @@ fn dfu_download(
     Ok(())
 }
 
-fn dfu_reboot(
-    interface: &nusb::Interface,
-    status: &mut DfuStatus,
-) -> Result<(), ZappError> {
+fn dfu_reboot(interface: &nusb::Interface, status: &mut DfuStatus) -> Result<(), ZappError> {
     // Send empty download to trigger manifest/reboot
     interface
-        .control_out(ControlOut {
-            control_type: ControlType::Class,
-            recipient: Recipient::Interface,
-            request: DFU_DNLOAD,
-            value: 2,
-            index: 0,
-            data: &[],
-        }, USB_TIMEOUT)
+        .control_out(
+            ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: DFU_DNLOAD,
+                value: 2,
+                index: 0,
+                data: &[],
+            },
+            USB_TIMEOUT,
+        )
         .wait()?;
 
     dfu_get_status(interface, status)?;

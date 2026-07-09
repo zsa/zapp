@@ -1,10 +1,10 @@
 pub mod dfu;
 pub mod halfkay;
 
+use crate::ZappError;
 use crate::device::ids::{self, Keyboard};
 use crate::device::{BootloaderDevice, BootloaderKind};
 use crate::firmware::Firmware;
-use crate::ZappError;
 
 /// Progress updates emitted during flashing.
 #[derive(Debug, Clone)]
