@@ -3,19 +3,22 @@
   rustPlatform,
   pkg-config,
   libusb1,
+  stdenv,
 }:
 let
   fs = lib.fileset;
   src = fs.toSource {
     root = ../.;
-    fileset = fs.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../zapp
-      ../zapp-core
-      ../zapp-oryx
-      ../udev
-    ];
+    fileset = fs.unions (
+      [
+        ../Cargo.toml
+        ../Cargo.lock
+        ../zapp
+        ../zapp-core
+        ../zapp-oryx
+      ]
+      ++ lib.optional (!stdenv.isDarwin) ../udev
+    );
   };
   cargoToml = builtins.fromTOML (builtins.readFile ../zapp/Cargo.toml);
 in
@@ -28,7 +31,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ libusb1 ];
 
-  postInstall = ''
+  postInstall = lib.optionalString stdenv.isLinux ''
     install -Dm644 udev/50-zsa.rules $out/lib/udev/rules.d/50-zsa.rules
   '';
 
@@ -37,6 +40,6 @@ rustPlatform.buildRustPackage {
     homepage = "https://github.com/zsa/zapp";
     license = lib.licenses.mit;
     mainProgram = "zapp";
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }

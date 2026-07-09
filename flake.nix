@@ -9,6 +9,7 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
@@ -22,7 +23,7 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.system}.zapp ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.zapp ];
           packages = [
             pkgs.cargo
             pkgs.rustc
@@ -38,8 +39,15 @@
       nixosModules.default =
         { pkgs, ... }:
         {
-          imports = [ ./nix/module.nix ];
-          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.system}.default;
+          imports = [ ./nix/module/nixos ];
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+
+      darwinModules.default =
+        { pkgs, ... }:
+        {
+          imports = [ ./nix/module/darwin ];
+          programs.zapp.package = nixpkgs.lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
     };
 }
