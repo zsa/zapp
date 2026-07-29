@@ -12,30 +12,41 @@ use nusb::hotplug::HotplugEvent;
 use nusb::{DeviceId, MaybeFuture};
 
 use super::ids::{
-    identify_bootloader, identify_keyboard, keyboard_for_bootloader, BootloaderKind, Keyboard,
+    BootloaderKind, Keyboard, identify_bootloader, identify_keyboard, keyboard_for_bootloader,
 };
 use crate::ZappError;
 
 /// Events emitted by the device monitor.
-#[derive(Debug)]
+///
+/// Every variant carries the `nusb::DeviceId` of the device it refers to, so a
+/// consumer tracking several devices can match a disconnect to a connect.
+/// Connect variants also carry the physical port (`bus_id` + `port_chain`),
+/// which stays stable across a reset into the bootloader.
+#[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// A ZSA keyboard was connected in normal mode.
     KeyboardConnected {
+        id: DeviceId,
         keyboard: Keyboard,
         serial: String,
         pid: u16,
+        bus_id: String,
+        port_chain: Vec<u8>,
     },
     /// A ZSA keyboard was disconnected.
-    KeyboardDisconnected,
+    KeyboardDisconnected { id: DeviceId },
     /// A bootloader device appeared.
     BootloaderConnected {
+        id: DeviceId,
         keyboard: Option<Keyboard>,
         kind: BootloaderKind,
         vid: u16,
         pid: u16,
+        bus_id: String,
+        port_chain: Vec<u8>,
     },
     /// A bootloader device was disconnected.
-    BootloaderDisconnected,
+    BootloaderDisconnected { id: DeviceId },
 }
 
 enum TrackedDevice {
@@ -56,43 +67,19 @@ impl DeviceMonitor {
         // Start hotplug watcher before initial scan to avoid missing events
         let watch = nusb::watch_devices()?;
 
-        // Initial scan for already-connected devices
-        for dev_info in nusb::list_devices().wait()? {
-            let vid = dev_info.vendor_id();
-            let pid = dev_info.product_id();
-
-            if let Some(keyboard) = identify_keyboard(vid, pid) {
-                let serial = dev_info.serial_number().unwrap_or_default().to_string();
-                let _ = tx.send(DeviceEvent::KeyboardConnected {
-                    keyboard,
-                    serial,
-                    pid,
-                });
-            } else if let Some(kind) = identify_bootloader(vid, pid) {
-                let keyboard = keyboard_for_bootloader(vid, pid);
-                let _ = tx.send(DeviceEvent::BootloaderConnected {
-                    keyboard,
-                    kind,
-                    vid,
-                    pid,
-                });
-            }
-        }
-
-        // Background thread for hotplug events
         thread::spawn(move || {
             // Track connected ZSA devices by their DeviceId so we can identify disconnects
             let mut tracked: Vec<(DeviceId, TrackedDevice)> = Vec::new();
 
-            // Build initial tracked list
+            // Single initial scan: seeds `tracked` and emits the events for
+            // devices that were already attached
             if let Ok(devices) = nusb::list_devices().wait() {
                 for dev_info in devices {
-                    let vid = dev_info.vendor_id();
-                    let pid = dev_info.product_id();
-                    if identify_keyboard(vid, pid).is_some() {
-                        tracked.push((dev_info.id(), TrackedDevice::Keyboard));
-                    } else if identify_bootloader(vid, pid).is_some() {
-                        tracked.push((dev_info.id(), TrackedDevice::Bootloader));
+                    if let Some((event, kind)) = classify(&dev_info) {
+                        tracked.push((dev_info.id(), kind));
+                        if tx.send(event).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -100,49 +87,30 @@ impl DeviceMonitor {
             futures_lite::future::block_on(async {
                 let mut watch = std::pin::pin!(watch);
 
-                loop {
-                    let Some(event) = watch.next().await else {
-                        break;
+                while let Some(event) = watch.next().await {
+                    let event = match event {
+                        HotplugEvent::Connected(dev_info) => {
+                            let Some((event, kind)) = classify(&dev_info) else {
+                                continue;
+                            };
+                            tracked.push((dev_info.id(), kind));
+                            event
+                        }
+                        HotplugEvent::Disconnected(id) => {
+                            let Some(pos) = tracked.iter().position(|(dev, _)| *dev == id) else {
+                                continue;
+                            };
+                            match tracked.remove(pos).1 {
+                                TrackedDevice::Keyboard => DeviceEvent::KeyboardDisconnected { id },
+                                TrackedDevice::Bootloader => {
+                                    DeviceEvent::BootloaderDisconnected { id }
+                                }
+                            }
+                        }
                     };
 
-                    match event {
-                        HotplugEvent::Connected(dev_info) => {
-                            let vid = dev_info.vendor_id();
-                            let pid = dev_info.product_id();
-
-                            if let Some(keyboard) = identify_keyboard(vid, pid) {
-                                tracked.push((dev_info.id(), TrackedDevice::Keyboard));
-                                let serial =
-                                    dev_info.serial_number().unwrap_or_default().to_string();
-                                let _ = tx.send(DeviceEvent::KeyboardConnected {
-                                    keyboard,
-                                    serial,
-                                    pid,
-                                });
-                            } else if let Some(kind) = identify_bootloader(vid, pid) {
-                                tracked.push((dev_info.id(), TrackedDevice::Bootloader));
-                                let keyboard = keyboard_for_bootloader(vid, pid);
-                                let _ = tx.send(DeviceEvent::BootloaderConnected {
-                                    keyboard,
-                                    kind,
-                                    vid,
-                                    pid,
-                                });
-                            }
-                        }
-                        HotplugEvent::Disconnected(device_id) => {
-                            if let Some(pos) =
-                                tracked.iter().position(|(id, _)| *id == device_id)
-                            {
-                                let (_, kind) = tracked.remove(pos);
-                                let _ = tx.send(match kind {
-                                    TrackedDevice::Keyboard => DeviceEvent::KeyboardDisconnected,
-                                    TrackedDevice::Bootloader => {
-                                        DeviceEvent::BootloaderDisconnected
-                                    }
-                                });
-                            }
-                        }
+                    if tx.send(event).is_err() {
+                        break;
                     }
                 }
             });
@@ -160,4 +128,42 @@ impl DeviceMonitor {
     pub fn recv(&self) -> Option<DeviceEvent> {
         self.rx.recv().ok()
     }
+}
+
+/// Build the connect event for a device, or `None` if it is not a ZSA device.
+fn classify(dev_info: &nusb::DeviceInfo) -> Option<(DeviceEvent, TrackedDevice)> {
+    let vid = dev_info.vendor_id();
+    let pid = dev_info.product_id();
+    let id = dev_info.id();
+    let bus_id = dev_info.bus_id().to_string();
+    let port_chain = dev_info.port_chain().to_vec();
+
+    if let Some(keyboard) = identify_keyboard(vid, pid) {
+        let serial = dev_info.serial_number().unwrap_or_default().to_string();
+        return Some((
+            DeviceEvent::KeyboardConnected {
+                id,
+                keyboard,
+                serial,
+                pid,
+                bus_id,
+                port_chain,
+            },
+            TrackedDevice::Keyboard,
+        ));
+    }
+
+    let kind = identify_bootloader(vid, pid)?;
+    Some((
+        DeviceEvent::BootloaderConnected {
+            id,
+            keyboard: keyboard_for_bootloader(vid, pid),
+            kind,
+            vid,
+            pid,
+            bus_id,
+            port_chain,
+        },
+        TrackedDevice::Bootloader,
+    ))
 }

@@ -7,7 +7,7 @@ use nusb::transfer::ControlType;
 use nusb::transfer::Recipient;
 
 use crate::ZappError;
-use crate::device::BootloaderDevice;
+use crate::device::{BootloaderDevice, BootloaderKind};
 use crate::firmware::Firmware;
 
 use super::FlashProgress;
@@ -44,13 +44,27 @@ struct DfuStatus {
     b_state: u8,
 }
 
+/// Flash region `(start, end)` the application occupies for a bootloader kind.
+///
+/// HALFKAY does not flash via DFU; it maps to the plain STM32 region so the
+/// match stays total.
+pub fn flash_region(kind: BootloaderKind) -> (u32, u32) {
+    match kind {
+        BootloaderKind::Stm32Dfu | BootloaderKind::Halfkay => {
+            (STM32_START_ADDRESS, STM32_END_ADDRESS)
+        }
+        BootloaderKind::IgnitionStm32 | BootloaderKind::IgnitionGd32 => {
+            (IGNITION_START_ADDRESS, IGNITION_END_ADDRESS)
+        }
+    }
+}
+
 /// Perform DFU flashing on a device.
 ///
-/// If `ignition` is true, uses Ignition address offsets (0x0800_2000).
+/// The flash region comes from the device's bootloader kind.
 pub fn flash_dfu(
     device: &BootloaderDevice,
     firmware: &Firmware,
-    ignition: bool,
     on_progress: &dyn Fn(FlashProgress),
 ) -> Result<(), ZappError> {
     let firmware_data = match firmware {
@@ -73,16 +87,7 @@ pub fn flash_dfu(
         }
     };
 
-    let start_address = if ignition {
-        IGNITION_START_ADDRESS
-    } else {
-        STM32_START_ADDRESS
-    };
-    let max_address = if ignition {
-        IGNITION_END_ADDRESS
-    } else {
-        STM32_END_ADDRESS
-    };
+    let (start_address, max_address) = flash_region(device.kind);
 
     let end_address = start_address + firmware_data.len() as u32 + BLOCK_SIZE as u32;
     if end_address > max_address {
