@@ -1931,7 +1931,12 @@ dependencies = [
  "log",
  "nusb",
  "thiserror 2.0.18",
+ "zapp-hid-proto",
 ]
+
+[[package]]
+name = "zapp-hid-proto"
+version = "0.1.0"
 
 [[package]]
 name = "zapp-oryx"
