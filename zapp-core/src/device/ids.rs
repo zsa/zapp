@@ -38,6 +38,9 @@ pub enum BootloaderKind {
     IgnitionStm32,
     /// ZSA Ignition bootloader on a GD32 chip (flash at 0x0800_2000).
     IgnitionGd32,
+    /// ZSA Ignition v2 bootloader, 16 KiB reserved (flash at 0x0800_4000).
+    /// Used by the Voyager 2.
+    IgnitionV2,
     /// Legacy HALFKAY (Teensy) bootloader for original Ergodox EZ.
     Halfkay,
 }
@@ -58,6 +61,7 @@ pub fn identify_bootloader(vid: u16, pid: u16) -> Option<BootloaderKind> {
         (STM32_VID, STM32_DFU_PID) => Some(BootloaderKind::Stm32Dfu),
         (ZSA_VID, 0x0791) => Some(BootloaderKind::IgnitionStm32),
         (ZSA_VID, 0x1791) => Some(BootloaderKind::IgnitionGd32),
+        (ZSA_VID, 0x0792) => Some(BootloaderKind::IgnitionV2),
         // Ignition Ergodox variants (all STM32)
         (ZSA_VID, 0x2000..=0x2002) => Some(BootloaderKind::IgnitionStm32),
         // Ignition Moonlander
@@ -72,6 +76,8 @@ pub fn keyboard_for_bootloader(vid: u16, pid: u16) -> Option<Keyboard> {
         (HALFKAY_VID, HALFKAY_PID) => Some(Keyboard::ErgodoxEz),
         (STM32_VID, STM32_DFU_PID) => None, // generic, could be any STM32 keyboard
         (ZSA_VID, 0x0791 | 0x1791) => Some(Keyboard::Voyager),
+        // Voyager 2 — no `Keyboard` variant yet
+        (ZSA_VID, 0x0792) => None,
         (ZSA_VID, 0x2000..=0x2002) => Some(Keyboard::ErgodoxEz),
         (ZSA_VID, 0x2003) => Some(Keyboard::Moonlander),
         _ => None,
@@ -85,6 +91,7 @@ pub fn friendly_name(vid: u16, pid: u16) -> &'static str {
         (STM32_VID, STM32_DFU_PID) => "Keyboard in Reset Mode (STM32 DFU)",
         (ZSA_VID, 0x0791) => "Voyager (Ignition STM32)",
         (ZSA_VID, 0x1791) => "Voyager (Ignition GD32)",
+        (ZSA_VID, 0x0792) => "Voyager 2 (Ignition)",
         (ZSA_VID, 0x2000) => "Ergodox EZ Glow (Ignition)",
         (ZSA_VID, 0x2001) => "Ergodox EZ Shine (Ignition)",
         (ZSA_VID, 0x2002) => "Ergodox EZ Original (Ignition)",
@@ -129,6 +136,7 @@ pub fn target_name_for_pid(pid: u16) -> &'static str {
         // Bootloader PIDs that may appear in firmware suffixes
         0x0791 => "Voyager (STM32)",
         0x1791 => "Voyager (GD32)",
+        0x0792 => "Voyager 2",
         0x2000 => "Ergodox EZ Glow",
         0x2001 => "Ergodox EZ Shine",
         0x2002 => "Ergodox EZ Original",
@@ -164,6 +172,11 @@ mod tests {
             identify_bootloader(ZSA_VID, 0x2003),
             Some(BootloaderKind::IgnitionStm32)
         );
+        // Voyager 2 has its own kind — reusing IgnitionStm32 would flash at the wrong base
+        assert_eq!(
+            identify_bootloader(ZSA_VID, 0x0792),
+            Some(BootloaderKind::IgnitionV2)
+        );
         // Unknown device
         assert_eq!(identify_bootloader(0x1234, 0x5678), None);
     }
@@ -184,5 +197,7 @@ mod tests {
         );
         // Generic STM32 DFU — no specific keyboard
         assert_eq!(keyboard_for_bootloader(STM32_VID, STM32_DFU_PID), None);
+        // Voyager 2 — no `Keyboard` variant yet
+        assert_eq!(keyboard_for_bootloader(ZSA_VID, 0x0792), None);
     }
 }

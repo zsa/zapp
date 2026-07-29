@@ -30,9 +30,10 @@ pub fn flash_device(
     validate_firmware_compatibility(device, firmware)?;
 
     match device.kind {
-        BootloaderKind::Stm32Dfu | BootloaderKind::IgnitionStm32 | BootloaderKind::IgnitionGd32 => {
-            dfu::flash_dfu(device, firmware, on_progress)
-        }
+        BootloaderKind::Stm32Dfu
+        | BootloaderKind::IgnitionStm32
+        | BootloaderKind::IgnitionGd32
+        | BootloaderKind::IgnitionV2 => dfu::flash_dfu(device, firmware, on_progress),
         BootloaderKind::Halfkay => halfkay::flash_halfkay(device, firmware, on_progress),
     }
 }
@@ -47,8 +48,8 @@ fn validate_firmware_compatibility(
 
 /// Prevents flashing firmware built for one bootloader onto a device using
 /// another, which would brick the keyboard: each bootloader writes at its own
-/// flash base (STM32 DFU 0x0800_0000, Ignition 0x0800_2000) and the image is
-/// linked for exactly one of them.
+/// flash base (STM32 DFU 0x0800_0000, Ignition 0x0800_2000, Ignition v2
+/// 0x0800_4000) and the image is linked for exactly one of them.
 fn check_compatibility(
     kind: BootloaderKind,
     vid: u16,
@@ -57,7 +58,7 @@ fn check_compatibility(
 ) -> Result<(), ZappError> {
     let is_ignition = matches!(
         kind,
-        BootloaderKind::IgnitionStm32 | BootloaderKind::IgnitionGd32
+        BootloaderKind::IgnitionStm32 | BootloaderKind::IgnitionGd32 | BootloaderKind::IgnitionV2
     );
     let (device_base, _) = dfu::flash_region(kind);
 
@@ -151,6 +152,15 @@ mod tests {
 
     #[test]
     fn matching_base_is_accepted() {
+        // Voyager 2 image on a Voyager 2 bootloader
+        assert!(
+            check(
+                BootloaderKind::IgnitionV2,
+                0x0792,
+                &dfu_binary(ids::ZSA_VID, 0x0792)
+            )
+            .is_ok()
+        );
         // Voyager image on a Voyager Ignition bootloader
         assert!(
             check(
@@ -163,8 +173,10 @@ mod tests {
     }
 
     #[test]
-    fn ignition_image_is_rejected_on_other_bases() {
-        let fw = dfu_binary(ids::ZSA_VID, 0x0791);
+    fn voyager2_image_is_rejected_on_other_bases() {
+        let fw = dfu_binary(ids::ZSA_VID, 0x0792);
+        assert!(check(BootloaderKind::IgnitionStm32, 0x0791, &fw).is_err());
+        assert!(check(BootloaderKind::IgnitionGd32, 0x1791, &fw).is_err());
         assert!(
             check_compatibility(
                 BootloaderKind::Stm32Dfu,
@@ -174,6 +186,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn other_images_are_rejected_on_voyager2() {
+        for (vid, pid) in [
+            (ids::ZSA_VID, 0x0791),
+            (ids::ZSA_VID, 0x1791),
+            (ids::STM32_VID, ids::STM32_DFU_PID),
+        ] {
+            assert!(
+                check(BootloaderKind::IgnitionV2, 0x0792, &dfu_binary(vid, pid)).is_err(),
+                "{vid:#06x}:{pid:#06x} should not flash onto Ignition v2"
+            );
+        }
     }
 
     #[test]
@@ -188,7 +214,7 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(check(BootloaderKind::IgnitionStm32, 0x0791, &hex).is_err());
+        assert!(check(BootloaderKind::IgnitionV2, 0x0792, &hex).is_err());
     }
 
     #[test]
@@ -206,6 +232,6 @@ mod tests {
             },
         };
         assert!(check(BootloaderKind::IgnitionStm32, 0x0791, &dual).is_ok());
-        assert!(check(BootloaderKind::IgnitionStm32, 0x2003, &dual).is_err());
+        assert!(check(BootloaderKind::IgnitionV2, 0x0792, &dual).is_err());
     }
 }
