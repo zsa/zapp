@@ -122,13 +122,25 @@ impl Backend for Bluez {
             })
             .collect();
 
+        // A subscription dies with the connection that carried it, and BlueZ
+        // hands the same object paths back on reconnect, so anything under a
+        // board that is no longer connected is forgotten and asked for again.
+        let live: Vec<&str> = devices
+            .iter()
+            .filter(|(_, sighting)| sighting.connected)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        self.notifying
+            .retain(|path| live.iter().any(|device| path.starts_with(device)));
+
         Ok(devices
-            .into_iter()
-            .map(|(path, mut sighting)| {
+            .iter()
+            .map(|(path, sighting)| {
+                let mut sighting = sighting.clone();
                 // Only ours, and only while connected: reading a battery means
                 // talking to the board.
                 if sighting.connected && identity::is_zsa_board(&sighting) {
-                    sighting.battery = self.battery(&objects, &path);
+                    sighting.battery = self.battery(&objects, path);
                 }
                 sighting
             })
@@ -283,4 +295,47 @@ where
 
 fn platform(err: impl std::fmt::Display) -> BleError {
     BleError::Platform(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    /// The rule that decides which subscriptions survive a snapshot, lifted out
+    /// of the D-Bus call so it can be exercised without a bus.
+    fn keep(notifying: &mut HashSet<String>, connected: &[&str]) {
+        notifying.retain(|path| connected.iter().any(|device| path.starts_with(device)));
+    }
+
+    #[test]
+    fn a_subscription_is_forgotten_when_its_board_disconnects() {
+        let device = "/org/bluez/hci0/dev_E8_6B_FC_47_E2_64";
+        let level = format!("{device}/service0016/char0017");
+        let mut notifying = HashSet::from([level.clone()]);
+
+        keep(&mut notifying, &[device]);
+        assert!(
+            notifying.contains(&level),
+            "still connected, still subscribed"
+        );
+
+        // BlueZ tore the notify session down with the connection, and hands the
+        // same path back on reconnect: without forgetting, it is never renewed.
+        keep(&mut notifying, &[]);
+        assert!(notifying.is_empty());
+    }
+
+    #[test]
+    fn one_board_disconnecting_leaves_anothers_subscription_alone() {
+        let ours = "/org/bluez/hci0/dev_E8_6B_FC_47_E2_64";
+        let other = "/org/bluez/hci0/dev_F8_DE_F9_BF_5F_5F";
+        let mut notifying = HashSet::from([
+            format!("{ours}/service0016/char0017"),
+            format!("{other}/service0016/char0017"),
+        ]);
+
+        keep(&mut notifying, &[ours]);
+        assert_eq!(notifying.len(), 1);
+        assert!(notifying.iter().all(|path| path.starts_with(ours)));
+    }
 }
