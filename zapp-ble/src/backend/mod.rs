@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use crate::{BleError, BleSighting};
 
+#[cfg(target_os = "linux")]
+mod bluez;
+
 pub trait Backend: Send {
     /// Every device the platform can see right now, ZSA or not.
     fn sightings(&mut self) -> Result<Vec<BleSighting>, BleError>;
@@ -28,5 +31,13 @@ pub trait Backend: Send {
 /// ignore it.
 pub fn for_platform(known: &[String]) -> Option<Box<dyn Backend>> {
     let _ = known;
+
+    #[cfg(target_os = "linux")]
+    match bluez::Bluez::connect() {
+        Ok(backend) => return Some(Box::new(backend)),
+        // No system bus, or no BlueZ on it. Nothing else to fall back to.
+        Err(err) => log::warn!("no BlueZ: {err}"),
+    }
+
     None
 }

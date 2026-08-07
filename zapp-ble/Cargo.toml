@@ -8,3 +8,8 @@ description = "BLE discovery for ZSA keyboards"
 log = "0.4"
 thiserror = "2"
 zapp-core = { path = "../zapp-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure Rust D-Bus, so BlueZ costs no system library at build time. The blocking
+# API keeps the crate free of an async runtime.
+zbus = "5"

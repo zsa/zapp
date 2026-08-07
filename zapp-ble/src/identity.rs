@@ -54,6 +54,13 @@ pub fn keyboard_from_modalias(modalias: &str) -> Option<Keyboard> {
     )
 }
 
+/// A `0000180f-0000-1000-8000-00805f9b34fb` UUID as the integer the id tables
+/// are keyed on. Every platform hands UUIDs over as text of this shape.
+pub fn parse_uuid(uuid: &str) -> Option<u128> {
+    let digits: String = uuid.chars().filter(|c| *c != '-').collect();
+    (digits.len() == 32).then(|| u128::from_str_radix(&digits, 16).ok())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +131,22 @@ mod tests {
             ..BleSighting::default()
         };
         assert_eq!(keyboard_for(&sighting), Some(Keyboard::Voyager2));
+    }
+
+    #[test]
+    fn uuids_parse_from_the_text_every_platform_hands_over() {
+        assert_eq!(
+            parse_uuid("32970001-e5aa-4f42-a596-1ea5a0200001"),
+            Some(ZSA_BLE_DFU_SERVICE)
+        );
+        assert_eq!(
+            parse_uuid("0000180F-0000-1000-8000-00805F9B34FB"),
+            Some(BATTERY)
+        );
+        assert_eq!(parse_uuid("not a uuid"), None);
+        assert_eq!(parse_uuid(""), None);
+        // Too short to be one, even though every character is a hex digit.
+        assert_eq!(parse_uuid("3297"), None);
     }
 
     #[test]
