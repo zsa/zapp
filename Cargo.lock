@@ -2344,6 +2344,7 @@ dependencies = [
 name = "zapp-ble"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "log",
  "thiserror 2.0.18",
  "zapp-core",

@@ -6,11 +6,14 @@
 //! all three presence states come from a single call.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use zbus::blocking::{fdo::ObjectManagerProxy, Connection, Proxy};
+use zbus::blocking::{fdo::ObjectManagerProxy, Connection, MessageIterator, Proxy};
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+use zbus::MatchRule;
 
 use super::Backend;
 use crate::battery::{self, Battery};
@@ -38,6 +41,14 @@ const PRESENTATION_FORMAT: u128 = 0x00002904_0000_1000_8000_00805f9b34fb;
 const SCAN_WINDOW: Duration = Duration::from_secs(4);
 const SCAN_EVERY: Duration = Duration::from_secs(30);
 
+/// How long to let a burst of signals finish before reading the tree.
+///
+/// One change rarely arrives alone — a connection brings a `Connected`
+/// property, a pile of `InterfacesAdded` for the GATT tree, then the first
+/// notifications — and reading after each would mean reading a dozen times for
+/// one event.
+const SETTLE: Duration = Duration::from_millis(250);
+
 type Properties = HashMap<String, OwnedValue>;
 type Objects = HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, Properties>>;
 
@@ -52,12 +63,15 @@ pub struct Bluez {
     /// Level characteristics already subscribed to. BlueZ then keeps their
     /// `Value` fresh, and later snapshots cost nothing.
     notifying: HashSet<String>,
+    /// Ticks when BlueZ says something changed.
+    changes: Receiver<()>,
 }
 
 impl Bluez {
     pub fn connect() -> Result<Self, BleError> {
         let connection = Connection::system().map_err(platform)?;
         let objects = ObjectManagerProxy::new(&connection, BLUEZ, "/").map_err(platform)?;
+        let changes = watch_signals(&connection)?;
         Ok(Self {
             connection,
             objects,
@@ -65,6 +79,7 @@ impl Bluez {
             scanned_at: None,
             halves: HashMap::new(),
             notifying: HashSet::new(),
+            changes,
         })
     }
 
@@ -108,6 +123,29 @@ impl Bluez {
 }
 
 impl Backend for Bluez {
+    /// Waits for BlueZ to say something changed, rather than for the clock.
+    ///
+    /// Everything this backend reports — presence, connection state, battery —
+    /// reaches BlueZ as a signal, so the timeout is only the safety net for one
+    /// that was missed.
+    fn wait_for_change(&mut self, timeout: Duration) {
+        match self.changes.recv_timeout(timeout) {
+            Ok(()) => log::trace!("woken by bluez"),
+            // The watcher thread is gone, so nothing will ever tick again.
+            // Falling back to the clock keeps the monitor working.
+            Err(RecvTimeoutError::Disconnected) => thread::sleep(timeout),
+            Err(RecvTimeoutError::Timeout) => {
+                log::trace!("nothing from bluez in {timeout:?}");
+                return;
+            }
+        }
+
+        thread::sleep(SETTLE);
+        // Everything that arrived during the burst is answered by the one
+        // snapshot about to be taken.
+        while self.changes.try_recv().is_ok() {}
+    }
+
     fn sightings(&mut self) -> Result<Vec<BleSighting>, BleError> {
         let objects = self.objects.get_managed_objects().map_err(platform)?;
         self.pump_discovery(&objects);
@@ -234,6 +272,38 @@ impl Bluez {
             self.notifying.remove(characteristic);
         }
     }
+}
+
+/// Ticks once per signal from BlueZ.
+///
+/// Anything it emits is worth a look: `InterfacesAdded` and `InterfacesRemoved`
+/// for devices and their GATT trees, `PropertiesChanged` for connection state,
+/// rssi and the battery values notifications refresh. Which one it was does not
+/// matter, since the answer is always to read the tree again.
+fn watch_signals(connection: &Connection) -> Result<Receiver<()>, BleError> {
+    let rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(BLUEZ)
+        .map_err(platform)?
+        .build();
+    let signals = MessageIterator::for_match_rule(rule, connection, None).map_err(platform)?;
+
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("zapp-ble-dbus".into())
+        .spawn(move || {
+            for message in signals {
+                if message.is_err() {
+                    continue;
+                }
+                if tx.send(()).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(platform)?;
+
+    Ok(rx)
 }
 
 /// One interface's properties, if an object carries it.
