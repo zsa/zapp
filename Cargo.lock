@@ -1923,6 +1923,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zapp-ble"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
+ "zapp-core",
+]
+
+[[package]]
 name = "zapp-core"
 version = "0.1.1"
 dependencies = [

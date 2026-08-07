@@ -1,0 +1,10 @@
+[package]
+name = "zapp-ble"
+version = "0.1.0"
+edition = "2021"
+description = "BLE discovery for ZSA keyboards"
+
+[dependencies]
+log = "0.4"
+thiserror = "2"
+zapp-core = { path = "../zapp-core" }
