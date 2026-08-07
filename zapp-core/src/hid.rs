@@ -48,9 +48,7 @@ impl HidConnection {
 
         let path = api
             .device_list()
-            .find(|d| {
-                d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == USAGE_PAGE
-            })
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == USAGE_PAGE)
             .map(|d| d.path().to_owned())
             .ok_or(ZappError::NoKeyboardFound)?;
 

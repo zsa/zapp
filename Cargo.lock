@@ -2335,6 +2335,7 @@ dependencies = [
  "env_logger",
  "indicatif",
  "log",
+ "zapp-ble",
  "zapp-core",
  "zapp-oryx",
 ]

@@ -1,11 +1,14 @@
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_core::device::ids::{is_moonlander_revb, target_name_for_pid};
-use zapp_core::device::{self, WatchStatus};
+use zapp_ble::{BleMonitor, Presence};
+use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
+use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_oryx::FirmwareVariant;
@@ -44,6 +47,17 @@ enum Commands {
             coming from Oryx and is not currently in bootloader mode."
     )]
     Update,
+    /// List the ZSA keyboards this machine can see, wired and wireless
+    #[command(long_about = "List the ZSA keyboards this machine can see.\n\n\
+            Wired boards are read straight from USB. Bluetooth boards are listed \
+            when they are connected to this machine, bonded to it, or advertising \
+            in range. A board that has never been paired only advertises, so pass \
+            --scan to hold a discovery window open long enough to catch one.")]
+    Devices {
+        /// Scan for boards that have never been paired to this machine
+        #[arg(long)]
+        scan: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -62,6 +76,71 @@ fn main() -> Result<()> {
             }
         }
         Commands::Update => cmd_update(),
+        Commands::Devices { scan } => cmd_devices(scan),
+    }
+}
+
+/// How long to give the radio. Without `--scan`, just long enough for the first
+/// answer, which already carries every bonded board; with it, long enough for a
+/// discovery window to open and close.
+const BLE_SETTLE: Duration = Duration::from_millis(750);
+const BLE_SCAN: Duration = Duration::from_secs(7);
+
+fn cmd_devices(scan: bool) -> Result<()> {
+    println!("USB");
+    match device::list_devices() {
+        Ok(devices) if devices.is_empty() => println!("  none"),
+        Ok(devices) => {
+            for device in &devices {
+                println!("  {}", describe_usb(device));
+            }
+        }
+        Err(err) => println!("  cannot scan: {err}"),
+    }
+
+    let monitor = BleMonitor::start(&[]);
+    let wait = if scan { BLE_SCAN } else { BLE_SETTLE };
+    let spinner = new_spinner("Looking for Bluetooth boards...");
+    thread::sleep(wait);
+    spinner.finish_and_clear();
+
+    println!();
+    println!("Bluetooth");
+    let boards = monitor.snapshot();
+    if boards.is_empty() {
+        println!("  none");
+        if !scan {
+            println!("  (pass --scan to look for boards that have never been paired)");
+        }
+    }
+    for board in boards {
+        let name = board
+            .keyboard
+            .map(|keyboard| keyboard.to_string())
+            .unwrap_or_else(|| "ZSA keyboard".to_string());
+        let known_as = board.name.unwrap_or_else(|| "unnamed".to_string());
+        println!("  {name} · {} · {known_as:?}", state(board.presence));
+    }
+
+    Ok(())
+}
+
+fn state(presence: Presence) -> &'static str {
+    match presence {
+        Presence::Connected => "connected",
+        Presence::Nearby => "in range",
+        Presence::Paired => "paired, not in range",
+    }
+}
+
+fn describe_usb(device: &UsbDevice) -> String {
+    let name = match device.bootloader {
+        Some(_) => ids::friendly_name(device.vid, device.pid).to_string(),
+        None => target_name_for_pid(device.pid).to_string(),
+    };
+    match &device.serial {
+        Some(serial) if !serial.is_empty() => format!("{name} · {serial}"),
+        _ => name,
     }
 }
 

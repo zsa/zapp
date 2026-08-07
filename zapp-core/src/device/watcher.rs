@@ -17,6 +17,49 @@ pub struct ConnectedKeyboard {
     pub pid: u16,
 }
 
+/// A ZSA device attached right now, in either mode.
+pub struct UsbDevice {
+    /// `None` for a bootloader that names no keyboard, such as the generic
+    /// STM32 DFU any STM32 board can present.
+    pub keyboard: Option<Keyboard>,
+    /// The mode it is in: `None` means it is running keyboard firmware.
+    pub bootloader: Option<BootloaderKind>,
+    /// `layoutId/revisionId` for a keyboard; bootloaders carry none.
+    pub serial: Option<String>,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+/// Every ZSA device attached right now, keyboards and bootloaders alike.
+pub fn list_devices() -> Result<Vec<UsbDevice>, ZappError> {
+    let mut devices = Vec::new();
+
+    for dev_info in nusb::list_devices().wait()? {
+        let vid = dev_info.vendor_id();
+        let pid = dev_info.product_id();
+
+        if let Some(keyboard) = identify_keyboard(vid, pid) {
+            devices.push(UsbDevice {
+                keyboard: Some(keyboard),
+                bootloader: None,
+                serial: dev_info.serial_number().map(str::to_string),
+                vid,
+                pid,
+            });
+        } else if let Some(kind) = identify_bootloader(vid, pid) {
+            devices.push(UsbDevice {
+                keyboard: keyboard_for_bootloader(vid, pid),
+                bootloader: Some(kind),
+                serial: None,
+                vid,
+                pid,
+            });
+        }
+    }
+
+    Ok(devices)
+}
+
 /// Scan USB for the first ZSA keyboard in normal mode.
 pub fn find_keyboard() -> Result<ConnectedKeyboard, ZappError> {
     for dev_info in nusb::list_devices().wait()? {

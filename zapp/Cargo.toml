@@ -4,6 +4,7 @@ version = "1.0.2"
 edition = "2024"
 
 [dependencies]
+zapp-ble = { path = "../zapp-ble" }
 zapp-core = { path = "../zapp-core" }
 zapp-oryx = { path = "../zapp-oryx" }
 anyhow = "1"
