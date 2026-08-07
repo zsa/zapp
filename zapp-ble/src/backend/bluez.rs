@@ -5,7 +5,7 @@
 //! is still there to be read. That is what makes Linux the one platform where
 //! all three presence states come from a single call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use zbus::blocking::{fdo::ObjectManagerProxy, Connection, Proxy};
@@ -13,11 +13,21 @@ use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use super::Backend;
+use crate::battery::{self, Battery};
 use crate::{identity, BleError, BleSighting};
 
 const BLUEZ: &str = "org.bluez";
 const DEVICE: &str = "org.bluez.Device1";
 const ADAPTER: &str = "org.bluez.Adapter1";
+const SERVICE: &str = "org.bluez.GattService1";
+const CHARACTERISTIC: &str = "org.bluez.GattCharacteristic1";
+const DESCRIPTOR: &str = "org.bluez.GattDescriptor1";
+
+/// Battery Service, its level characteristic, and the descriptor saying which
+/// half an instance speaks for.
+const BATTERY_SERVICE: u128 = 0x0000180f_0000_1000_8000_00805f9b34fb;
+const BATTERY_LEVEL: u128 = 0x00002a19_0000_1000_8000_00805f9b34fb;
+const PRESENTATION_FORMAT: u128 = 0x00002904_0000_1000_8000_00805f9b34fb;
 
 /// How long each discovery window stays open, and how often one opens.
 ///
@@ -36,6 +46,12 @@ pub struct Bluez {
     objects: ObjectManagerProxy<'static>,
     scanning_since: Option<Instant>,
     scanned_at: Option<Instant>,
+    /// Which half each level characteristic speaks for, by object path. The
+    /// descriptor saying so never changes, so it is read once.
+    halves: HashMap<String, battery::Half>,
+    /// Level characteristics already subscribed to. BlueZ then keeps their
+    /// `Value` fresh, and later snapshots cost nothing.
+    notifying: HashSet<String>,
 }
 
 impl Bluez {
@@ -47,6 +63,8 @@ impl Bluez {
             objects,
             scanning_since: None,
             scanned_at: None,
+            halves: HashMap::new(),
+            notifying: HashSet::new(),
         })
     }
 
@@ -93,16 +111,140 @@ impl Backend for Bluez {
     fn sightings(&mut self) -> Result<Vec<BleSighting>, BleError> {
         let objects = self.objects.get_managed_objects().map_err(platform)?;
         self.pump_discovery(&objects);
-        Ok(objects
+        let devices: Vec<(String, BleSighting)> = objects
             .iter()
             .filter_map(|(path, ifaces)| {
-                let device = ifaces
+                let properties = ifaces
                     .iter()
                     .find(|(iface, _)| iface.as_str() == DEVICE)
                     .map(|(_, properties)| properties)?;
-                Some(sighting(path.as_str(), device))
+                Some((path.to_string(), sighting(path.as_str(), properties)))
+            })
+            .collect();
+
+        Ok(devices
+            .into_iter()
+            .map(|(path, mut sighting)| {
+                // Only ours, and only while connected: reading a battery means
+                // talking to the board.
+                if sighting.connected && identity::is_zsa_board(&sighting) {
+                    sighting.battery = self.battery(&objects, &path);
+                }
+                sighting
             })
             .collect())
+    }
+}
+
+impl Bluez {
+    /// What a board's Battery Service instances say.
+    ///
+    /// A split board publishes one per half plus a combined one, so the levels
+    /// are read from the GATT tree rather than `org.bluez.Battery1`, which
+    /// surfaces only the first.
+    fn battery(&mut self, objects: &Objects, device: &str) -> Battery {
+        let mut battery = Battery::default();
+
+        let services: Vec<&str> = objects
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(device))
+            .filter(|(_, ifaces)| {
+                properties(ifaces, SERVICE)
+                    .and_then(|service| get::<String>(service, "UUID"))
+                    .and_then(|uuid| identity::parse_uuid(&uuid))
+                    == Some(BATTERY_SERVICE)
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+
+        for service in services {
+            let Some((path, level)) = objects
+                .iter()
+                .filter(|(path, _)| path.as_str().starts_with(service))
+                .find_map(|(path, ifaces)| {
+                    let characteristic = properties(ifaces, CHARACTERISTIC)?;
+                    let uuid = identity::parse_uuid(&get::<String>(characteristic, "UUID")?)?;
+                    (uuid == BATTERY_LEVEL).then(|| (path.as_str(), characteristic))
+                })
+            else {
+                continue;
+            };
+
+            let Some(half) = self.half_of(objects, path) else {
+                continue;
+            };
+            // The cached value, which notifications keep fresh; a read is only
+            // needed the first time, before the subscription exists.
+            let level = get::<Vec<u8>>(level, "Value")
+                .filter(|value| !value.is_empty())
+                .or_else(|| read(&self.connection, path, CHARACTERISTIC));
+            if let Some(level) = level.and_then(|value| value.first().copied()) {
+                battery.set(half, level);
+            }
+            self.subscribe(path);
+        }
+
+        battery
+    }
+
+    /// Which half a level characteristic speaks for, from the presentation
+    /// format descriptor beside it. Read once and remembered.
+    fn half_of(&mut self, objects: &Objects, characteristic: &str) -> Option<battery::Half> {
+        if let Some(half) = self.halves.get(characteristic) {
+            return Some(*half);
+        }
+
+        let descriptor = objects
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(characteristic))
+            .find_map(|(path, ifaces)| {
+                let descriptor = properties(ifaces, DESCRIPTOR)?;
+                let uuid = identity::parse_uuid(&get::<String>(descriptor, "UUID")?)?;
+                (uuid == PRESENTATION_FORMAT).then(|| path.as_str())
+            })?;
+
+        let value = read(&self.connection, descriptor, DESCRIPTOR)?;
+        let half = battery::half_from_format(&value)?;
+        self.halves.insert(characteristic.to_string(), half);
+        Some(half)
+    }
+
+    /// Asks BlueZ to keep this characteristic's value fresh. Once each: a
+    /// second call is an error, and the subscription outlives the poll.
+    fn subscribe(&mut self, characteristic: &str) {
+        if !self.notifying.insert(characteristic.to_string()) {
+            return;
+        }
+        let proxy = Proxy::new(&self.connection, BLUEZ, characteristic, CHARACTERISTIC);
+        let call = proxy.and_then(|proxy| proxy.call::<_, _, ()>("StartNotify", &()));
+        if let Err(err) = call {
+            log::debug!("StartNotify on {characteristic} failed: {err}");
+            self.notifying.remove(characteristic);
+        }
+    }
+}
+
+/// One interface's properties, if an object carries it.
+fn properties<'a>(
+    ifaces: &'a HashMap<OwnedInterfaceName, Properties>,
+    wanted: &str,
+) -> Option<&'a Properties> {
+    ifaces
+        .iter()
+        .find(|(iface, _)| iface.as_str() == wanted)
+        .map(|(_, properties)| properties)
+}
+
+/// Reads a characteristic or descriptor, which means talking to the board.
+fn read(connection: &Connection, path: &str, iface: &str) -> Option<Vec<u8>> {
+    let proxy = Proxy::new(connection, BLUEZ, path, iface).ok()?;
+    let options: HashMap<String, OwnedValue> = HashMap::new();
+    match proxy.call::<_, _, Vec<u8>>("ReadValue", &(options,)) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            log::debug!("ReadValue on {path} failed: {err}");
+            None
+        }
     }
 }
 
@@ -127,6 +269,8 @@ fn sighting(path: &str, device: &Properties) -> BleSighting {
         // Present only while the device has been heard from recently, which is
         // what makes it the "in range" signal rather than a signal strength.
         rssi: get::<i16>(device, "RSSI"),
+        // Filled in afterwards, and only for a board worth reading.
+        battery: Battery::default(),
     }
 }
 

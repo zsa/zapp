@@ -71,6 +71,7 @@ mod tests {
             name: Some("Voyager".into()),
             keyboard: Some(Keyboard::Voyager2),
             presence,
+            battery: crate::Battery::default(),
         }
     }
 

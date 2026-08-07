@@ -56,7 +56,11 @@ pub enum HidEvent {
     /// The active layer changed.
     LayerChanged(u8),
     /// A physical key went down or up, in matrix (column, row) coordinates.
-    Key { column: u8, row: u8, pressed: bool },
+    Key {
+        column: u8,
+        row: u8,
+        pressed: bool,
+    },
     /// The device opened a pairing handshake; answered automatically.
     PairingInit,
     /// The device is collecting the pairing key from the user.

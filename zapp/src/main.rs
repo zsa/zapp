@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_ble::{BleMonitor, Presence};
+use zapp_ble::{Battery, BleMonitor, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
@@ -119,10 +119,28 @@ fn cmd_devices(scan: bool) -> Result<()> {
             .map(|keyboard| keyboard.to_string())
             .unwrap_or_else(|| "ZSA keyboard".to_string());
         let known_as = board.name.unwrap_or_else(|| "unnamed".to_string());
-        println!("  {name} · {} · {known_as:?}", state(board.presence));
+        println!(
+            "  {name} · {} · {known_as:?}{}",
+            state(board.presence),
+            charge(board.battery)
+        );
     }
 
     Ok(())
+}
+
+/// What the halves have left. A board only linked to one half says so by
+/// leaving the other out.
+fn charge(battery: Battery) -> String {
+    match (battery.left, battery.right) {
+        (Some(left), Some(right)) => format!(" · left {left}% · right {right}%"),
+        (Some(left), None) => format!(" · left {left}% · right unknown"),
+        (None, Some(right)) => format!(" · right {right}%"),
+        (None, None) => battery
+            .keyboard
+            .map(|level| format!(" · {level}%"))
+            .unwrap_or_default(),
+    }
 }
 
 fn state(presence: Presence) -> &'static str {

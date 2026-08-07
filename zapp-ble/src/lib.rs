@@ -6,11 +6,13 @@
 //! keymapp-tng for why each platform needs its own backend.
 
 pub mod backend;
+pub mod battery;
 mod board;
 pub mod identity;
 mod monitor;
 mod roster;
 
+pub use battery::{Battery, Half};
 pub use board::{BleBoard, BleEvent, BleSighting, Presence};
 pub use monitor::BleMonitor;
 pub use roster::Roster;

@@ -2,7 +2,7 @@
 
 use zapp_core::device::ids::Keyboard;
 
-use crate::identity;
+use crate::{identity, Battery};
 
 /// How reachable a board is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub struct BleBoard {
     /// `None` when nothing the platform offered names the product.
     pub keyboard: Option<Keyboard>,
     pub presence: Presence,
+    pub battery: Battery,
 }
 
 /// A change in what the platform can see.
@@ -53,6 +54,7 @@ pub struct BleSighting {
     pub connected: bool,
     pub paired: bool,
     pub rssi: Option<i16>,
+    pub battery: Battery,
 }
 
 impl BleSighting {
@@ -83,6 +85,7 @@ impl BleBoard {
             name: sighting.name.clone(),
             keyboard: identity::keyboard_for(sighting),
             presence: sighting.presence()?,
+            battery: sighting.battery,
         })
     }
 }
