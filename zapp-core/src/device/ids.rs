@@ -9,6 +9,11 @@ pub const STM32_DFU_PID: u16 = 0xDF11;
 pub const HALFKAY_VID: u16 = 0x16C0;
 pub const HALFKAY_PID: u16 = 0x0478;
 
+/// ZSA's BLE UUID space: `3297xxxx-e5aa-4f42-a596-1ea5a0200001`, keyed on the
+/// vendor id. `32970001`-`32970004` is the firmware-update service and its
+/// characteristics; per-product identity UUIDs start at `32970101`.
+pub const ZSA_BLE_DFU_SERVICE: u128 = 0x32970001_e5aa_4f42_a596_1ea5a0200001;
+
 /// Known ZSA keyboard models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyboard {
@@ -16,6 +21,7 @@ pub enum Keyboard {
     PlanckEz,
     Moonlander,
     Voyager,
+    Voyager2,
 }
 
 impl std::fmt::Display for Keyboard {
@@ -25,6 +31,7 @@ impl std::fmt::Display for Keyboard {
             Self::PlanckEz => write!(f, "Planck EZ"),
             Self::Moonlander => write!(f, "Moonlander"),
             Self::Voyager => write!(f, "Voyager"),
+            Self::Voyager2 => write!(f, "Voyager 2"),
         }
     }
 }
@@ -76,8 +83,7 @@ pub fn keyboard_for_bootloader(vid: u16, pid: u16) -> Option<Keyboard> {
         (HALFKAY_VID, HALFKAY_PID) => Some(Keyboard::ErgodoxEz),
         (STM32_VID, STM32_DFU_PID) => None, // generic, could be any STM32 keyboard
         (ZSA_VID, 0x0791 | 0x1791) => Some(Keyboard::Voyager),
-        // Voyager 2 — no `Keyboard` variant yet
-        (ZSA_VID, 0x0792) => None,
+        (ZSA_VID, 0x0792) => Some(Keyboard::Voyager2),
         (ZSA_VID, 0x2000..=0x2002) => Some(Keyboard::ErgodoxEz),
         (ZSA_VID, 0x2003) => Some(Keyboard::Moonlander),
         _ => None,
@@ -110,7 +116,20 @@ pub fn identify_keyboard(vid: u16, pid: u16) -> Option<Keyboard> {
         0x1307 | 0x4974 | 0x4975 | 0x4976 | 0x2010 | 0x2020 | 0x2030 => Some(Keyboard::ErgodoxEz),
         0x6060 | 0xC6CE | 0xC6CF => Some(Keyboard::PlanckEz),
         0x1969 | 0x1972 => Some(Keyboard::Moonlander),
-        0x1977 | 0x1978 => Some(Keyboard::Voyager),
+        0x1977 => Some(Keyboard::Voyager),
+        0x1978 => Some(Keyboard::Voyager2),
+        _ => None,
+    }
+}
+
+/// Identify a keyboard from the product identity UUID it advertises over BLE.
+///
+/// Advertised rather than a real GATT service, so it names the product before
+/// anything connects. A bonded board stops advertising and is named by its DIS
+/// PnP id instead, which carries the same PID `identify_keyboard` takes.
+pub fn keyboard_for_ble_identity(uuid: u128) -> Option<Keyboard> {
+    match uuid {
+        0x32970101_e5aa_4f42_a596_1ea5a0200001 => Some(Keyboard::Voyager2),
         _ => None,
     }
 }
@@ -132,7 +151,8 @@ pub fn target_name_for_pid(pid: u16) -> &'static str {
         0xC6CE => "Planck EZ Standard",
         0xC6CF => "Planck EZ Glow",
         0x1969 | 0x1972 => "Moonlander MK1",
-        0x1977 | 0x1978 => "Voyager",
+        0x1977 => "Voyager",
+        0x1978 => "Voyager 2",
         // Bootloader PIDs that may appear in firmware suffixes
         0x0791 => "Voyager (STM32)",
         0x1791 => "Voyager (GD32)",
@@ -197,7 +217,29 @@ mod tests {
         );
         // Generic STM32 DFU — no specific keyboard
         assert_eq!(keyboard_for_bootloader(STM32_VID, STM32_DFU_PID), None);
-        // Voyager 2 — no `Keyboard` variant yet
-        assert_eq!(keyboard_for_bootloader(ZSA_VID, 0x0792), None);
+        assert_eq!(
+            keyboard_for_bootloader(ZSA_VID, 0x0792),
+            Some(Keyboard::Voyager2)
+        );
+    }
+
+    #[test]
+    fn the_voyager_2_has_its_own_product_id() {
+        // qmk voyager/keyboard.json is 0x1977, voyager_tng/keyboard.json 0x1978.
+        assert_eq!(identify_keyboard(ZSA_VID, 0x1977), Some(Keyboard::Voyager));
+        assert_eq!(identify_keyboard(ZSA_VID, 0x1978), Some(Keyboard::Voyager2));
+        assert_eq!(target_name_for_pid(0x1977), "Voyager");
+        assert_eq!(target_name_for_pid(0x1978), "Voyager 2");
+    }
+
+    #[test]
+    fn the_advertised_identity_uuid_names_the_product() {
+        assert_eq!(
+            keyboard_for_ble_identity(0x32970101_e5aa_4f42_a596_1ea5a0200001),
+            Some(Keyboard::Voyager2)
+        );
+        // The DFU service says "a ZSA board", never which one.
+        assert_eq!(keyboard_for_ble_identity(ZSA_BLE_DFU_SERVICE), None);
+        assert_eq!(keyboard_for_ble_identity(0), None);
     }
 }

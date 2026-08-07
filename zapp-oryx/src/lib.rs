@@ -54,7 +54,9 @@ struct GqlRevision {
 /// MCUs, and Oryx models them as separate geometries.
 pub fn geometry_for(keyboard: Keyboard, pid: u16) -> &'static str {
     match keyboard {
-        Keyboard::Voyager => "voyager",
+        // The Voyager 2 keeps the Voyager's key layout, so Oryx serves both from
+        // the one geometry.
+        Keyboard::Voyager | Keyboard::Voyager2 => "voyager",
         Keyboard::Moonlander => "moonlander",
         Keyboard::PlanckEz => "planck-ez",
         Keyboard::ErgodoxEz => match pid {
