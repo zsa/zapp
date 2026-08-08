@@ -5,15 +5,22 @@ use std::time::{Duration, Instant};
 use zapp_core::flash::FlashProgress;
 
 use super::img::{self, ImageSlot};
-use super::proto::{self, Header, Op, Reassembler};
+use super::proto::{self, Header, Op, Reassembler, HEADER_LEN};
 use super::{cbor, image, SmpError};
 use crate::backend::GattChannel;
 
-/// os_mgmt, and the one command this client uses from it.
+/// os_mgmt, and the two commands this client uses from it.
 pub const OS_GROUP: u16 = 0;
 pub const OS_CMD_RESET: u8 = 5;
+pub const OS_CMD_MCUMGR_PARAMS: u8 = 6;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The most a request may ever be, whatever a device claims.
+///
+/// The header's length field is sixteen bits, so a frame larger than this
+/// cannot be described at all.
+pub const MAX_REQUEST: usize = HEADER_LEN + u16::MAX as usize;
 
 /// How many replies in a row may leave the offset where it was.
 ///
@@ -21,13 +28,41 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// never ends.
 const MAX_STALLS: u32 = 3;
 
+/// How many times an upload may halve its request size before giving up.
+///
+/// Enough to walk a 2.4 KiB request back down to one write.
+const MAX_SHRINKS: u32 = 4;
+
+/// What a device says about the buffers it reassembles requests into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McumgrParams {
+    /// The largest whole SMP frame it can put back together from a run of
+    /// writes. The eight-byte header counts against it: Zephyr's own protocol
+    /// documentation calls this "single SMP buffer size, this includes SMP
+    /// header and CBOR payload", and its reassembly adds the header to the
+    /// length field before comparing.
+    pub buf_size: usize,
+    /// How many of those buffers it has.
+    ///
+    /// Not used here, because this client keeps one request in flight. It is
+    /// the other half of the throughput story: Nordic's own clients treat it
+    /// as a pipelining window — `windowCapacity` on Android, `pipelineDepth`
+    /// on iOS, both set to `buf_count - 1` by convention — and send that many
+    /// requests without waiting for each reply. Nothing in the protocol
+    /// promises that, since the pool is shared with responses, which is why it
+    /// is a convention and not a rule.
+    pub buf_count: usize,
+}
+
 pub struct SmpClient {
     channel: Box<dyn GattChannel>,
     reassembler: Reassembler,
     seq: u8,
+    /// Bytes one write puts on the wire: the ATT payload, header already off.
     mtu: usize,
-    /// The largest request to build before fragmenting. One MTU by default, so
-    /// a request is one write and a reply is one notification.
+    /// The largest request to build before fragmenting, header included. One
+    /// MTU by default, so a request is one write; `negotiate_request_limit`
+    /// raises it to whatever the device says it can reassemble.
     request_limit: usize,
     timeout: Duration,
 }
@@ -47,6 +82,9 @@ impl SmpClient {
 
     /// Overrides what the platform said one write can carry.
     ///
+    /// This is bytes of ATT payload, not the ATT MTU: a write of exactly the
+    /// MTU is three bytes too long and the board never sees it.
+    ///
     /// Takes the request size with it, so the default stays "one request, one
     /// write". Call `with_request_limit` after this to part the two.
     pub fn with_mtu(mut self, mtu: usize) -> Self {
@@ -57,7 +95,7 @@ impl SmpClient {
 
     /// Sets how large a request may get before it is fragmented.
     pub fn with_request_limit(mut self, limit: usize) -> Self {
-        self.request_limit = limit;
+        self.request_limit = limit.min(MAX_REQUEST);
         self
     }
 
@@ -155,6 +193,77 @@ impl SmpClient {
         Ok(true)
     }
 
+    /// What the device says its request buffers are, if it will say.
+    ///
+    /// `Ok(None)` is a device that does not carry the command — it is optional,
+    /// and mcumgr answers an unknown one with an error rather than silence.
+    pub fn mcumgr_params(&mut self) -> Result<Option<McumgrParams>, SmpError> {
+        let empty = cbor::encode(&cbor::map(vec![]));
+        let reply = self.transact(Op::Read, OS_GROUP, OS_CMD_MCUMGR_PARAMS, &empty)?;
+        match parse_params(&reply) {
+            // "Command not supported" is the device refusing the question, not
+            // failing at it: mcumgr answers an unknown command that way.
+            Err(SmpError::Remote { rc, meaning, .. }) => {
+                log::debug!("no mcumgr parameters on this board: {meaning} (rc {rc})");
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    /// Sizes requests from what the device can reassemble, and says what it
+    /// settled on.
+    ///
+    /// Without this a request is one write, so an upload costs a round trip per
+    /// two hundred-odd bytes — at a 15 ms connection interval that round trip
+    /// *is* the transfer time, and the radio sits idle through most of it. A
+    /// request that fills the device's reassembly buffer carries ten times as
+    /// much image for the same round trip, and the fragmenter already knows how
+    /// to spread one across writes.
+    ///
+    /// Nothing here is fatal. A board that does not answer, or answers that it
+    /// has never heard of the command, keeps the one-write default: a slow
+    /// upload rather than a failed one.
+    ///
+    /// A board that reports a buffer it cannot actually take is a real hazard
+    /// and not a hypothetical: Zephyr's reassembly carries no sequence numbers
+    /// and no checksum, so one fragment lost anywhere below GATT silently
+    /// discards the whole request and the reply never comes. The more writes a
+    /// request is spread over, the more of that exposure it buys. `upload`
+    /// halves its way back down when that happens.
+    pub fn negotiate_request_limit(&mut self) -> usize {
+        match self.mcumgr_params() {
+            Ok(Some(params)) => {
+                if params.buf_size > HEADER_LEN {
+                    self.request_limit = params.buf_size.min(MAX_REQUEST);
+                    log::info!(
+                        "the board reassembles {} bytes ({} buffers); {} per request, {} per write",
+                        params.buf_size,
+                        params.buf_count,
+                        self.request_limit,
+                        self.mtu
+                    );
+                } else {
+                    log::warn!(
+                        "the board claims a {}-byte buffer, which is not one; keeping {}",
+                        params.buf_size,
+                        self.request_limit
+                    );
+                }
+            }
+            Ok(None) => log::info!(
+                "the board does not report its buffers; one request per write ({})",
+                self.request_limit
+            ),
+            Err(err) => log::warn!(
+                "could not ask the board about its buffers ({err}); \
+                 keeping {} per request",
+                self.request_limit
+            ),
+        }
+        self.request_limit
+    }
+
     /// Every image the board is carrying, slot by slot.
     pub fn image_state(&mut self) -> Result<Vec<ImageSlot>, SmpError> {
         let empty = cbor::encode(&cbor::map(vec![]));
@@ -187,6 +296,7 @@ impl SmpClient {
 
         let mut off = 0u32;
         let mut stalls = 0;
+        let mut shrinks = 0;
         on_progress(FlashProgress::Writing {
             bytes_written: 0,
             total_bytes: data.len(),
@@ -213,7 +323,27 @@ impl SmpClient {
                 Some(&sha),
                 &data[start..start + size],
             );
-            let reply = self.transact(Op::Write, img::GROUP, img::CMD_UPLOAD, &payload)?;
+            let reply = match self.transact(Op::Write, img::GROUP, img::CMD_UPLOAD, &payload) {
+                Ok(reply) => reply,
+                // A board that reported a buffer it cannot actually fill says
+                // nothing at all: the fragments land, the request is dropped
+                // somewhere below the handlers, and no error comes back to
+                // read. Halving is the only way to tell that apart from a
+                // board that has gone away, and it costs one timeout.
+                Err(SmpError::Timeout(waited))
+                    if self.request_limit > self.mtu && shrinks < MAX_SHRINKS =>
+                {
+                    shrinks += 1;
+                    self.request_limit = (self.request_limit / 2).max(self.mtu);
+                    log::warn!(
+                        "no reply to a {size}-byte chunk in {waited:?}; \
+                         trying {} bytes per request",
+                        self.request_limit
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let next = img::advance(off, size as u32, total, img::parse_upload(&reply)?.off)?;
 
             if next <= off {
@@ -249,6 +379,28 @@ impl SmpClient {
                 Ok(())
             }
             Err(err) => Err(err),
+        }
+    }
+}
+
+/// The buffer sizes out of an mcumgr-parameters response.
+///
+/// A reply with an error in it is the device saying no; a reply with neither
+/// error nor sizes is one that answered the wrong question, and is treated the
+/// same as not having the command at all.
+fn parse_params(payload: &[u8]) -> Result<Option<McumgrParams>, SmpError> {
+    let value = cbor::decode(payload)?;
+    proto::check_rc(&value, OS_GROUP)?;
+
+    let field = |name: &str| cbor::field(&value, name).and_then(cbor::as_u32);
+    match (field("buf_size"), field("buf_count")) {
+        (Some(buf_size), Some(buf_count)) => Ok(Some(McumgrParams {
+            buf_size: buf_size as usize,
+            buf_count: buf_count as usize,
+        })),
+        _ => {
+            log::debug!("an mcumgr-parameters reply with no sizes in it");
+            Ok(None)
         }
     }
 }
@@ -289,6 +441,17 @@ mod tests {
         accept: Accept,
         /// Set once the next reply should carry this instead of a success.
         fail_with: Option<i64>,
+        /// What it really reassembles into. A request past this is dropped on
+        /// the floor by the firmware, so here it is a failed test.
+        capacity: usize,
+        /// A request past this gets no answer, the way a board that reported
+        /// more than it can take behaves.
+        silent_over: Option<usize>,
+        /// What it says when asked, as `(buf_size, buf_count)`. `None` is a
+        /// build without the mcumgr-parameters command.
+        buffers: Option<(usize, usize)>,
+        /// The largest request that ever reached it whole.
+        largest: Arc<Mutex<usize>>,
         requests: Arc<Mutex<Vec<(u16, u8)>>>,
         resets: Arc<Mutex<u32>>,
     }
@@ -304,6 +467,10 @@ mod tests {
                 declared_sha: None,
                 accept: Accept::All,
                 fail_with: None,
+                capacity: 2475,
+                silent_over: None,
+                buffers: Some((2475, 4)),
+                largest: Arc::new(Mutex::new(0)),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 resets: Arc::new(Mutex::new(0)),
             }
@@ -321,12 +488,40 @@ mod tests {
 
         fn handle(&mut self, header: Header, body: &[u8]) {
             self.requests.lock().unwrap().push((header.group, header.command));
+
+            // What the firmware's reassembly does with a frame too big for a
+            // net_buf, minus the politeness of an error.
+            let whole = HEADER_LEN + body.len();
+            let mut largest = self.largest.lock().unwrap();
+            *largest = (*largest).max(whole);
+            drop(largest);
+            assert!(
+                whole <= self.capacity,
+                "a {whole}-byte request into a {}-byte buffer",
+                self.capacity
+            );
+            if self.silent_over.is_some_and(|most| whole > most) {
+                return;
+            }
+
             if let Some(rc) = self.fail_with.take() {
                 self.answer(header, cbor::map(vec![("rc", Value::Integer(rc.into()))]));
                 return;
             }
 
             match (header.group, header.command) {
+                (OS_GROUP, OS_CMD_MCUMGR_PARAMS) => match self.buffers {
+                    Some((buf_size, buf_count)) => self.answer(
+                        header,
+                        cbor::map(vec![
+                            ("buf_size", cbor::uint(buf_size as u32)),
+                            ("buf_count", cbor::uint(buf_count as u32)),
+                        ]),
+                    ),
+                    // MGMT_ERR_ENOTSUP, which is what a build without the
+                    // command answers.
+                    None => self.answer(header, cbor::map(vec![("rc", cbor::uint(8))])),
+                },
                 (OS_GROUP, OS_CMD_RESET) => {
                     *self.resets.lock().unwrap() += 1;
                     self.answer(header, cbor::map(vec![("rc", cbor::uint(0))]));
@@ -592,24 +787,6 @@ mod tests {
     #[test]
     fn a_reset_the_board_reboots_through_is_not_a_failure() {
         // Nothing ever answers: the board went down with the request.
-        struct Deaf;
-        impl GattChannel for Deaf {
-            fn mtu(&self) -> usize {
-                244
-            }
-            fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-                Ok(Vec::new())
-            }
-            fn write(&mut self, _value: &[u8]) -> Result<(), crate::BleError> {
-                Ok(())
-            }
-            fn notification(
-                &mut self,
-                _timeout: Duration,
-            ) -> Result<Option<Vec<u8>>, crate::BleError> {
-                Ok(None)
-            }
-        }
         let mut client = SmpClient::new(Box::new(Deaf)).with_timeout(Duration::from_millis(10));
         assert!(client.reset().is_ok());
         // But a command that needs an answer still fails.
@@ -701,6 +878,158 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A channel that answers nothing, for the cases where the board does not.
+    struct Deaf;
+    impl GattChannel for Deaf {
+        fn mtu(&self) -> usize {
+            249
+        }
+        fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
+            Ok(Vec::new())
+        }
+        fn write(&mut self, _value: &[u8]) -> Result<(), crate::BleError> {
+            Ok(())
+        }
+        fn notification(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, crate::BleError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_request_never_outgrows_the_write_budget() {
+        // Bug 1, in arithmetic: BlueZ reports the ATT MTU, so the budget is
+        // three bytes less, and a request built to fill it has to fit in one
+        // write rather than being three bytes over and dropped in silence.
+        let att_mtu = 252usize;
+        let budget = att_mtu - 3;
+
+        let mut device = FakeDevice::new(budget);
+        device.buffers = None;
+        device.capacity = budget;
+        let widest = Arc::clone(&device.largest);
+        let image: Vec<u8> = (0..2000u32).map(|byte| byte as u8).collect();
+
+        // The FakeDevice asserts every write is within the MTU on its way in.
+        client(device).upload(0, &image, &|_| {}).unwrap();
+        let widest = *widest.lock().unwrap();
+        assert!(widest <= budget, "{widest} bytes in a {budget}-byte write");
+        // And it is spending the budget, not hiding under it.
+        assert_eq!(widest, budget);
+    }
+
+    #[test]
+    fn the_request_size_comes_from_the_buffer_the_board_reports() {
+        let mut client = client(FakeDevice::new(249));
+        assert_eq!(client.request_limit(), 249);
+        assert_eq!(client.negotiate_request_limit(), 2475);
+        assert_eq!(client.mcumgr_params().unwrap().unwrap().buf_count, 4);
+        // The write size is a property of the link and does not move with it.
+        assert_eq!(client.mtu(), 249);
+    }
+
+    #[test]
+    fn a_board_without_the_parameters_command_keeps_one_request_per_write() {
+        let mut device = FakeDevice::new(249);
+        device.buffers = None;
+        let mut client = client(device);
+        assert_eq!(client.mcumgr_params().unwrap(), None);
+        assert_eq!(client.negotiate_request_limit(), 249);
+    }
+
+    #[test]
+    fn a_board_that_will_not_answer_at_all_keeps_one_request_per_write() {
+        // A failure to negotiate is not a failure to update.
+        let mut client = SmpClient::new(Box::new(Deaf)).with_timeout(Duration::from_millis(10));
+        assert!(client.mcumgr_params().is_err());
+        assert_eq!(client.negotiate_request_limit(), 249);
+    }
+
+    #[test]
+    fn a_nonsense_buffer_size_is_not_taken_at_its_word() {
+        for buffers in [(0usize, 4usize), (8, 4)] {
+            let mut device = FakeDevice::new(249);
+            device.buffers = Some(buffers);
+            assert_eq!(client(device).negotiate_request_limit(), 249, "{buffers:?}");
+        }
+        // And one that would not fit the header's length field is clamped.
+        let mut device = FakeDevice::new(249);
+        device.buffers = Some((1 << 20, 4));
+        assert_eq!(client(device).negotiate_request_limit(), MAX_REQUEST);
+        assert_eq!(
+            SmpClient::new(Box::new(Deaf)).with_request_limit(usize::MAX).request_limit(),
+            MAX_REQUEST
+        );
+    }
+
+    #[test]
+    fn a_negotiated_upload_fills_the_boards_buffer_and_lands_the_same_image() {
+        // Bug 2: the same image, in a tenth of the round trips, still byte for
+        // byte what went in.
+        let image: Vec<u8> = (0..20_000u32).map(|byte| (byte % 251) as u8).collect();
+        let device = FakeDevice::new(249);
+        let widest = Arc::clone(&device.largest);
+        let requests = Arc::clone(&device.requests);
+        let landed = Arc::new(Mutex::new(Vec::new()));
+
+        let mut client = SmpClient::new(Box::new(Watched {
+            inner: device,
+            landed: Arc::clone(&landed),
+            declared: Arc::new(Mutex::new((None, None))),
+        }));
+        assert_eq!(client.negotiate_request_limit(), 2475);
+        client.upload(0, &image, &|_| {}).unwrap();
+
+        assert_eq!(*landed.lock().unwrap(), image);
+        // Filling the buffer, and never overrunning it — the FakeDevice would
+        // have panicked on that.
+        assert!(*widest.lock().unwrap() > 2400, "{}", widest.lock().unwrap());
+
+        let uploads = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| **request == (img::GROUP, img::CMD_UPLOAD))
+            .count();
+        // 20 KiB in 2.4 KiB requests, rather than the 84 a 249-byte one needs.
+        assert!(uploads <= 10, "{uploads} round trips");
+    }
+
+    #[test]
+    fn a_board_that_claimed_more_than_it_can_take_is_followed_back_down() {
+        // Seen on hardware: the board reports a 2475-byte buffer and then
+        // answers nothing at all to a request that fills it. A slower upload
+        // is the right outcome; a failed one is not.
+        let mut device = FakeDevice::new(249);
+        device.silent_over = Some(600);
+        let landed = Arc::new(Mutex::new(Vec::new()));
+        let image: Vec<u8> = (0..4000u32).map(|byte| (byte % 251) as u8).collect();
+
+        let mut client = SmpClient::new(Box::new(Watched {
+            inner: device,
+            landed: Arc::clone(&landed),
+            declared: Arc::new(Mutex::new((None, None))),
+        }))
+        .with_timeout(Duration::from_millis(10));
+        assert_eq!(client.negotiate_request_limit(), 2475);
+
+        client.upload(0, &image, &|_| {}).unwrap();
+        assert_eq!(*landed.lock().unwrap(), image);
+        // 2475 -> 1237 -> 618 -> 309, the first size the board will answer.
+        assert_eq!(client.request_limit(), 309);
+    }
+
+    #[test]
+    fn a_board_that_answers_nothing_at_all_still_fails_the_upload() {
+        // Shrinking is bounded: a dead link must not turn into an endless
+        // sequence of ever-smaller requests.
+        let mut client = SmpClient::new(Box::new(Deaf))
+            .with_request_limit(2475)
+            .with_timeout(Duration::from_millis(5));
+        let err = client.upload(0, &[0x42; 5000], &|_| {}).unwrap_err();
+        assert!(matches!(err, SmpError::Timeout(_)), "{err:?}");
+        assert_eq!(client.request_limit(), 249);
     }
 
     #[test]

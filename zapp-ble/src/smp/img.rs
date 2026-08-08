@@ -335,7 +335,9 @@ mod tests {
             HEADER_LEN + upload_request(0, off, 300_000, Some(&SHA), &vec![0u8; data]).len()
         };
 
-        for limit in [64usize, 100, 244, 251, 512, 2048] {
+        // 249 is what one write carries on a Voyager 2; 2475 is the buffer it
+        // reassembles a fragmented request into.
+        for limit in [64usize, 100, 244, 249, 251, 512, 2048, 2475] {
             for off in [0u32, 1, 23, 24, 255, 256, 65535, 65536, 200_000] {
                 let size = chunk_size(0, off, 300_000, Some(&SHA), 300_000, limit);
                 if size == 0 {
@@ -353,6 +355,20 @@ mod tests {
                     "{off} in {limit}: could have sent {size}+1"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_request_stays_inside_the_decoders_map() {
+        // Zephyr decodes the top-level map with a fixed number of slots —
+        // MCUMGR_SMP_CBOR_MAX_MAIN_MAP_ENTRIES, 15 on this firmware — so a
+        // request with more keys than that is refused whatever its size.
+        for off in [0u32, 4096] {
+            let Value::Map(entries) = decoded(&upload_request(0, off, 1000, Some(&SHA), &[1, 2]))
+            else {
+                panic!("an upload request is a map");
+            };
+            assert!(entries.len() <= 15, "{} entries at {off}", entries.len());
         }
     }
 

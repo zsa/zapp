@@ -7,9 +7,9 @@
 //! packet after that is a plain `write`/`read` on a file descriptor: no D-Bus
 //! round trip, no message marshalling, and back pressure comes free from the
 //! socket buffer filling up. They also answer the question nothing else does —
-//! `AcquireWrite` returns the negotiated MTU, which is what decides how much
-//! image fits in one request. A firmware image is tens of thousands of packets,
-//! so this is the path that matters.
+//! `AcquireWrite` returns the negotiated ATT MTU, which is what decides how
+//! much image fits in one write. A firmware image is tens of thousands of
+//! packets, so this is the path that matters.
 //!
 //! `WriteValue` plus `PropertiesChanged` needs no kernel tricks and works on
 //! every BlueZ, but pays a bus round trip per packet in each direction and
@@ -46,6 +46,20 @@ const RESOLVE_POLL: Duration = Duration::from_millis(200);
 /// fallback path's guess, matching the 247-byte ATT MTU a Zephyr peripheral
 /// asks for, less the three bytes of ATT header.
 const DEFAULT_MTU: usize = 244;
+
+/// The ATT header on a write command and on a notification: one byte of
+/// opcode, two of attribute handle.
+///
+/// Every MTU BlueZ hands out — `AcquireWrite`, `AcquireNotify`, and the `MTU`
+/// property — is the *ATT* MTU, the whole PDU, not the value that fits in it.
+/// Subtracting this is what turns it into bytes of payload.
+///
+/// Proven on a Voyager 2 (`CONFIG_BT_L2CAP_TX_MTU=252`), which is what this
+/// constant is here to stop being re-guessed: BlueZ reported 252, echo requests
+/// of 249 bytes came back, and 250 through 256 were dropped by the ATT layer
+/// with no error anywhere. A request that exactly filled the reported MTU was
+/// three bytes too long and vanished.
+const ATT_HEADER: usize = 3;
 
 /// Connects if need be, then opens a characteristic.
 pub fn open(
@@ -177,13 +191,13 @@ impl FdChannel {
         let notifier = socket(notify_fd)?;
         let writer = socket(write_fd)?;
 
-        // Both are ATT payload sizes, already less the three bytes of ATT
-        // header, and a request cannot outgrow what a notification can answer.
-        let mtu = usize::from(write_mtu.min(notify_mtu));
-        log::debug!("acquired sockets on {path}, mtu {mtu} (write {write_mtu}, notify {notify_mtu})");
-        if mtu == 0 {
-            return Err(BleError::Platform("BlueZ reported a zero MTU".into()));
-        }
+        // Both are ATT MTUs, so both pay the ATT header, and a request cannot
+        // outgrow what a notification can answer.
+        let mtu = payload_of(write_mtu.min(notify_mtu))?;
+        log::debug!(
+            "acquired sockets on {path}, {mtu} bytes per write \
+             (att mtu: write {write_mtu}, notify {notify_mtu})"
+        );
 
         Ok(Self {
             writer,
@@ -193,6 +207,18 @@ impl FdChannel {
             connection: connection.clone(),
             timeout: None,
         })
+    }
+}
+
+/// Bytes of payload in an ATT MTU.
+///
+/// Anything that cannot hold a header and a byte is not a link to write on.
+pub(crate) fn payload_of(att_mtu: u16) -> Result<usize, BleError> {
+    match usize::from(att_mtu).checked_sub(ATT_HEADER) {
+        Some(payload) if payload > 0 => Ok(payload),
+        _ => Err(BleError::Platform(format!(
+            "BlueZ reported an ATT MTU of {att_mtu}, which cannot carry anything"
+        ))),
     }
 }
 
@@ -221,6 +247,18 @@ impl GattChannel for FdChannel {
     }
 
     fn write(&mut self, value: &[u8]) -> Result<(), BleError> {
+        // Nothing downstream will complain: the socket takes the bytes, BlueZ
+        // reads them, and its ATT layer drops a PDU that will not fit the MTU
+        // without a callback, an error or a log line. Refusing here is the only
+        // place an oversized write can be noticed at all.
+        if value.len() > self.mtu {
+            return Err(BleError::Platform(format!(
+                "a {}-byte write will not fit the {}-byte ATT payload and would be \
+                 dropped without a word",
+                value.len(),
+                self.mtu
+            )));
+        }
         // A sequenced-packet socket sends one packet per write, which is
         // exactly the framing GATT wants; write_all would be wrong here, since
         // a short write would become a second packet.
@@ -282,15 +320,16 @@ impl DbusChannel {
             .call::<_, _, ()>("StartNotify", &())
             .map_err(|err| BleError::Platform(format!("StartNotify on {path} failed: {err}")))?;
 
-        // BlueZ 5.62 and later publish the ATT MTU here, header included.
-        let mtu = match proxy.get_property::<u16>("MTU") {
-            Ok(mtu) if mtu > 3 => usize::from(mtu) - 3,
+        // BlueZ 5.62 and later publish the ATT MTU here, header included, the
+        // same as the acquired sockets report.
+        let mtu = match proxy.get_property::<u16>("MTU").map(payload_of) {
+            Ok(Ok(mtu)) => mtu,
             _ => {
                 log::warn!("BlueZ will not say what the MTU is; assuming {DEFAULT_MTU}");
                 DEFAULT_MTU
             }
         };
-        log::debug!("notifying on {path} over D-Bus, mtu {mtu}");
+        log::debug!("notifying on {path} over D-Bus, {mtu} bytes per write");
 
         Ok(Self {
             connection: connection.clone(),
@@ -352,6 +391,13 @@ impl GattChannel for DbusChannel {
     }
 
     fn write(&mut self, value: &[u8]) -> Result<(), BleError> {
+        if value.len() > self.mtu {
+            return Err(BleError::Platform(format!(
+                "a {}-byte write will not fit the {}-byte ATT payload",
+                value.len(),
+                self.mtu
+            )));
+        }
         let proxy = Proxy::new(&self.connection, bluez::BLUEZ, self.path.as_str(), CHARACTERISTIC)
             .map_err(bluez::platform)?;
         // "command" is write-without-response, which is the only kind the SMP
@@ -382,5 +428,28 @@ impl Drop for DbusChannel {
         if let Err(err) = call {
             log::debug!("StopNotify on {} failed: {err}", self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_att_mtu_becomes_the_payload_that_fits_in_it() {
+        // The figures that matter: what a Voyager 2 negotiates, what BlueZ
+        // reported when a full-MTU request was being dropped, and the smallest
+        // ATT MTU there is.
+        assert_eq!(payload_of(252).unwrap(), 249);
+        assert_eq!(payload_of(247).unwrap(), 244);
+        assert_eq!(payload_of(23).unwrap(), 20);
+    }
+
+    #[test]
+    fn an_mtu_with_no_room_for_a_payload_is_refused() {
+        for att_mtu in [0u16, 1, 2, 3] {
+            assert!(payload_of(att_mtu).is_err(), "{att_mtu}");
+        }
+        assert_eq!(payload_of(4).unwrap(), 1);
     }
 }

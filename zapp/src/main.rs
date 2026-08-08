@@ -121,10 +121,12 @@ struct SmpArgs {
     /// Which board, by advertised name or by the handle `zapp devices` shows
     #[arg(long, short = 'd')]
     device: Option<String>,
-    /// Bytes per Bluetooth write. Defaults to what the platform reports.
+    /// Bytes of payload per Bluetooth write, the ATT MTU less its 3-byte
+    /// header. Defaults to what the platform reports.
     #[arg(long)]
     mtu: Option<usize>,
-    /// Largest request to send. Defaults to one MTU, so nothing is fragmented.
+    /// Largest request to send, fragmented across writes. Defaults to the
+    /// buffer the board reports, or one write if it does not report one.
     #[arg(long)]
     chunk: Option<usize>,
     /// Seconds to wait for each reply
@@ -386,15 +388,22 @@ fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
     if let Some(mtu) = args.mtu {
         client = client.with_mtu(mtu);
     }
-    if let Some(chunk) = args.chunk {
-        client = client.with_request_limit(chunk);
+    let mut client = client.with_timeout(Duration::from_secs(args.timeout));
+
+    // The timeout has to be set first: this is a request like any other, and
+    // it is the first thing the board is asked.
+    match args.chunk {
+        Some(chunk) => client = client.with_request_limit(chunk),
+        None => {
+            client.negotiate_request_limit();
+        }
     }
     log::debug!(
         "connected, {} bytes per write, {} per request",
         client.mtu(),
         client.request_limit()
     );
-    Ok(client.with_timeout(Duration::from_secs(args.timeout)))
+    Ok(client)
 }
 
 fn cmd_smp_images(args: &SmpArgs) -> Result<()> {
