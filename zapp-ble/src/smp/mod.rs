@@ -15,6 +15,7 @@
 //! `img`, and a client in `client` that is driven through a `GattChannel` and
 //! so can be run against a fake device with no radio in sight.
 
+pub mod bundle;
 pub mod cbor;
 pub mod client;
 pub mod image;
@@ -25,11 +26,12 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+pub use bundle::Bundle;
 pub use client::SmpClient;
 pub use img::ImageSlot;
 
 use crate::backend;
-use crate::{identity, BleError, BleSighting};
+use crate::{identity, Battery, BleError, BleSighting};
 
 /// The Zephyr SMP service, and the one characteristic everything rides on.
 pub const SMP_SERVICE: u128 = 0x8d53dc1d_1db7_4cd3_868b_8a527460aa84;
@@ -171,6 +173,24 @@ pub fn open(hint: Option<&str>, half: Half) -> Result<SmpClient, SmpError> {
     let (service, characteristic) = half.channel();
     let channel = backend.open(&key, service, characteristic)?;
     Ok(SmpClient::new(channel))
+}
+
+/// What the halves have left, in one look, without starting a monitor.
+///
+/// A `BleMonitor` would keep a discovery window opening behind the update, and
+/// a scanning radio is airtime the link does not get — over a transfer measured
+/// in minutes that is worth avoiding.
+///
+/// A board only publishes its levels while it is connected, so this says
+/// nothing at all about one that is not; the battery gate reads that as unknown
+/// and allows it. Calling this straight after a session is open is what makes
+/// it answer.
+pub fn battery(hint: Option<&str>) -> Result<Battery, SmpError> {
+    let mut backend = backend::for_platform(&[]).ok_or(BleError::NoAdapter)?;
+    let sightings = backend.sightings()?;
+    let battery = select(&sightings, hint)?.battery;
+    backend.stop_discovery();
+    Ok(battery)
 }
 
 /// The one board a hint names, out of everything the platform can see.

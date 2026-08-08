@@ -1,3 +1,5 @@
+mod zsab;
+
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -71,8 +73,12 @@ enum Commands {
             --half right sends the same commands to the right half instead, \
             through a second service on the left that relays whole frames over \
             the halves' radio link. Update the right half first: it is only \
-            reachable while both halves still speak the same protocol.",
+            reachable while both halves still speak the same protocol.\n\n\
+            `zapp smp bundle` does all of that in one go, both halves, from a \
+            .zsab release bundle. The subcommands below are what it is built \
+            from, and what to reach for when one step needs doing by hand.",
         after_long_help = "Examples:\n  \
+            zapp smp bundle voyager2_0.1.8.zsab\n  \
             zapp smp images\n  \
             zapp smp upload app.signed.bin\n  \
             zapp smp images --half right\n  \
@@ -89,6 +95,36 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum SmpCommands {
+    /// Update both halves from one .zsab bundle
+    #[command(
+        long_about = "Update both halves from one .zsab bundle.\n\n\
+            A .zsab carries both nRF images and the build they came from, and \
+            this drives the whole update from it: read what is installed, \
+            write the right half, write the left, restart both and wait for \
+            each to come back and confirm itself. A half already running its \
+            image is skipped rather than written again.\n\n\
+            The right half goes first, always. It is reachable only through \
+            the left, and only while both halves still speak the same \
+            protocol, so a left updated first would cut off the only route to \
+            the half still waiting for its image.\n\n\
+            The keyboard cannot be typed on while this runs and both halves go \
+            dark. It takes a couple of minutes. Nothing is confirmed until it \
+            has proved itself, so a keyboard left half-way through gets its old \
+            firmware back on the next power cycle.",
+        after_long_help = "Examples:\n  \
+            zapp smp bundle voyager2_0.1.8.zsab\n  \
+            zapp smp bundle voyager2_0.1.8.zsab --force\n  \
+            zapp smp bundle voyager2_0.1.8.zsab --device \"Voyager\""
+    )]
+    Bundle {
+        /// Path to a .zsab firmware bundle
+        bundle: PathBuf,
+        /// Write both halves even where the image is already installed
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        args: LinkArgs,
+    },
     /// List the images the board is carrying, slot by slot
     Images(SmpArgs),
     /// Upload an MCUboot-signed image into the board's spare slot
@@ -128,6 +164,16 @@ struct SmpArgs {
     /// through the left's relay
     #[arg(long, default_value = "left")]
     half: Half,
+    #[command(flatten)]
+    link: LinkArgs,
+}
+
+/// Everything about reaching a board that does not say which half.
+///
+/// Split out so the bundle flow, which talks to both halves in turn and picks
+/// the order itself, takes the same options as a single command.
+#[derive(clap::Args)]
+pub struct LinkArgs {
     /// Which board, by advertised name or by the handle `zapp devices` shows
     #[arg(long, short = 'd')]
     device: Option<String>,
@@ -165,6 +211,11 @@ fn main() -> Result<()> {
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
         Commands::Smp { command } => match command {
+            SmpCommands::Bundle {
+                bundle,
+                force,
+                args,
+            } => zsab::update(&bundle, force, &args),
             SmpCommands::Images(args) => cmd_smp_images(&args),
             SmpCommands::Upload {
                 firmware,
@@ -392,15 +443,15 @@ fn new_spinner(msg: &str) -> ProgressBar {
 ///
 /// The spinner is the whole point of doing this in one place: a board that is
 /// bonded but idle takes seconds to wake, and silence there looks like a hang.
-fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
-    let spinner = new_spinner(match args.half {
+pub fn smp_connect(args: &LinkArgs, half: Half) -> Result<SmpClient> {
+    let spinner = new_spinner(match half {
         Half::Left => "Connecting over Bluetooth...",
         Half::Right => "Connecting to the right half over Bluetooth...",
     });
-    let client = smp::open(args.device.as_deref(), args.half);
+    let client = smp::open(args.device.as_deref(), half);
     spinner.finish_and_clear();
 
-    let mut client = client.with_context(|| match args.half {
+    let mut client = client.with_context(|| match half {
         Half::Left => "Could not reach the board over Bluetooth".to_string(),
         Half::Right => "Could not reach the right half over Bluetooth. It is reached \
                         through the left, so the left must be running firmware with the \
@@ -455,7 +506,7 @@ fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
 }
 
 fn cmd_smp_images(args: &SmpArgs) -> Result<()> {
-    let mut client = smp_connect(args)?;
+    let mut client = smp_connect(&args.link, args.half)?;
     let slots = client.image_state().context("Could not read the image state")?;
     print_image_state(&slots);
     Ok(())
@@ -512,7 +563,7 @@ fn cmd_smp_upload(path: &Path, image: u32, args: &SmpArgs) -> Result<()> {
     }
     println!("SHA-256: {}", smp::image::hex(&smp::image::sha256(&data)));
 
-    let mut client = smp_connect(args)?;
+    let mut client = smp_connect(&args.link, args.half)?;
     let pb = ProgressBar::new(data.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -544,7 +595,7 @@ fn cmd_smp_mark(hash: &str, confirm: bool, args: &SmpArgs) -> Result<()> {
     let hash = smp::image::unhex(hash)
         .with_context(|| format!("{hash:?} is not a hash; expected hex, as `zapp smp images` prints it"))?;
 
-    let mut client = smp_connect(args)?;
+    let mut client = smp_connect(&args.link, args.half)?;
     let slots = client
         .mark(&hash, confirm)
         .with_context(|| match confirm {
@@ -562,7 +613,7 @@ fn cmd_smp_mark(hash: &str, confirm: bool, args: &SmpArgs) -> Result<()> {
 }
 
 fn cmd_smp_reset(args: &SmpArgs) -> Result<()> {
-    let mut client = smp_connect(args)?;
+    let mut client = smp_connect(&args.link, args.half)?;
     client.reset().context("Reset failed")?;
     println!("Resetting.");
     Ok(())
