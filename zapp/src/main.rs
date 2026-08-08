@@ -395,7 +395,23 @@ fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
     match args.chunk {
         Some(chunk) => client = client.with_request_limit(chunk),
         None => {
-            client.negotiate_request_limit();
+            // What the board says it can reassemble is not what it can take
+            // while it is also erasing and writing flash. Measured on a
+            // Voyager 2 (reported buffer 2475, 249 per write): os_mgmt echo
+            // answers up to 5 writes per request and stops dead at 6, and an
+            // upload — whose first chunk erases a 712 KB slot — fails even at
+            // 5, wedging the radio until the board is reset. One write per
+            // request is the only size that has carried an image end to end.
+            // `--chunk` opts into more.
+            let reported = client.negotiate_request_limit();
+            let safe = client.mtu();
+            if reported > safe {
+                log::info!(
+                    "board reports {reported} per request; using {safe} \
+                     (one write) — pass --chunk to override"
+                );
+                client = client.with_request_limit(safe);
+            }
         }
     }
     log::debug!(
