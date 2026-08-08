@@ -1,6 +1,6 @@
 //! Temporary: finds the largest SMP request the board actually answers.
 //!
-//! `mtu_probe <lo> <hi> [step] [write_mtu]`. With no write MTU each request is
+//! `mtu_probe <lo> <hi> [step] [write_mtu] [half]`. With no write MTU each request is
 //! one write of exactly its own size, which is what pins the ATT boundary; with
 //! one, requests larger than it are fragmented, which is what pins the
 //! reassembly boundary. Uses os_mgmt echo, so nothing on the board is written.
@@ -33,7 +33,8 @@ fn main() {
         .format_timestamp(None)
         .init();
 
-    let mut client = smp::open(None).expect("a bonded board");
+    let half: smp::Half = arg(5, smp::Half::Left);
+    let mut client = smp::open(None, half).expect("a bonded board");
     println!("channel reports {} bytes per write", client.mtu());
 
     let lo: usize = arg(1, 240);

@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_ble::smp::{self, ImageSlot, SmpClient};
+use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
@@ -67,10 +67,16 @@ enum Commands {
             already be bonded to this machine: pairing is the desktop's job. \n\
             A firmware update is three steps — upload the image, mark it for \
             test, reset — and each is a subcommand here so a failure is visible \
-            where it happens.",
+            where it happens.\n\n\
+            --half right sends the same commands to the right half instead, \
+            through a second service on the left that relays whole frames over \
+            the halves' radio link. Update the right half first: it is only \
+            reachable while both halves still speak the same protocol.",
         after_long_help = "Examples:\n  \
             zapp smp images\n  \
             zapp smp upload app.signed.bin\n  \
+            zapp smp images --half right\n  \
+            zapp smp upload right.signed.bin --half right\n  \
             zapp smp test 3a5f9c...\n  \
             zapp smp confirm 3a5f9c...\n  \
             zapp smp reset"
@@ -118,6 +124,10 @@ enum SmpCommands {
 
 #[derive(clap::Args)]
 struct SmpArgs {
+    /// Which half to talk to: the left's own SMP service, or the right's
+    /// through the left's relay
+    #[arg(long, default_value = "left")]
+    half: Half,
     /// Which board, by advertised name or by the handle `zapp devices` shows
     #[arg(long, short = 'd')]
     device: Option<String>,
@@ -125,8 +135,11 @@ struct SmpArgs {
     /// header. Defaults to what the platform reports.
     #[arg(long)]
     mtu: Option<usize>,
-    /// Largest request to send, fragmented across writes. Defaults to the
-    /// buffer the board reports, or one write if it does not report one.
+    /// Bluetooth writes to spend on one request. Defaults to 5.
+    #[arg(long)]
+    writes: Option<usize>,
+    /// Largest request to send, fragmented across writes. Overrides --writes.
+    /// Defaults to the buffer the board reports, capped by --writes.
     #[arg(long)]
     chunk: Option<usize>,
     /// Seconds to wait for each reply
@@ -380,11 +393,20 @@ fn new_spinner(msg: &str) -> ProgressBar {
 /// The spinner is the whole point of doing this in one place: a board that is
 /// bonded but idle takes seconds to wake, and silence there looks like a hang.
 fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
-    let spinner = new_spinner("Connecting over Bluetooth...");
-    let client = smp::open(args.device.as_deref());
+    let spinner = new_spinner(match args.half {
+        Half::Left => "Connecting over Bluetooth...",
+        Half::Right => "Connecting to the right half over Bluetooth...",
+    });
+    let client = smp::open(args.device.as_deref(), args.half);
     spinner.finish_and_clear();
 
-    let mut client = client.context("Could not reach the board over Bluetooth")?;
+    let mut client = client.with_context(|| match args.half {
+        Half::Left => "Could not reach the board over Bluetooth".to_string(),
+        Half::Right => "Could not reach the right half over Bluetooth. It is reached \
+                        through the left, so the left must be running firmware with the \
+                        relay in it, and the halves' radio link must be up."
+            .to_string(),
+    })?;
     if let Some(mtu) = args.mtu {
         client = client.with_mtu(mtu);
     }
@@ -396,21 +418,29 @@ fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
         Some(chunk) => client = client.with_request_limit(chunk),
         None => {
             // What the board says it can reassemble is more than it will take.
-            // Zephyr's BT reassembly has no sequence numbers and no checksum,
-            // so a fragment lost anywhere discards the request silently and no
-            // reply ever comes; the more writes a request spans, the more of
-            // that exposure it buys. Measured on a Voyager 2 (reports 2475,
-            // 249 per write): os_mgmt echo answers up to 8 writes and stops
-            // dead at 9, and an upload of a 316 KB image takes 51 s at one
-            // write, 25 s at five, 22 s at eight. Five keeps margin under the
-            // ceiling for most of the gain. `--chunk` opts into more.
+            // Reassembly across writes carries no sequence numbers and no
+            // checksum — neither Zephyr's nor the left relay's — so a fragment
+            // lost anywhere discards the request silently and no reply ever
+            // comes; the more writes a request spans, the more of that
+            // exposure it buys. Measured on a Voyager 2's left half (reports
+            // 2475, 249 per write): os_mgmt echo answers up to 8 writes and
+            // stops dead at 9, and an upload of a 316 KB image takes 51 s at
+            // one write, 25 s at five, 22 s at eight. Five keeps margin under
+            // the ceiling for most of the gain.
+            //
+            // The right half is not measured: its ceiling is the 1024-byte
+            // frame the relay and its own reassembly buffer share, which five
+            // writes already exceeds, so the reported buffer is what binds and
+            // the count only matters if that frame size changes. Same default
+            // either way; `--writes` and `--chunk` override it.
             const WRITES_PER_REQUEST: usize = 5;
+            let writes = args.writes.unwrap_or(WRITES_PER_REQUEST).max(1);
             let reported = client.negotiate_request_limit();
-            let safe = (client.mtu() * WRITES_PER_REQUEST).min(reported);
+            let safe = (client.mtu() * writes).min(reported);
             if reported > safe {
                 log::info!(
                     "board reports {reported} per request; using {safe} \
-                     (one write) — pass --chunk to override"
+                     ({writes} writes) — pass --chunk or --writes to override"
                 );
                 client = client.with_request_limit(safe);
             }
