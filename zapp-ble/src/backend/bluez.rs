@@ -15,15 +15,15 @@ use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::MatchRule;
 
-use super::Backend;
+use super::{bluez_gatt, Backend, GattChannel};
 use crate::battery::{self, Battery};
 use crate::{identity, BleError, BleSighting};
 
-const BLUEZ: &str = "org.bluez";
-const DEVICE: &str = "org.bluez.Device1";
+pub(super) const BLUEZ: &str = "org.bluez";
+pub(super) const DEVICE: &str = "org.bluez.Device1";
 const ADAPTER: &str = "org.bluez.Adapter1";
-const SERVICE: &str = "org.bluez.GattService1";
-const CHARACTERISTIC: &str = "org.bluez.GattCharacteristic1";
+pub(super) const SERVICE: &str = "org.bluez.GattService1";
+pub(super) const CHARACTERISTIC: &str = "org.bluez.GattCharacteristic1";
 const DESCRIPTOR: &str = "org.bluez.GattDescriptor1";
 
 /// Battery Service, its level characteristic, and the descriptor saying which
@@ -49,8 +49,8 @@ const SCAN_EVERY: Duration = Duration::from_secs(30);
 /// one event.
 const SETTLE: Duration = Duration::from_millis(250);
 
-type Properties = HashMap<String, OwnedValue>;
-type Objects = HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, Properties>>;
+pub(super) type Properties = HashMap<String, OwnedValue>;
+pub(super) type Objects = HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, Properties>>;
 
 pub struct Bluez {
     connection: Connection,
@@ -184,6 +184,33 @@ impl Backend for Bluez {
             })
             .collect())
     }
+
+    /// Shuts the discovery window, and keeps it shut until the next snapshot
+    /// decides otherwise.
+    fn stop_discovery(&mut self) {
+        if self.scanning_since.is_none() {
+            return;
+        }
+        let objects = match self.objects.get_managed_objects() {
+            Ok(objects) => objects,
+            Err(err) => {
+                log::debug!("cannot read the object tree to stop discovery: {err}");
+                return;
+            }
+        };
+        self.for_each_adapter(&objects, "StopDiscovery");
+        self.scanning_since = None;
+        self.scanned_at = Some(Instant::now());
+    }
+
+    fn open(
+        &mut self,
+        key: &str,
+        service: u128,
+        characteristic: u128,
+    ) -> Result<Box<dyn GattChannel>, BleError> {
+        bluez_gatt::open(&self.connection, &self.objects, key, service, characteristic)
+    }
 }
 
 impl Bluez {
@@ -307,7 +334,7 @@ fn watch_signals(connection: &Connection) -> Result<Receiver<()>, BleError> {
 }
 
 /// One interface's properties, if an object carries it.
-fn properties<'a>(
+pub(super) fn properties<'a>(
     ifaces: &'a HashMap<OwnedInterfaceName, Properties>,
     wanted: &str,
 ) -> Option<&'a Properties> {
@@ -318,7 +345,7 @@ fn properties<'a>(
 }
 
 /// Reads a characteristic or descriptor, which means talking to the board.
-fn read(connection: &Connection, path: &str, iface: &str) -> Option<Vec<u8>> {
+pub(super) fn read(connection: &Connection, path: &str, iface: &str) -> Option<Vec<u8>> {
     let proxy = Proxy::new(connection, BLUEZ, path, iface).ok()?;
     let options: HashMap<String, OwnedValue> = HashMap::new();
     match proxy.call::<_, _, Vec<u8>>("ReadValue", &(options,)) {
@@ -356,14 +383,14 @@ fn sighting(path: &str, device: &Properties) -> BleSighting {
     }
 }
 
-fn get<T>(properties: &Properties, key: &str) -> Option<T>
+pub(super) fn get<T>(properties: &Properties, key: &str) -> Option<T>
 where
     T: TryFrom<OwnedValue>,
 {
     T::try_from(properties.get(key)?.try_clone().ok()?).ok()
 }
 
-fn platform(err: impl std::fmt::Display) -> BleError {
+pub(super) fn platform(err: impl std::fmt::Display) -> BleError {
     BleError::Platform(err.to_string())
 }
 

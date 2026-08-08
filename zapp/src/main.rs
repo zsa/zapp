@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use zapp_ble::smp::{self, ImageSlot, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
@@ -58,6 +59,77 @@ enum Commands {
         #[arg(long)]
         scan: bool,
     },
+    /// Drive an mcumgr (SMP) firmware update over Bluetooth
+    #[command(
+        long_about = "Drive an mcumgr (SMP) firmware update over Bluetooth.\n\n\
+            Talks the standard Zephyr SMP service, the one nRF Connect Device \
+            Manager speaks, to the wireless half of a Voyager 2. The board must \
+            already be bonded to this machine: pairing is the desktop's job. \n\
+            A firmware update is three steps — upload the image, mark it for \
+            test, reset — and each is a subcommand here so a failure is visible \
+            where it happens.",
+        after_long_help = "Examples:\n  \
+            zapp smp images\n  \
+            zapp smp upload app.signed.bin\n  \
+            zapp smp test 3a5f9c...\n  \
+            zapp smp confirm 3a5f9c...\n  \
+            zapp smp reset"
+    )]
+    Smp {
+        #[command(subcommand)]
+        command: SmpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SmpCommands {
+    /// List the images the board is carrying, slot by slot
+    Images(SmpArgs),
+    /// Upload an MCUboot-signed image into the board's spare slot
+    #[command(after_long_help = "The image is only written, not booted: mark it \
+        with `zapp smp test <hash>` and reset to try it, or `zapp smp confirm \
+        <hash>` to keep it. `zapp smp images` shows the hash afterwards.")]
+    Upload {
+        /// Path to an MCUboot-signed .bin
+        firmware: PathBuf,
+        /// Which image, on a board carrying more than one
+        #[arg(long, default_value_t = 0)]
+        image: u32,
+        #[command(flatten)]
+        args: SmpArgs,
+    },
+    /// Mark an image to be tried on the next boot, by hash
+    Test {
+        /// The image hash, as `zapp smp images` prints it
+        hash: String,
+        #[command(flatten)]
+        args: SmpArgs,
+    },
+    /// Confirm an image permanently, by hash
+    Confirm {
+        /// The image hash, as `zapp smp images` prints it
+        hash: String,
+        #[command(flatten)]
+        args: SmpArgs,
+    },
+    /// Reboot the board
+    Reset(SmpArgs),
+}
+
+#[derive(clap::Args)]
+struct SmpArgs {
+    /// Which board, by advertised name or by the handle `zapp devices` shows
+    #[arg(long, short = 'd')]
+    device: Option<String>,
+    /// Bytes per Bluetooth write. Defaults to what the platform reports.
+    #[arg(long)]
+    mtu: Option<usize>,
+    /// Largest request to send. Defaults to one MTU, so nothing is fragmented.
+    #[arg(long)]
+    chunk: Option<usize>,
+    /// Seconds to wait for each reply
+    #[arg(long, default_value_t = 15)]
+    timeout: u64,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +149,17 @@ fn main() -> Result<()> {
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
+        Commands::Smp { command } => match command {
+            SmpCommands::Images(args) => cmd_smp_images(&args),
+            SmpCommands::Upload {
+                firmware,
+                image,
+                args,
+            } => cmd_smp_upload(&firmware, image, &args),
+            SmpCommands::Test { hash, args } => cmd_smp_mark(&hash, false, &args),
+            SmpCommands::Confirm { hash, args } => cmd_smp_mark(&hash, true, &args),
+            SmpCommands::Reset(args) => cmd_smp_reset(&args),
+        },
     }
 }
 
@@ -288,6 +371,144 @@ fn new_spinner(msg: &str) -> ProgressBar {
     spinner.set_message(msg.to_string());
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
     spinner
+}
+
+/// Connects to the board these arguments name.
+///
+/// The spinner is the whole point of doing this in one place: a board that is
+/// bonded but idle takes seconds to wake, and silence there looks like a hang.
+fn smp_connect(args: &SmpArgs) -> Result<SmpClient> {
+    let spinner = new_spinner("Connecting over Bluetooth...");
+    let client = smp::open(args.device.as_deref());
+    spinner.finish_and_clear();
+
+    let mut client = client.context("Could not reach the board over Bluetooth")?;
+    if let Some(mtu) = args.mtu {
+        client = client.with_mtu(mtu);
+    }
+    if let Some(chunk) = args.chunk {
+        client = client.with_request_limit(chunk);
+    }
+    log::debug!(
+        "connected, {} bytes per write, {} per request",
+        client.mtu(),
+        client.request_limit()
+    );
+    Ok(client.with_timeout(Duration::from_secs(args.timeout)))
+}
+
+fn cmd_smp_images(args: &SmpArgs) -> Result<()> {
+    let mut client = smp_connect(args)?;
+    let slots = client.image_state().context("Could not read the image state")?;
+    print_image_state(&slots);
+    Ok(())
+}
+
+fn print_image_state(slots: &[ImageSlot]) {
+    if slots.is_empty() {
+        println!("The board reports no images.");
+        return;
+    }
+    for slot in slots {
+        let image = slot.image.map(|n| format!("image {n} ")).unwrap_or_default();
+        let version = if slot.version.is_empty() {
+            "(no version)"
+        } else {
+            &slot.version
+        };
+        println!("{image}slot {} · {version}", slot.slot);
+        println!("  hash  {}", smp::image::hex(&slot.hash));
+        println!("  flags {}", flags_of(slot));
+    }
+}
+
+fn flags_of(slot: &ImageSlot) -> String {
+    match slot.flags().join(" ") {
+        flags if flags.is_empty() => "none".to_string(),
+        flags => flags,
+    }
+}
+
+fn cmd_smp_upload(path: &Path, image: u32, args: &SmpArgs) -> Result<()> {
+    // Not `firmware::load_firmware`: that reads a DFU suffix or Intel HEX
+    // records, and an MCUboot image is a flat binary with neither. Its own
+    // header is what says whether this is the right kind of file.
+    let data = std::fs::read(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    if data.is_empty() {
+        bail!("{} is empty", path.display());
+    }
+
+    match smp::image::inspect(&data) {
+        Some(info) => println!(
+            "Image loaded: v{} ({} bytes, {} of image)",
+            info.version,
+            data.len(),
+            info.image_size
+        ),
+        // Not fatal: the board checks the header itself and will refuse it. A
+        // warning here says which file to look at, which the board cannot.
+        None => println!(
+            "Warning: {} has no MCUboot header — uploading it anyway, but the board will likely refuse it",
+            path.display()
+        ),
+    }
+    println!("SHA-256: {}", smp::image::hex(&smp::image::sha256(&data)));
+
+    let mut client = smp_connect(args)?;
+    let pb = ProgressBar::new(data.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    client
+        .upload(image, &data, &|progress| match progress {
+            FlashProgress::Writing { bytes_written, .. } => {
+                pb.set_position(bytes_written as u64);
+                pb.set_message("Uploading...");
+            }
+            FlashProgress::Complete => pb.finish_with_message("Done!"),
+            _ => {}
+        })
+        .context("Upload failed")?;
+
+    println!();
+    println!("Uploaded. Mark it and reset to boot it:");
+    println!("  zapp smp test <hash>   (reverts unless confirmed after boot)");
+    println!("  zapp smp confirm <hash>");
+    print_image_state(&client.image_state().context("Could not read the image state")?);
+    Ok(())
+}
+
+fn cmd_smp_mark(hash: &str, confirm: bool, args: &SmpArgs) -> Result<()> {
+    let hash = smp::image::unhex(hash)
+        .with_context(|| format!("{hash:?} is not a hash; expected hex, as `zapp smp images` prints it"))?;
+
+    let mut client = smp_connect(args)?;
+    let slots = client
+        .mark(&hash, confirm)
+        .with_context(|| match confirm {
+            true => "Could not confirm that image".to_string(),
+            false => "Could not mark that image for test".to_string(),
+        })?;
+
+    println!(
+        "Marked {} as {}.",
+        smp::image::hex(&hash),
+        if confirm { "confirmed" } else { "pending test" }
+    );
+    print_image_state(&slots);
+    Ok(())
+}
+
+fn cmd_smp_reset(args: &SmpArgs) -> Result<()> {
+    let mut client = smp_connect(args)?;
+    client.reset().context("Reset failed")?;
+    println!("Resetting.");
+    Ok(())
 }
 
 fn wait_and_flash(fw: &Firmware) -> Result<()> {
