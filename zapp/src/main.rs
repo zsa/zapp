@@ -2,7 +2,7 @@ mod zsab;
 
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,6 +14,9 @@ use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pi
 use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
+use zapp_core::hid::{
+    BatteryReading, CMD_GET_TELEMETRY, HidConnection, HidEvent, Nav, Source, Telemetry,
+};
 use zapp_oryx::FirmwareVariant;
 
 #[derive(Parser)]
@@ -249,17 +252,36 @@ fn main() -> Result<()> {
 const BLE_SETTLE: Duration = Duration::from_millis(750);
 const BLE_SCAN: Duration = Duration::from_secs(7);
 
+/// How long to wait for a wired board to answer the telemetry query. Firmware
+/// that predates the command never answers at all, so this elapses in the
+/// ordinary case and must stay short enough not to be felt.
+const TELEMETRY_WAIT: Duration = Duration::from_millis(500);
+
 fn cmd_devices(scan: bool) -> Result<()> {
+    let wired = device::list_devices();
+
     println!("USB");
-    match device::list_devices() {
+    match &wired {
         Ok(devices) if devices.is_empty() => println!("  none"),
         Ok(devices) => {
-            for device in &devices {
+            for device in devices {
                 println!("  {}", describe_usb(device));
+                for line in wired_report(device) {
+                    println!("    {line}");
+                }
             }
         }
         Err(err) => println!("  cannot scan: {err}"),
     }
+
+    // Which models are plugged in, so a board listed twice can say which of
+    // its two entries is the live one.
+    let wired_models: Vec<_> = wired
+        .iter()
+        .flatten()
+        .filter(|device| device.bootloader.is_none())
+        .filter_map(|device| device.keyboard)
+        .collect();
 
     let monitor = BleMonitor::start(&[]);
     let wait = if scan { BLE_SCAN } else { BLE_SETTLE };
@@ -283,13 +305,121 @@ fn cmd_devices(scan: bool) -> Result<()> {
             .unwrap_or_else(|| "ZSA keyboard".to_string());
         let known_as = board.name.unwrap_or_else(|| "unnamed".to_string());
         println!(
-            "  {name} · {} · {known_as:?}{}",
+            "  {name} · {} · {known_as:?}{}{}",
             state(board.presence),
-            charge(board.battery)
+            charge(board.battery),
+            also_wired(board.keyboard, &wired_models)
         );
     }
 
     Ok(())
+}
+
+/// Ask a wired board about itself, and say what it answered.
+///
+/// A board is preferred over the radio for its own state: plugged in, it can
+/// read both halves directly, and the Bluetooth view of a wired board is
+/// whatever the radio last carried. Firmware without the command simply never
+/// answers, so an empty result here is the normal old-firmware case and says
+/// nothing.
+fn wired_report(device: &UsbDevice) -> Vec<String> {
+    match usb_telemetry(device) {
+        Some(telemetry) => describe_telemetry(&telemetry),
+        None => Vec::new(),
+    }
+}
+
+fn usb_telemetry(device: &UsbDevice) -> Option<Telemetry> {
+    if device.bootloader.is_some() {
+        return None; // a board in its bootloader runs no keyboard firmware
+    }
+
+    let conn = HidConnection::open(device.vid, device.pid).ok()?;
+    conn.send(CMD_GET_TELEMETRY, &[]);
+
+    let deadline = Instant::now() + TELEMETRY_WAIT;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match conn.recv_timeout(left)? {
+            HidEvent::Telemetry(telemetry) => return Some(telemetry),
+            HidEvent::Disconnected => return None,
+            _ => {} // the connection handshake, on its way past
+        }
+    }
+}
+
+/// The lines under a wired board: what each half has left, where each reading
+/// came from, and what is plugged into it.
+fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let halves: Vec<String> = [("left", telemetry.left), ("right", telemetry.right)]
+        .into_iter()
+        .map(|(half, reading)| format!("{half} {}", read_as(reading)))
+        .collect();
+    lines.push(format!("battery · {}", halves.join(" · ")));
+
+    let pointing = [
+        ("build", telemetry.nav_build),
+        ("left", telemetry.nav_left),
+        ("right", telemetry.nav_right),
+    ]
+    .into_iter()
+    .map(|(where_, nav)| format!("{where_} {}", named(nav)))
+    .collect::<Vec<_>>();
+    lines.push(format!("pointing · {}", pointing.join(" · ")));
+
+    lines
+}
+
+/// One half's level, what it is doing, and which path the number took. The
+/// path is worth the words: a relayed level keeps its last value when the link
+/// carrying it stops, so it reads as current long after it stopped being so.
+fn read_as(reading: BatteryReading) -> String {
+    let level = match reading.level {
+        Some(level) => format!("{level}%"),
+        None => "unknown".to_string(),
+    };
+    let doing = match (reading.charging, reading.usb) {
+        (Some(true), _) => " charging",
+        (Some(false), Some(true)) => " on USB",
+        _ => "",
+    };
+    match reading.source {
+        Some(source) if reading.level.is_some() => {
+            format!("{level}{doing} ({})", came_from(source))
+        }
+        _ => format!("{level}{doing}"),
+    }
+}
+
+fn came_from(source: Source) -> &'static str {
+    match source {
+        Source::Nrf => "read by the left half",
+        Source::Wired => "read over the cable",
+        Source::Esb => "relayed over the radio",
+        Source::Unknown => "no source",
+        Source::Other(_) => "a source this zapp does not know",
+    }
+}
+
+/// What a nav mask names. An empty mask is a board that looked and found
+/// nothing; no mask at all is one that could not tell, and the two must not
+/// print the same.
+fn named(nav: Option<Nav>) -> String {
+    let Some(nav) = nav else {
+        return "unknown".to_string();
+    };
+    let devices: Vec<&str> = [("trackball", nav.trackball), ("trackpad", nav.trackpad)]
+        .into_iter()
+        .filter(|&(_, present)| present)
+        .map(|(name, _)| name)
+        .collect();
+
+    match devices.is_empty() {
+        true => "none".to_string(),
+        false => devices.join(" + "),
+    }
 }
 
 /// What the halves have left.
@@ -311,6 +441,17 @@ fn charge(battery: Battery) -> String {
             Level::Percent(level) => format!(" · {level}%"),
             _ => String::new(),
         },
+    }
+}
+
+/// Points at the wired entry for a board that is listed in both places. What
+/// the radio published is what the board last had reason to publish; plugged
+/// in, it answers for itself. Saying which is which is the whole difference
+/// between a reading and a memory.
+fn also_wired(keyboard: Option<device::Keyboard>, wired: &[device::Keyboard]) -> &'static str {
+    match keyboard.is_some_and(|model| wired.contains(&model)) {
+        true => " · also on USB above, which reads live",
+        false => "",
     }
 }
 
@@ -739,6 +880,105 @@ mod tests {
             ..Battery::default()
         };
         assert_eq!(charge(battery), " · 80%");
+    }
+
+    fn reading(level: Option<u8>, source: Source) -> BatteryReading {
+        BatteryReading {
+            level,
+            charging: Some(false),
+            usb: Some(false),
+            source: Some(source),
+        }
+    }
+
+    #[test]
+    fn a_wired_board_says_where_each_level_came_from() {
+        let telemetry = Telemetry {
+            version: 1,
+            left: reading(Some(87), Source::Nrf),
+            right: reading(Some(64), Source::Wired),
+            nav_build: Some(Nav {
+                trackball: true,
+                trackpad: false,
+            }),
+            nav_left: Some(Nav::default()),
+            nav_right: Some(Nav {
+                trackball: true,
+                trackpad: false,
+            }),
+        };
+        assert_eq!(
+            describe_telemetry(&telemetry),
+            vec![
+                "battery · left 87% (read by the left half) · right 64% (read over the cable)",
+                "pointing · build trackball · left none · right trackball",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relayed_level_is_not_dressed_up_as_a_live_one() {
+        // The distinction this whole payload exists for: same number, and the
+        // line has to say which of the two it is.
+        assert_eq!(
+            read_as(reading(Some(64), Source::Wired)),
+            "64% (read over the cable)"
+        );
+        assert_eq!(
+            read_as(reading(Some(64), Source::Esb)),
+            "64% (relayed over the radio)"
+        );
+    }
+
+    #[test]
+    fn a_level_that_was_not_read_is_not_a_flat_one() {
+        assert_eq!(read_as(reading(None, Source::Wired)), "unknown");
+        assert_eq!(
+            read_as(reading(Some(0), Source::Wired)),
+            "0% (read over the cable)"
+        );
+    }
+
+    #[test]
+    fn unknown_flags_do_not_become_a_confident_no() {
+        let unsure = BatteryReading {
+            level: Some(50),
+            charging: None,
+            usb: None,
+            source: Some(Source::Nrf),
+        };
+        assert_eq!(read_as(unsure), "50% (read by the left half)");
+
+        let charging = BatteryReading {
+            charging: Some(true),
+            ..unsure
+        };
+        assert_eq!(read_as(charging), "50% charging (read by the left half)");
+    }
+
+    #[test]
+    fn a_half_we_could_not_read_is_not_a_half_with_nothing_in_it() {
+        assert_eq!(named(None), "unknown");
+        assert_eq!(named(Some(Nav::default())), "none");
+        assert_eq!(
+            named(Some(Nav {
+                trackball: true,
+                trackpad: true
+            })),
+            "trackball + trackpad"
+        );
+    }
+
+    #[test]
+    fn a_board_listed_twice_points_at_its_live_entry() {
+        let wired = [device::Keyboard::Voyager2];
+        assert_eq!(
+            also_wired(Some(device::Keyboard::Voyager2), &wired),
+            " · also on USB above, which reads live"
+        );
+        assert_eq!(also_wired(Some(device::Keyboard::Voyager), &wired), "");
+        assert_eq!(also_wired(None, &wired), "");
+        assert_eq!(also_wired(Some(device::Keyboard::Voyager2), &[]), "");
     }
 
     #[test]

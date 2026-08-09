@@ -20,8 +20,9 @@ use zapp_hid_proto::{CMD_GET_FW_VERSION, Packet, REPORT_SIZE, encode_packet, pro
 use crate::ZappError;
 
 pub use zapp_hid_proto::{
-    CMD_RGB_CONTROL, CMD_SET_LAYER, CMD_SET_RGB_ALL_LED, CMD_SET_RGB_LED, CMD_SET_STATUS_LED,
-    CMD_STATUS_LED_CONTROL, CMD_UPDATE_BRIGHTNESS, HidEvent, USAGE_PAGE,
+    BatteryReading, CMD_GET_TELEMETRY, CMD_RGB_CONTROL, CMD_SET_LAYER, CMD_SET_RGB_ALL_LED,
+    CMD_SET_RGB_LED, CMD_SET_STATUS_LED, CMD_STATUS_LED_CONTROL, CMD_UPDATE_BRIGHTNESS, HidEvent,
+    Nav, Source, Telemetry, USAGE_PAGE,
 };
 
 /// Write packet size: report ID byte + 32-byte report.

@@ -6,4 +6,4 @@ pub mod hid;
 
 pub use error::ZappError;
 pub use flash::FlashProgress;
-pub use hid::{HidConnection, HidEvent};
+pub use hid::{BatteryReading, HidConnection, HidEvent, Nav, Source, Telemetry};
