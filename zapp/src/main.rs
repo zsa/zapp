@@ -15,7 +15,8 @@ use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
-    BatteryReading, CMD_GET_TELEMETRY, HidConnection, HidEvent, Nav, Source, Telemetry,
+    BatteryReading, CMD_GET_TELEMETRY, ChargeState, Charging, HidConnection, HidEvent, Nav,
+    Source, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 
@@ -369,7 +370,48 @@ fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
     .collect::<Vec<_>>();
     lines.push(format!("pointing · {}", pointing.join(" · ")));
 
+    if let Some(line) = charging_as(telemetry.charging) {
+        lines.push(line);
+    }
+
     lines
+}
+
+/// How fast the board is charging and what decided that.
+///
+/// Two currents, because they are two different things and confusing them is
+/// what the firmware used to do: what the board draws from the source, and
+/// what reaches the cells. Nothing at all for firmware that predates the
+/// fields — an empty line would read as a board that answered "none".
+fn charging_as(charging: Charging) -> Option<String> {
+    let state = charging.state?;
+    let mut parts = vec![charging_state_as(state).to_string()];
+
+    if let Some(ma) = charging.input_limit_ma {
+        parts.push(format!("{ma} mA from the source"));
+    }
+    if let Some(ma) = charging.charge_current_ma {
+        parts.push(format!("{ma} mA to each cell"));
+    }
+    // What the source said it could give, when that is not already obvious
+    // from the limit we settled on.
+    match charging.budget_ma {
+        Some(0) | None => {}
+        Some(ma) if Some(ma) == charging.input_limit_ma => {}
+        Some(ma) => parts.push(format!("source offers {ma} mA")),
+    }
+
+    Some(format!("charging · {}", parts.join(" · ")))
+}
+
+fn charging_state_as(state: ChargeState) -> String {
+    match state {
+        ChargeState::Battery => "on battery".to_string(),
+        ChargeState::Floor => "holding at the unconfigured limit".to_string(),
+        ChargeState::Charging => "charging".to_string(),
+        ChargeState::Full => "full".to_string(),
+        ChargeState::Other(raw) => format!("a state this zapp does not know ({raw})"),
+    }
 }
 
 /// One half's level, what it is doing, and which path the number took. The
@@ -910,14 +952,81 @@ mod tests {
                 trackball: true,
                 trackpad: false,
             }),
+            charging: Charging {
+                budget_ma: Some(1500),
+                input_limit_ma: Some(700),
+                charge_current_ma: Some(550),
+                state: Some(ChargeState::Charging),
+            },
         };
         assert_eq!(
             describe_telemetry(&telemetry),
             vec![
                 "battery · left 87% · right 64% (read over the cable)",
                 "pointing · build trackball · left none · right trackball",
+                "charging · charging · 700 mA from the source · 550 mA to each cell · source offers 1500 mA",
             ]
         );
+    }
+
+    #[test]
+    fn the_two_currents_are_kept_apart() {
+        // What the board draws and what reaches the cells are different
+        // numbers, and reporting one as the other is the bug this line exists
+        // to make visible.
+        assert_eq!(
+            charging_as(Charging {
+                budget_ma: Some(500),
+                input_limit_ma: Some(200),
+                charge_current_ma: Some(50),
+                state: Some(ChargeState::Charging),
+            }),
+            Some(
+                "charging · charging · 200 mA from the source · 50 mA to each cell · source offers 500 mA"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_source_that_has_not_said_what_it_is_reads_as_held_back() {
+        assert_eq!(
+            charging_as(Charging {
+                budget_ma: Some(0),
+                input_limit_ma: Some(100),
+                charge_current_ma: Some(32),
+                state: Some(ChargeState::Floor),
+            }),
+            Some(
+                "charging · holding at the unconfigured limit · 100 mA from the source · 32 mA to each cell"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_source_offering_more_than_we_take_says_so() {
+        // A 3 A charger against a board whose input register stops at 1.5 A:
+        // the difference is real and the line has to show it.
+        assert_eq!(
+            charging_as(Charging {
+                budget_ma: Some(3000),
+                input_limit_ma: Some(1500),
+                charge_current_ma: Some(700),
+                state: Some(ChargeState::Charging),
+            }),
+            Some(
+                "charging · charging · 1500 mA from the source · 700 mA to each cell · source offers 3000 mA"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn firmware_without_the_charging_fields_says_nothing_at_all() {
+        // Not an empty line and not zeroes: an old board did not answer this
+        // question, which is different from answering "none".
+        assert_eq!(charging_as(Charging::default()), None);
     }
 
     #[test]

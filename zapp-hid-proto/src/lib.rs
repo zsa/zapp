@@ -73,6 +73,11 @@ mod telemetry_offset {
     pub const NAV_BUILD: usize = 8;
     pub const NAV_LEFT: usize = 9;
     pub const NAV_RIGHT: usize = 10;
+    /// Milliamps, little-endian pairs — see [`telemetry_field_le16`].
+    pub const POWER_BUDGET_MA: usize = 11;
+    pub const CHARGE_LIMIT_MA: usize = 13;
+    pub const CHARGE_CURRENT_MA: usize = 15;
+    pub const CHARGE_STATE: usize = 17;
 }
 
 /// A battery level the firmware could not read. Never 0: that is a flat one.
@@ -86,6 +91,11 @@ const TELEMETRY_BAT_CHARGING: u8 = 0x01;
 const TELEMETRY_BAT_USB: u8 = 0x02;
 /// Clear means the flag bits are unknown, not false.
 const TELEMETRY_BAT_KNOWN: u8 = 0x80;
+/// A current the board could not report. Zero, because no limit or rate it can
+/// be set to is zero — the input floor alone is 100 mA.
+const TELEMETRY_CURRENT_UNKNOWN: u16 = 0;
+/// The board has nothing to say about what its charging policy is doing.
+const TELEMETRY_CHG_UNKNOWN: u8 = 0xFF;
 
 /// Where a battery reading came from. Worth surfacing rather than folding
 /// away: a relayed level keeps its last value when the link carrying it stops,
@@ -151,12 +161,58 @@ pub struct BatteryReading {
     pub source: Option<Source>,
 }
 
+/// What the board's charging policy is doing, as against what the cells are
+/// doing — [`BatteryReading::charging`] already says whether current flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeState {
+    /// No source attached: running off the cells.
+    Battery,
+    /// A source is attached but has not identified itself, so the board is
+    /// still holding at the current a USB device may draw unconfigured.
+    Floor,
+    /// Charging at the rate the source allows.
+    Charging,
+    /// Source attached, charger has terminated.
+    Full,
+    /// A state this host has no name for: firmware newer than it.
+    Other(u8),
+}
+
+impl ChargeState {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            TELEMETRY_CHG_UNKNOWN => None,
+            0 => Some(ChargeState::Battery),
+            1 => Some(ChargeState::Floor),
+            2 => Some(ChargeState::Charging),
+            3 => Some(ChargeState::Full),
+            other => Some(ChargeState::Other(other)),
+        }
+    }
+}
+
+/// How fast the board is charging and why. Every field is optional for the
+/// usual reason: a firmware that predates them says nothing rather than zero,
+/// and the board itself distinguishes "no source" from "did not find out".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Charging {
+    /// Milliamps the attached source advertised. `Some(0)` is a real answer —
+    /// nothing attached, or attached and not yet identified.
+    pub budget_ma: Option<u16>,
+    /// Milliamps the board is allowed to draw from the source.
+    pub input_limit_ma: Option<u16>,
+    /// Milliamps going into each cell.
+    pub charge_current_ma: Option<u16>,
+    pub state: Option<ChargeState>,
+}
+
 /// What a board says about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Telemetry {
     pub version: u8,
     pub left: BatteryReading,
     pub right: BatteryReading,
+    pub charging: Charging,
     /// Pointing devices this firmware was built to drive. Compile-time, so the
     /// board always knows it — `None` only if the field predates this host.
     pub nav_build: Option<Nav>,
@@ -241,6 +297,29 @@ fn telemetry_field(params: &[u8], offset: usize) -> Option<u8> {
     (offset < len + 2).then(|| params.get(offset).copied())?
 }
 
+/// A little-endian `u16` at `offset`, if the payload claims both of its bytes.
+///
+/// Both or neither: half a number is not a smaller number, it is a wrong one,
+/// and a board whose `len` stops between them has not sent this field.
+fn telemetry_field_le16(params: &[u8], offset: usize) -> Option<u16> {
+    let lo = telemetry_field(params, offset)?;
+    let hi = telemetry_field(params, offset + 1)?;
+    Some(u16::from_le_bytes([lo, hi]))
+}
+
+fn telemetry_charging(params: &[u8]) -> Charging {
+    use telemetry_offset as at;
+
+    Charging {
+        budget_ma: telemetry_field_le16(params, at::POWER_BUDGET_MA),
+        input_limit_ma: telemetry_field_le16(params, at::CHARGE_LIMIT_MA)
+            .filter(|&ma| ma != TELEMETRY_CURRENT_UNKNOWN),
+        charge_current_ma: telemetry_field_le16(params, at::CHARGE_CURRENT_MA)
+            .filter(|&ma| ma != TELEMETRY_CURRENT_UNKNOWN),
+        state: telemetry_field(params, at::CHARGE_STATE).and_then(ChargeState::from_raw),
+    }
+}
+
 fn telemetry_battery(params: &[u8], level: usize, flags: usize, source: usize) -> BatteryReading {
     let raw_flags = telemetry_field(params, flags).filter(|f| f & TELEMETRY_BAT_KNOWN != 0);
     BatteryReading {
@@ -282,6 +361,7 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
             at::BATTERY_RIGHT_FLAGS,
             at::BATTERY_RIGHT_SOURCE,
         ),
+        charging: telemetry_charging(params),
         nav_build: telemetry_field(params, at::NAV_BUILD).and_then(Nav::from_mask),
         nav_left: telemetry_field(params, at::NAV_LEFT).and_then(Nav::from_mask),
         nav_right: telemetry_field(params, at::NAV_RIGHT).and_then(Nav::from_mask),
@@ -728,6 +808,82 @@ mod tests {
         data[0] = EVT_TELEMETRY;
         data[1..1 + payload.len()].copy_from_slice(&payload);
         assert_eq!(process_packet(&data), (None, Vec::new()));
+    }
+
+    /// The same board once it also reports what its charging policy is doing.
+    /// `telemetry_payload()` deliberately stays as it was: it is now a real
+    /// case, a board from before these fields existed.
+    fn telemetry_payload_with_charging() -> Vec<u8> {
+        let mut payload = telemetry_payload();
+        payload[1] = 16; // len grew with the fields; the version did not
+        payload.extend_from_slice(&1500u16.to_le_bytes()); // source offered
+        payload.extend_from_slice(&1500u16.to_le_bytes()); // drawn from it
+        payload.extend_from_slice(&700u16.to_le_bytes()); // into each cell
+        payload.push(2); // charging
+        payload
+    }
+
+    #[test]
+    fn the_two_charging_currents_are_read_apart() {
+        let telemetry = parse_telemetry(&telemetry_payload_with_charging()).unwrap();
+
+        assert_eq!(telemetry.charging.budget_ma, Some(1500));
+        assert_eq!(telemetry.charging.input_limit_ma, Some(1500));
+        assert_eq!(telemetry.charging.charge_current_ma, Some(700));
+        assert_eq!(telemetry.charging.state, Some(ChargeState::Charging));
+    }
+
+    #[test]
+    fn a_currentless_reading_is_unknown_not_zero() {
+        // The board has not commanded a rate yet. Zero is not a rate any of
+        // this hardware can be set to, so it can only mean "did not find out".
+        let mut payload = telemetry_payload_with_charging();
+        payload[13] = 0;
+        payload[14] = 0;
+        payload[15] = 0;
+        payload[16] = 0;
+        payload[17] = 0xFF; // unknown state
+
+        let telemetry = parse_telemetry(&payload).unwrap();
+        assert_eq!(telemetry.charging.input_limit_ma, None);
+        assert_eq!(telemetry.charging.charge_current_ma, None);
+        assert_eq!(telemetry.charging.state, None);
+        // A zero budget IS an answer: no source, or one not yet identified.
+        assert_eq!(telemetry.charging.budget_ma, Some(1500));
+    }
+
+    #[test]
+    fn a_board_from_before_the_charging_fields_says_nothing_about_them() {
+        // The whole point of `len`: this host asks for fields the board never
+        // heard of and gets "unknown" rather than whatever was at that offset.
+        let telemetry = parse_telemetry(&telemetry_payload()).unwrap();
+
+        assert_eq!(telemetry.charging, Charging::default());
+        // and everything the old board did send still reads correctly
+        assert_eq!(telemetry.left.level, Some(87));
+        assert_eq!(telemetry.right.source, Some(Source::Wired));
+    }
+
+    #[test]
+    fn half_a_current_is_not_a_smaller_one() {
+        // A board whose len stops between the two bytes of a 16-bit field has
+        // not sent that field, and reading the low byte alone would report
+        // 1500 mA as 220 mA.
+        let mut payload = telemetry_payload_with_charging();
+        payload[1] = 10; // covers POWER_BUDGET_MA's low byte only
+
+        let telemetry = parse_telemetry(&payload).unwrap();
+        assert_eq!(telemetry.charging.budget_ma, None);
+    }
+
+    #[test]
+    fn a_charge_state_this_host_does_not_know_keeps_its_number() {
+        let mut payload = telemetry_payload_with_charging();
+        payload[17] = 9;
+        assert_eq!(
+            parse_telemetry(&payload).unwrap().charging.state,
+            Some(ChargeState::Other(9))
+        );
     }
 
     #[test]
