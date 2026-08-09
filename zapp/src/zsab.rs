@@ -16,7 +16,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::smp::bundle::{self, Bundle, Step};
 use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
-use zapp_ble::Battery;
+use zapp_ble::{Battery, Level};
 use zapp_core::device::{self, ids::Keyboard};
 use zapp_core::flash::FlashProgress;
 
@@ -507,9 +507,9 @@ fn read_state(link: &LinkArgs, half: Half) -> Result<Vec<ImageSlot>> {
 /// A level nobody can read is allowed, deliberately: see `bundle::battery_allows`.
 fn check_battery(battery: Battery, charging: bool) -> Result<()> {
     let halves = [
-        ("left", battery.left),
-        ("right", battery.right),
-        ("keyboard", battery.keyboard),
+        ("left", battery.left.percent()),
+        ("right", battery.right.percent()),
+        ("keyboard", battery.keyboard.percent()),
     ];
     for (half, level) in halves {
         if bundle::battery_allows(level, charging) {
@@ -600,9 +600,11 @@ fn describe(step: Step, slots: &[ImageSlot]) -> String {
 }
 
 fn charge(battery: Battery, charging: bool) -> String {
-    let level = |level: Option<u8>| match level {
-        Some(level) => format!("{level}%"),
-        None => "unknown".to_string(),
+    // Both halves are always named here: this runs against a split board that
+    // is being updated, where a half with no level is a half worth noticing.
+    let level = |level: Level| match level {
+        Level::Percent(level) => format!("{level}%"),
+        _ => "unknown".to_string(),
     };
     format!(
         "left {} · right {}{}",
@@ -723,15 +725,28 @@ mod tests {
     #[test]
     fn the_charge_line_says_unknown_rather_than_a_made_up_number() {
         let battery = Battery {
-            left: Some(36),
-            right: None,
-            keyboard: Some(36),
+            left: Level::Percent(36),
+            right: Level::Unknown,
+            keyboard: Level::Percent(36),
         };
         assert_eq!(charge(battery, false), "left 36% · right unknown");
         assert_eq!(
             charge(battery, true),
             "left 36% · right unknown · on the charger"
         );
+    }
+
+    #[test]
+    fn a_flat_half_is_a_number_rather_than_nothing() {
+        // 0% is a level like any other, and the gate has to see it as one.
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        assert_eq!(charge(battery, false), "left 0% · right 27%");
+        assert!(check_battery(battery, false).is_err());
+        assert!(check_battery(battery, true).is_ok(), "on the charger");
     }
 }
 

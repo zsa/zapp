@@ -58,11 +58,13 @@ pub struct Bluez {
     scanning_since: Option<Instant>,
     scanned_at: Option<Instant>,
     /// Which half each level characteristic speaks for, by object path. The
-    /// descriptor saying so never changes, so it is read once.
+    /// descriptor saying so never changes, so it is read once — unlike a
+    /// subscription, which dies with the connection that carried it.
     halves: HashMap<String, battery::Half>,
-    /// Level characteristics already subscribed to. BlueZ then keeps their
-    /// `Value` fresh, and later snapshots cost nothing.
-    notifying: HashSet<String>,
+    /// Level characteristics whose current notify session we are in step with:
+    /// read once since it came up, and fed by BlueZ ever since. Their cached
+    /// `Value` is the board's value, so later snapshots cost nothing.
+    synced: HashSet<String>,
     /// Ticks when BlueZ says something changed.
     changes: Receiver<()>,
 }
@@ -78,7 +80,7 @@ impl Bluez {
             scanning_since: None,
             scanned_at: None,
             halves: HashMap::new(),
-            notifying: HashSet::new(),
+            synced: HashSet::new(),
             changes,
         })
     }
@@ -160,16 +162,16 @@ impl Backend for Bluez {
             })
             .collect();
 
-        // A subscription dies with the connection that carried it, and BlueZ
-        // hands the same object paths back on reconnect, so anything under a
-        // board that is no longer connected is forgotten and asked for again.
+        // Housekeeping: a board that is no longer connected has no GATT tree to
+        // hold paths for, so its entries are dropped rather than kept for a
+        // reconnect that may never come. Renewing a subscription does not
+        // depend on this — `plan` reads that off BlueZ.
         let live: Vec<&str> = devices
             .iter()
             .filter(|(_, sighting)| sighting.connected)
             .map(|(path, _)| path.as_str())
             .collect();
-        self.notifying
-            .retain(|path| live.iter().any(|device| path.starts_with(device)));
+        keep(&mut self.synced, &live);
 
         Ok(devices
             .iter()
@@ -250,15 +252,38 @@ impl Bluez {
             let Some(half) = self.half_of(objects, path) else {
                 continue;
             };
-            // The cached value, which notifications keep fresh; a read is only
-            // needed the first time, before the subscription exists.
-            let level = get::<Vec<u8>>(level, "Value")
-                .filter(|value| !value.is_empty())
-                .or_else(|| read(&self.connection, path, CHARACTERISTIC));
-            if let Some(level) = level.and_then(|value| value.first().copied()) {
-                battery.set(half, level);
+
+            // The instance is there, so the half is there. Whatever comes of
+            // reading it, this is a half whose level is unknown rather than a
+            // half the board does not have.
+            battery.set(half, battery::Level::Unknown);
+
+            let plan = plan(get::<bool>(level, "Notifying"), self.synced.contains(path));
+            // Armed before read, so a change in between arrives as a
+            // notification instead of falling in the gap.
+            let listening = !plan.start_notify || self.start_notify(path);
+            let value = match plan.read {
+                true => read(&self.connection, path, CHARACTERISTIC),
+                // In step with a live session: what BlueZ holds is the last
+                // thing the board sent, which is what the board holds.
+                false => get::<Vec<u8>>(level, "Value"),
             }
-            self.subscribe(path);
+            .filter(|value| !value.is_empty());
+            if let Some(raw) = value.as_deref().and_then(|value| value.first()) {
+                battery.set(half, battery::Level::from_raw(*raw));
+            }
+            log::trace!(
+                "{half:?} level {value:?} from {}",
+                if plan.read { "the board" } else { "bluez" }
+            );
+
+            // In step only once there is a session and a value read under it.
+            // A StartNotify or a read that failed leaves it out, so the next
+            // snapshot tries again instead of settling for a stale value.
+            match listening && (!plan.read || value.is_some()) {
+                true => self.synced.insert(path.to_string()),
+                false => self.synced.remove(path),
+            };
         }
 
         battery
@@ -286,19 +311,65 @@ impl Bluez {
         Some(half)
     }
 
-    /// Asks BlueZ to keep this characteristic's value fresh. Once each: a
-    /// second call is an error, and the subscription outlives the poll.
-    fn subscribe(&mut self, characteristic: &str) {
-        if !self.notifying.insert(characteristic.to_string()) {
-            return;
-        }
+    /// Asks BlueZ to keep this characteristic's value fresh, and says whether
+    /// it will.
+    fn start_notify(&self, characteristic: &str) -> bool {
         let proxy = Proxy::new(&self.connection, BLUEZ, characteristic, CHARACTERISTIC);
-        let call = proxy.and_then(|proxy| proxy.call::<_, _, ()>("StartNotify", &()));
-        if let Err(err) = call {
-            log::debug!("StartNotify on {characteristic} failed: {err}");
-            self.notifying.remove(characteristic);
+        match proxy.and_then(|proxy| proxy.call::<_, _, ()>("StartNotify", &())) {
+            Ok(()) => true,
+            Err(err) => {
+                log::debug!("StartNotify on {characteristic} failed: {err}");
+                false
+            }
         }
     }
+}
+
+/// What one battery level characteristic needs before its value can be
+/// believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Plan {
+    /// Ask BlueZ for a notify session.
+    start_notify: bool,
+    /// Go to the board, rather than believing what BlueZ has cached.
+    read: bool,
+}
+
+/// The rule, from BlueZ's `Notifying` property and whether this characteristic
+/// has been read since the session behind it came up.
+///
+/// Asking BlueZ what it is subscribed to, rather than remembering what we asked
+/// it to subscribe to, is what survives a reconnect: a session dies with its
+/// connection whether or not anyone was watching, and `Notifying` back at false
+/// is BlueZ saying so. Missing the disconnect costs nothing, because the next
+/// snapshot arms it again.
+fn plan(notifying: Option<bool>, synced: bool) -> Plan {
+    match (notifying == Some(true), synced) {
+        // Live, and in step with it. Every change since the read arrived as a
+        // notification, so the cached value is the board's.
+        (true, true) => Plan {
+            start_notify: false,
+            read: false,
+        },
+        // Live, but nothing was listening when it came up — it may be someone
+        // else's session, or ours from a moment ago. One read catches up.
+        (true, false) => Plan {
+            start_notify: false,
+            read: true,
+        },
+        // No session, so the cached value has been frozen since the last one
+        // died. Arm one, then read what was missed while it was down.
+        (false, _) => Plan {
+            start_notify: true,
+            read: true,
+        },
+    }
+}
+
+/// Which characteristics stay tracked across a snapshot: only those under a
+/// board that is still connected, since the rest have no GATT tree left.
+fn keep(tracked: &mut HashSet<String>, connected: &[&str]) {
+    tracked.retain(|path| connected.iter().any(|device| path.starts_with(device)));
 }
 
 /// Ticks once per signal from BlueZ.
@@ -396,43 +467,154 @@ pub(super) fn platform(err: impl std::fmt::Display) -> BleError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use super::*;
 
-    /// The rule that decides which subscriptions survive a snapshot, lifted out
-    /// of the D-Bus call so it can be exercised without a bus.
-    fn keep(notifying: &mut HashSet<String>, connected: &[&str]) {
-        notifying.retain(|path| connected.iter().any(|device| path.starts_with(device)));
+    /// One poll, as the backend runs it: plan, then record what came of it.
+    /// `notifying` is what BlueZ said, `armed` and `got` whether the
+    /// StartNotify and the read that followed worked.
+    fn poll(synced: &mut HashSet<String>, notifying: Option<bool>, armed: bool, got: bool) -> Plan {
+        let path = "char0017";
+        let plan = plan(notifying, synced.contains(path));
+        let listening = !plan.start_notify || armed;
+        match listening && (!plan.read || got) {
+            true => synced.insert(path.to_string()),
+            false => synced.remove(path),
+        };
+        plan
+    }
+
+    /// The case that was wrong on hardware: one snapshot, no subscription yet,
+    /// and BlueZ holding a value from who knows when.
+    #[test]
+    fn the_first_snapshot_goes_to_the_board_rather_than_to_the_cache() {
+        let mut synced = HashSet::new();
+        assert_eq!(
+            poll(&mut synced, Some(false), true, true),
+            Plan {
+                start_notify: true,
+                read: true
+            }
+        );
     }
 
     #[test]
-    fn a_subscription_is_forgotten_when_its_board_disconnects() {
+    fn a_session_we_are_in_step_with_costs_nothing() {
+        let mut synced = HashSet::new();
+        poll(&mut synced, Some(false), true, true);
+        // Armed and read last time, and BlueZ has been feeding it since.
+        assert_eq!(
+            poll(&mut synced, Some(true), true, true),
+            Plan {
+                start_notify: false,
+                read: false
+            }
+        );
+        assert_eq!(
+            poll(&mut synced, Some(true), true, true),
+            Plan {
+                start_notify: false,
+                read: false
+            },
+            "and stays free for as long as the session lasts"
+        );
+    }
+
+    /// The reconnect. BlueZ tears the session down with the connection and
+    /// hands the same object path back, so remembering that we once subscribed
+    /// is what froze the value for the life of the process.
+    #[test]
+    fn a_reconnect_arms_the_subscription_again() {
+        let mut synced = HashSet::new();
+        poll(&mut synced, Some(false), true, true);
+        poll(&mut synced, Some(true), true, true);
+
+        // Down, and back up on the same path: BlueZ says Notifying is false.
+        let plan = poll(&mut synced, Some(false), true, true);
+        assert!(plan.start_notify, "the session has to be renewed");
+        assert!(plan.read, "and what changed while it was down, read");
+    }
+
+    /// The disconnect may fall inside a settle window, between two snapshots —
+    /// then nothing ever sees `connected` go false, and a backend tracking the
+    /// transition would never renew. `Notifying` still says the session died.
+    #[test]
+    fn a_disconnect_nobody_saw_still_renews_the_subscription() {
+        let mut synced = HashSet::new();
+        poll(&mut synced, Some(false), true, true);
+        poll(&mut synced, Some(true), true, true);
+
+        assert!(poll(&mut synced, Some(false), true, true).start_notify);
+    }
+
+    #[test]
+    fn a_session_somebody_else_armed_is_read_once_before_it_is_trusted() {
+        let mut synced = HashSet::new();
+        // Nothing in this process subscribed, yet BlueZ is notifying: whatever
+        // it holds is from before we were listening.
+        assert_eq!(
+            poll(&mut synced, Some(true), true, true),
+            Plan {
+                start_notify: false,
+                read: true
+            }
+        );
+        assert!(!poll(&mut synced, Some(true), true, true).read);
+    }
+
+    #[test]
+    fn a_characteristic_that_will_not_notify_is_read_every_time() {
+        let mut synced = HashSet::new();
+        for _ in 0..3 {
+            let plan = poll(&mut synced, Some(false), false, true);
+            assert!(plan.read, "the value still has to be right");
+        }
+    }
+
+    #[test]
+    fn a_read_that_failed_is_not_taken_for_a_value() {
+        let mut synced = HashSet::new();
+        poll(&mut synced, Some(false), true, false);
+        // Nothing was learnt, so the next snapshot must not fall through to the
+        // cache on the strength of a subscription that told it nothing.
+        assert!(poll(&mut synced, Some(true), true, true).read);
+    }
+
+    #[test]
+    fn a_characteristic_bluez_says_nothing_about_is_read() {
+        let mut synced = HashSet::new();
+        assert_eq!(
+            poll(&mut synced, None, true, true),
+            Plan {
+                start_notify: true,
+                read: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_disconnected_board_stops_being_tracked() {
         let device = "/org/bluez/hci0/dev_E8_6B_FC_47_E2_64";
         let level = format!("{device}/service0016/char0017");
-        let mut notifying = HashSet::from([level.clone()]);
+        let mut synced = HashSet::from([level.clone()]);
 
-        keep(&mut notifying, &[device]);
-        assert!(
-            notifying.contains(&level),
-            "still connected, still subscribed"
-        );
+        keep(&mut synced, &[device]);
+        assert!(synced.contains(&level), "still connected, still tracked");
 
-        // BlueZ tore the notify session down with the connection, and hands the
-        // same path back on reconnect: without forgetting, it is never renewed.
-        keep(&mut notifying, &[]);
-        assert!(notifying.is_empty());
+        keep(&mut synced, &[]);
+        assert!(synced.is_empty());
     }
 
     #[test]
-    fn one_board_disconnecting_leaves_anothers_subscription_alone() {
+    fn one_board_disconnecting_leaves_another_alone() {
         let ours = "/org/bluez/hci0/dev_E8_6B_FC_47_E2_64";
         let other = "/org/bluez/hci0/dev_F8_DE_F9_BF_5F_5F";
-        let mut notifying = HashSet::from([
+        let mut synced = HashSet::from([
             format!("{ours}/service0016/char0017"),
             format!("{other}/service0016/char0017"),
         ]);
 
-        keep(&mut notifying, &[ours]);
-        assert_eq!(notifying.len(), 1);
-        assert!(notifying.iter().all(|path| path.starts_with(ours)));
+        keep(&mut synced, &[ours]);
+        assert_eq!(synced.len(), 1);
+        assert!(synced.iter().all(|path| path.starts_with(ours)));
     }
 }

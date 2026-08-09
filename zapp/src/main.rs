@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
-use zapp_ble::{Battery, BleMonitor, Presence};
+use zapp_ble::{Battery, BleMonitor, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
@@ -278,17 +278,32 @@ fn cmd_devices(scan: bool) -> Result<()> {
     Ok(())
 }
 
-/// What the halves have left. A board only linked to one half says so by
-/// leaving the other out.
+/// What the halves have left.
+///
+/// A half the board does not publish is left out; one it publishes without a
+/// level is named and called unknown, because a half that is there and quiet is
+/// worth saying and a half that is not there is not.
 fn charge(battery: Battery) -> String {
-    match (battery.left, battery.right) {
-        (Some(left), Some(right)) => format!(" · left {left}% · right {right}%"),
-        (Some(left), None) => format!(" · left {left}% · right unknown"),
-        (None, Some(right)) => format!(" · right {right}%"),
-        (None, None) => battery
-            .keyboard
-            .map(|level| format!(" · {level}%"))
-            .unwrap_or_default(),
+    let halves: Vec<String> = [("left", battery.left), ("right", battery.right)]
+        .into_iter()
+        .filter(|(_, level)| !level.is_absent())
+        .map(|(half, level)| format!("{half} {}", said(level)))
+        .collect();
+
+    match halves.is_empty() {
+        false => format!(" · {}", halves.join(" · ")),
+        // A board with one battery, which reports only the whole.
+        true => match battery.keyboard {
+            Level::Percent(level) => format!(" · {level}%"),
+            _ => String::new(),
+        },
+    }
+}
+
+fn said(level: Level) -> String {
+    match level {
+        Level::Percent(level) => format!("{level}%"),
+        _ => "unknown".to_string(),
     }
 }
 
@@ -666,4 +681,60 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
     .context("Flash failed")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_halves_of_a_split_board_are_named() {
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        assert_eq!(charge(battery), " · left 0% · right 27%");
+    }
+
+    #[test]
+    fn a_half_that_is_there_and_would_not_say_is_called_unknown() {
+        let battery = Battery {
+            left: Level::Percent(36),
+            right: Level::Unknown,
+            keyboard: Level::Percent(36),
+        };
+        assert_eq!(charge(battery), " · left 36% · right unknown");
+    }
+
+    #[test]
+    fn a_half_the_board_does_not_have_is_left_out() {
+        // Not the same as one that would not say: naming it would invent a half.
+        let battery = Battery {
+            left: Level::Percent(36),
+            right: Level::Absent,
+            keyboard: Level::Percent(36),
+        };
+        assert_eq!(charge(battery), " · left 36%");
+    }
+
+    #[test]
+    fn a_board_with_one_battery_reports_the_whole() {
+        let battery = Battery {
+            keyboard: Level::Percent(80),
+            ..Battery::default()
+        };
+        assert_eq!(charge(battery), " · 80%");
+    }
+
+    #[test]
+    fn a_board_that_said_nothing_says_nothing() {
+        assert_eq!(charge(Battery::default()), "");
+        // Including one connected but unreadable, which must not read as flat.
+        let battery = Battery {
+            keyboard: Level::Unknown,
+            ..Battery::default()
+        };
+        assert_eq!(charge(battery), "");
+    }
 }

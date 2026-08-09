@@ -13,7 +13,7 @@ mod monitor;
 mod roster;
 pub mod smp;
 
-pub use battery::{Battery, Half};
+pub use battery::{Battery, Half, Level};
 pub use board::{BleBoard, BleEvent, BleSighting, Presence};
 pub use monitor::BleMonitor;
 pub use roster::Roster;
