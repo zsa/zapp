@@ -385,21 +385,25 @@ fn read_as(reading: BatteryReading) -> String {
         (Some(false), Some(true)) => " on USB",
         _ => "",
     };
-    match reading.source {
-        Some(source) if reading.level.is_some() => {
-            format!("{level}{doing} ({})", came_from(source))
-        }
-        _ => format!("{level}{doing}"),
+    match reading.source.filter(|_| reading.level.is_some()).and_then(came_from) {
+        Some(from) => format!("{level}{doing} ({from})"),
+        None => format!("{level}{doing}"),
     }
 }
 
-fn came_from(source: Source) -> &'static str {
+/// Where a reading came from, when that tells the reader something.
+///
+/// A half reporting its own cell is the ordinary case and saying so is noise.
+/// The rest earn their words: over the cable is live, over the radio may be a
+/// moment old, and a source this build does not know should not be dressed up
+/// as one it does.
+fn came_from(source: Source) -> Option<&'static str> {
     match source {
-        Source::Nrf => "read by the left half",
-        Source::Wired => "read over the cable",
-        Source::Esb => "relayed over the radio",
-        Source::Unknown => "no source",
-        Source::Other(_) => "a source this zapp does not know",
+        Source::Nrf => None,
+        Source::Wired => Some("read over the cable"),
+        Source::Esb => Some("relayed over the radio"),
+        Source::Unknown => Some("no source"),
+        Source::Other(_) => Some("a source this zapp does not know"),
     }
 }
 
@@ -910,7 +914,7 @@ mod tests {
         assert_eq!(
             describe_telemetry(&telemetry),
             vec![
-                "battery · left 87% (read by the left half) · right 64% (read over the cable)",
+                "battery · left 87% · right 64% (read over the cable)",
                 "pointing · build trackball · left none · right trackball",
             ]
         );
@@ -947,13 +951,13 @@ mod tests {
             usb: None,
             source: Some(Source::Nrf),
         };
-        assert_eq!(read_as(unsure), "50% (read by the left half)");
+        assert_eq!(read_as(unsure), "50%");
 
         let charging = BatteryReading {
             charging: Some(true),
             ..unsure
         };
-        assert_eq!(read_as(charging), "50% charging (read by the left half)");
+        assert_eq!(read_as(charging), "50% charging");
     }
 
     #[test]
