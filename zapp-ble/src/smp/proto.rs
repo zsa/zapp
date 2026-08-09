@@ -21,10 +21,16 @@ pub const HEADER_LEN: usize = 8;
 
 /// The SMP protocol version this client speaks.
 ///
-/// Version 1 exists and adds a richer error shape, but a device answers in the
-/// version it was asked in, so speaking 0 is what keeps the replies simple, and
-/// every mcumgr build understands it.
-pub const VERSION: u8 = 0;
+/// 1 is the second version of the protocol, and the only reason to ask in it
+/// is the error shape: it is the one that carries `{"group", "rc"}`, and a
+/// group is how a device says something its vendor defined rather than one of
+/// the dozen codes mcumgr shares between every board. Asking in 0 does not
+/// merely leave that on the table — Zephyr translates a group error back to a
+/// shared code when the request was version 0, so "the battery is flat" would
+/// arrive as "access denied" or, with no translation registered, as "unknown
+/// error". A device answers in the version it was asked in, and version 1 has
+/// been understood since Zephyr 3.3.
+pub const VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -234,8 +240,17 @@ fn shared_meaning(rc: i64) -> &'static str {
     }
 }
 
-/// A group-scoped code, for the version 1 error shape.
+/// A group-scoped code, for the version 2 error shape.
+///
+/// ZSA's own group is looked up first and falls through to the generic wording
+/// when this build does not know the code: the firmware grows codes faster
+/// than the host learns them, and `SmpError::Remote` prints the group and the
+/// number alongside this either way, so an unrecognised refusal still says
+/// enough to look up.
 fn group_meaning(group: u16, rc: i64) -> &'static str {
+    if let Some(short) = super::zsa_err::short(group, rc) {
+        return short;
+    }
     match (group, rc) {
         (super::img::GROUP, 1) => "flash configuration query failed",
         (super::img::GROUP, 2) => "no free slot",
@@ -245,6 +260,7 @@ fn group_meaning(group: u16, rc: i64) -> &'static str {
         (super::img::GROUP, 9) => "image too large for the slot",
         (super::img::GROUP, 13) => "image already pending",
         (super::img::GROUP, 24) => "image is not confirmable",
+        (super::zsa_err::GROUP, _) => "a reason this version of zapp does not know",
         _ => "group-specific error",
     }
 }
@@ -295,10 +311,11 @@ mod tests {
 
     #[test]
     fn the_header_is_laid_out_the_way_the_device_reads_it() {
-        // An image-state read: op 0, one byte of payload, group 1, command 0.
+        // An image-state read: op 0, version 1 in the bits above it, one byte
+        // of payload, group 1, command 0.
         assert_eq!(
             image_state_read().encode(),
-            [0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x2a, 0x00]
+            [0x08, 0x00, 0x00, 0x01, 0x00, 0x01, 0x2a, 0x00]
         );
         // Multi-byte fields are big endian, which is the one thing a native
         // encoding would get silently wrong on this machine.

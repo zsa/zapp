@@ -210,22 +210,36 @@ fn main() -> Result<()> {
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
-        Commands::Smp { command } => match command {
-            SmpCommands::Bundle {
-                bundle,
-                force,
-                args,
-            } => zsab::update(&bundle, force, &args),
-            SmpCommands::Images(args) => cmd_smp_images(&args),
-            SmpCommands::Upload {
-                firmware,
-                image,
-                args,
-            } => cmd_smp_upload(&firmware, image, &args),
-            SmpCommands::Test { hash, args } => cmd_smp_mark(&hash, false, &args),
-            SmpCommands::Confirm { hash, args } => cmd_smp_mark(&hash, true, &args),
-            SmpCommands::Reset(args) => cmd_smp_reset(&args),
-        },
+        Commands::Smp { command } => {
+            // The bundle flow prints its own fuller version, with the measured
+            // levels in it, so it is left to do that.
+            let bundle_flow = matches!(command, SmpCommands::Bundle { .. });
+            let result = match command {
+                SmpCommands::Bundle {
+                    bundle,
+                    force,
+                    args,
+                } => zsab::update(&bundle, force, &args),
+                SmpCommands::Images(args) => cmd_smp_images(&args),
+                SmpCommands::Upload {
+                    firmware,
+                    image,
+                    args,
+                } => cmd_smp_upload(&firmware, image, &args),
+                SmpCommands::Test { hash, args } => cmd_smp_mark(&hash, false, &args),
+                SmpCommands::Confirm { hash, args } => cmd_smp_mark(&hash, true, &args),
+                SmpCommands::Reset(args) => cmd_smp_reset(&args),
+            };
+            // A keyboard that said no said why, and the reason is worth more
+            // than the one line the error chain gives it.
+            if let (false, Err(err)) = (bundle_flow, &result)
+                && let Some(advice) = zsab::refusal_advice(err)
+            {
+                println!();
+                println!("{advice}");
+            }
+            result
+        }
     }
 }
 

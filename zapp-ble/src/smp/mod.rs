@@ -21,6 +21,7 @@ pub mod client;
 pub mod image;
 pub mod img;
 pub mod proto;
+pub mod zsa_err;
 
 use std::fmt;
 use std::str::FromStr;

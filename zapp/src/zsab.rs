@@ -15,7 +15,8 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::smp::bundle::{self, Bundle, Step};
-use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
+use zapp_ble::smp::zsa_err::{self, Cause, Side};
+use zapp_ble::smp::{self, Half, ImageSlot, SmpClient, SmpError};
 use zapp_ble::{Battery, Level};
 use zapp_core::device::{self, ids::Keyboard};
 use zapp_core::flash::FlashProgress;
@@ -64,6 +65,10 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
         Err(err) => {
             println!();
             println!("Update failed: {err:#}");
+            if let Some(note) = refusal_note(&err, progress.battery, progress.charging) {
+                println!();
+                println!("{note}");
+            }
             println!();
             println!("{}", progress.advice(path));
             println!();
@@ -87,6 +92,12 @@ struct Progress {
     left_pending: bool,
     /// Both halves are back on their new images and only the confirm is left.
     settled: bool,
+    /// What the packs read at the last look, and whether the keyboard was on
+    /// the charger. Kept here so a refusal that turns out to be about the
+    /// battery can quote real numbers rather than the threshold alone; both
+    /// halves stay unknown until the levels have been asked for.
+    battery: Battery,
+    charging: bool,
 }
 
 impl Progress {
@@ -165,6 +176,16 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         log::debug!("could not read the battery levels: {err}");
         Battery::default()
     });
+    let charging = charging();
+    progress.battery = battery;
+    progress.charging = charging;
+    println!("  charge {}", charge(battery, charging));
+    // Before the right half is touched, not after: reading the right goes
+    // through the left's relay, and the relay is battery-gated too. On a flat
+    // pack that read is the thing that fails, and it fails looking like a
+    // radio-link fault — so the check that can actually name the battery has
+    // to run first.
+    check_battery(battery, charging)?;
     let right_slots = read_state(link, Half::Right).context(
         "The right half is reached through the left, over the halves' own radio link, and \
          that link has to be up before anything is written — updating the left first would \
@@ -186,9 +207,6 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         };
         println!("  {:<5}  {}", half.as_str(), describe(step, slots));
     }
-    let charging = charging();
-    println!("  charge {}", charge(battery, charging));
-    check_battery(battery, charging)?;
 
     if plan.iter().all(|(_, step)| *step == Step::Installed) {
         println!();
@@ -509,22 +527,144 @@ fn check_battery(battery: Battery, charging: bool) -> Result<()> {
     let halves = [
         ("left", battery.left.percent()),
         ("right", battery.right.percent()),
-        ("keyboard", battery.keyboard.percent()),
     ];
-    for (half, level) in halves {
-        if bundle::battery_allows(level, charging) {
-            continue;
-        }
-        bail!(
-            "The {half} battery is at {}%, under the {}% an update needs. An update takes \
-             minutes of radio and a reboot, and a half that runs out part-way through is a \
-             half that has to be recovered over the wire. Charge it, or plug the keyboard \
-             in and try again — on the charger this check does not apply.",
-            level.unwrap_or(0),
-            bundle::MIN_SOC_PERCENT
-        );
+    let mut low: Vec<String> = halves
+        .iter()
+        .filter(|(_, level)| !bundle::battery_allows(*level, charging))
+        .map(|(half, level)| format!("the {half} at {}%", level.unwrap_or(0)))
+        .collect();
+    // The combined instance is the lower of the two halves, so naming it as
+    // well would report the same flat pack twice. It is only worth naming on
+    // its own — which is what a board with one battery publishes.
+    if low.is_empty() && !bundle::battery_allows(battery.keyboard.percent(), charging) {
+        low.push(format!(
+            "the keyboard at {}%",
+            battery.keyboard.percent().unwrap_or(0)
+        ));
     }
-    Ok(())
+    if low.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} — under the {}% an update needs.\n\n{}",
+        sentence(&low),
+        bundle::MIN_SOC_PERCENT,
+        wrap(
+            "An update is minutes of radio and a reboot in which the firmware is rewritten, \
+             and a half that runs out part-way has to be recovered over a cable. Charge the \
+             keyboard, or plug it in and try again — on the charger this check does not \
+             apply."
+        )
+    );
+}
+
+/// "the left at 0%" / "the left at 0% and the keyboard at 0%" / a comma list.
+fn sentence(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => format!("The battery is low: {only}"),
+        [first, second] => format!("The batteries are low: {first} and {second}"),
+        [rest @ .., last] => format!("The batteries are low: {} and {last}", rest.join(", ")),
+    }
+}
+
+/// The measured levels, named one by one, so a half nobody could read is not
+/// passed off as a half that answered.
+fn levels_line(battery: Battery, charging: bool) -> String {
+    let level = |level: Level| match level {
+        Level::Percent(level) => format!("{level}%"),
+        Level::Unknown => "would not say".to_string(),
+        Level::Absent => "did not report".to_string(),
+    };
+    format!(
+        "The left reads {}, the right {}{}.",
+        level(battery.left),
+        level(battery.right),
+        if charging {
+            ", and the keyboard is on the charger"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The firmware's own reason for saying no, in plain sentences.
+///
+/// The board answers a refusal with a ZSA code (see
+/// `zapp_ble::smp::zsa_err`), and the one line the error chain gives it is a
+/// summary rather than an answer. `None` for anything that is not a refusal
+/// this build knows — including a code from a firmware newer than this zapp,
+/// which is left to the raw group and number in the error itself rather than
+/// dressed up as something it might not be.
+pub fn refusal_advice(err: &anyhow::Error) -> Option<String> {
+    Some(wrap(refusal(err)?.advice))
+}
+
+/// The same, with the measured levels spliced in when the reason is a battery.
+fn refusal_note(err: &anyhow::Error, battery: Battery, charging: bool) -> Option<String> {
+    let refusal = refusal(err)?;
+    let advice = wrap(refusal.advice);
+
+    let measured = match refusal.cause {
+        Cause::BatteryLow(side) | Cause::SwapHeld(side) => {
+            let (named, reading) = match side {
+                Side::Left => ("left", battery.left),
+                Side::Right => ("right", battery.right),
+            };
+            Some(match reading {
+                Level::Percent(_) => format!(
+                    "{} The threshold is {}%.",
+                    levels_line(battery, charging),
+                    bundle::MIN_SOC_PERCENT
+                ),
+                // The board refused on its own measurement and this end has
+                // none, so say that rather than print a half as flat when
+                // nobody here could read it.
+                _ => format!(
+                    "{} The threshold is {}%, and the keyboard refused on its own reading \
+                     of the {named} half — this end could not read a level for it at all.",
+                    levels_line(battery, charging),
+                    bundle::MIN_SOC_PERCENT
+                ),
+            })
+        }
+        _ => None,
+    };
+
+    Some(match measured {
+        Some(measured) => format!("{advice}\n\n{}", wrap(&measured)),
+        None => advice,
+    })
+}
+
+fn refusal(err: &anyhow::Error) -> Option<zsa_err::Refusal> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SmpError>())
+        .and_then(|smp| match smp {
+            SmpError::Remote { group, rc, .. } => zsa_err::lookup(*group, *rc),
+            _ => None,
+        })
+}
+
+/// Folds a paragraph to the width the rest of this file is written at.
+fn wrap(text: &str) -> String {
+    const WIDTH: usize = 76;
+
+    let mut out = String::new();
+    let mut line = 0;
+    for word in text.split_whitespace() {
+        if line > 0 && line + 1 + word.chars().count() > WIDTH {
+            out.push('\n');
+            line = 0;
+        } else if line > 0 {
+            out.push(' ');
+            line += 1;
+        }
+        out.push_str(word);
+        line += word.chars().count();
+    }
+    out
 }
 
 /// Whether the pack is on the charger.
@@ -709,6 +849,7 @@ mod tests {
             left_restarted: true,
             left_pending: true,
             settled: true,
+            ..Progress::default()
         });
         assert!(advice.contains("not confirmed"), "{advice}");
         assert!(advice.contains("zapp smp images"), "{advice}");
@@ -733,6 +874,140 @@ mod tests {
         assert_eq!(
             charge(battery, true),
             "left 36% · right unknown · on the charger"
+        );
+    }
+
+    /// A wrapped paragraph as one line, since where the fold lands is not what
+    /// these are checking.
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// An error shaped the way one comes back from a board.
+    fn refused(group: u16, rc: i64) -> anyhow::Error {
+        anyhow::Error::from(SmpError::Remote {
+            group,
+            rc,
+            meaning: "test",
+        })
+        .context("The left half's upload failed")
+    }
+
+    #[test]
+    fn a_refusal_this_build_knows_gets_a_plain_paragraph() {
+        let advice = refusal_advice(&refused(zsa_err::GROUP, 1)).unwrap();
+        assert!(flat(&advice).contains("battery is too low"), "{advice}");
+        assert!(flat(&advice).contains("Charge the keyboard"), "{advice}");
+        // Wrapped prose, not one long line, and no raw code in the text.
+        assert!(advice.lines().count() > 1, "{advice}");
+        assert!(advice.lines().all(|line| line.len() <= 76), "{advice}");
+        assert!(!advice.contains("rc "), "{advice}");
+    }
+
+    #[test]
+    fn the_three_refusals_a_user_acts_on_differently_read_differently() {
+        let battery = refusal_advice(&refused(zsa_err::GROUP, 2)).unwrap();
+        let busy = refusal_advice(&refused(zsa_err::GROUP, 6)).unwrap();
+        let link = refusal_advice(&refused(zsa_err::GROUP, 9)).unwrap();
+        assert!(flat(&battery).contains("Charge"), "{battery}");
+        assert!(flat(&busy).contains("already talking"), "{busy}");
+        assert!(flat(&link).contains("never got to the right half"), "{link}");
+        assert_ne!(battery, busy);
+        assert_ne!(busy, link);
+    }
+
+    #[test]
+    fn a_code_from_a_newer_firmware_gets_no_paragraph_at_all() {
+        // The error itself still prints "(group 66, rc 99)", which is honest.
+        // Inventing a paragraph for it would not be.
+        assert!(refusal_advice(&refused(zsa_err::GROUP, 99)).is_none());
+        assert!(refusal_advice(&refused(1, 9)).is_none());
+        assert!(refusal_advice(&anyhow::anyhow!("something else")).is_none());
+    }
+
+    #[test]
+    fn a_battery_refusal_quotes_the_measured_levels_and_the_threshold() {
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        let note = refusal_note(&refused(zsa_err::GROUP, 1), battery, false).unwrap();
+        assert!(flat(&note).contains("The left reads 0%"), "{note}");
+        assert!(flat(&note).contains("the right 27%"), "{note}");
+        assert!(flat(&note).contains("threshold is 30%"), "{note}");
+        assert!(flat(&note).contains("Charge the keyboard"), "{note}");
+    }
+
+    #[test]
+    fn a_battery_refusal_for_a_half_this_end_could_not_read_says_so() {
+        // The board refused on its own measurement. Printing "the right is at
+        // 0%" here would be a number nobody read.
+        let battery = Battery {
+            left: Level::Percent(64),
+            right: Level::Unknown,
+            keyboard: Level::Percent(64),
+        };
+        let note = refusal_note(&refused(zsa_err::GROUP, 2), battery, false).unwrap();
+        assert!(flat(&note).contains("could not read a level for it"), "{note}");
+        assert!(flat(&note).contains("the right would not say"), "{note}");
+        // No invented number for the half nobody here could read.
+        assert!(!flat(&note).contains("the right 0%"), "{note}");
+        assert!(!flat(&note).contains("the right reads"), "{note}");
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_about_a_battery_carries_no_levels() {
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        let note = refusal_note(&refused(zsa_err::GROUP, 6), battery, false).unwrap();
+        assert!(!flat(&note).contains("0%"), "{note}");
+        assert!(flat(&note).contains("already talking"), "{note}");
+    }
+
+    #[test]
+    fn the_battery_gate_names_the_halves_rather_than_the_pack_twice() {
+        // left and keyboard both read 0, and they are the same cell.
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        let err = check_battery(battery, false).unwrap_err().to_string();
+        assert!(flat(&err).contains("the left at 0%"), "{err}");
+        assert!(flat(&err).contains("the right at 27%"), "{err}");
+        assert!(!flat(&err).contains("keyboard at"), "{err}");
+        assert!(flat(&err).contains("under the 30%"), "{err}");
+        assert!(flat(&err).contains("Charge the keyboard"), "{err}");
+    }
+
+    #[test]
+    fn a_board_with_one_battery_is_still_named() {
+        let battery = Battery {
+            left: Level::Absent,
+            right: Level::Absent,
+            keyboard: Level::Percent(4),
+        };
+        let err = check_battery(battery, false).unwrap_err().to_string();
+        assert!(flat(&err).contains("the keyboard at 4%"), "{err}");
+        // No half is named, because this board publishes none.
+        assert!(!flat(&err).contains("the left"), "{err}");
+        assert!(!flat(&err).contains("the right"), "{err}");
+    }
+
+    #[test]
+    fn a_paragraph_is_folded_without_losing_or_breaking_a_word() {
+        let text = "one two three four five six seven eight nine ten eleven twelve \
+                    thirteen fourteen fifteen sixteen seventeen eighteen";
+        let wrapped = wrap(text);
+        assert!(wrapped.lines().count() > 1);
+        assert!(wrapped.lines().all(|line| line.len() <= 76), "{wrapped}");
+        assert_eq!(
+            wrapped.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
         );
     }
 
