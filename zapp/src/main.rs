@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use zapp_ble::smp::session::{Next, Status};
 use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
@@ -79,8 +80,12 @@ enum Commands {
             the halves' radio link. Update the right half first: it is only \
             reachable while both halves still speak the same protocol.\n\n\
             `zapp smp bundle` does all of that in one go, both halves, from a \
-            .zsab release bundle. The subcommands below are what it is built \
-            from, and what to reach for when one step needs doing by hand.",
+            .zsab release bundle. It is also the only thing here that declares \
+            an update, and shipping firmware accepts nothing else over \
+            Bluetooth: the single-step subcommands below are refused unless the \
+            board was built with the guard compiled out. They are kept because \
+            they are the debugging surface, and `zapp smp session` says what \
+            the board has open.",
         after_long_help = "Examples:\n  \
             zapp smp bundle voyager2_0.1.8.zsab\n  \
             zapp smp images\n  \
@@ -89,7 +94,8 @@ enum Commands {
             zapp smp upload right.signed.bin --half right\n  \
             zapp smp test 3a5f9c...\n  \
             zapp smp confirm 3a5f9c...\n  \
-            zapp smp reset"
+            zapp smp reset\n  \
+            zapp smp session"
     )]
     Smp {
         #[command(subcommand)]
@@ -160,6 +166,29 @@ enum SmpCommands {
     },
     /// Reboot the board
     Reset(SmpArgs),
+    /// Show the update session the keyboard has open, and end it
+    #[command(
+        long_about = "Show the update session the keyboard has open.\n\n\
+            Over Bluetooth a Voyager 2 only accepts a declared update: a host \
+            says which image each half is getting before it writes anything, \
+            and every write is checked against that. This reads that \
+            declaration back — what is declared, which half is next, how long \
+            the session has left, and whether this board is enforcing any of \
+            it at all.\n\n\
+            Only the left half serves this; the right runs no session of its \
+            own. --close ends the session, which is worth doing when something \
+            stopped half way and left one open.",
+        after_long_help = "Examples:\n  \
+            zapp smp session\n  \
+            zapp smp session --close"
+    )]
+    Session {
+        /// End the session rather than only reporting it
+        #[arg(long)]
+        close: bool,
+        #[command(flatten)]
+        link: LinkArgs,
+    },
 }
 
 #[derive(clap::Args)]
@@ -233,14 +262,22 @@ fn main() -> Result<()> {
                 SmpCommands::Test { hash, args } => cmd_smp_mark(&hash, false, &args),
                 SmpCommands::Confirm { hash, args } => cmd_smp_mark(&hash, true, &args),
                 SmpCommands::Reset(args) => cmd_smp_reset(&args),
+                SmpCommands::Session { close, link } => cmd_smp_session(close, &link),
             };
             // A keyboard that said no said why, and the reason is worth more
-            // than the one line the error chain gives it.
+            // than the one line the error chain gives it. The guard's own
+            // refusals get a second paragraph: a bare subcommand that hits one
+            // has to be told where the supported path is, because retrying it
+            // will be refused in exactly the same way.
             if let (false, Err(err)) = (bundle_flow, &result)
                 && let Some(advice) = zsab::refusal_advice(err)
             {
                 println!();
                 println!("{advice}");
+                if let Some(note) = zsab::guard_note(err) {
+                    println!();
+                    println!("{note}");
+                }
             }
             result
         }
@@ -826,6 +863,102 @@ fn cmd_smp_mark(hash: &str, confirm: bool, args: &SmpArgs) -> Result<()> {
     );
     print_image_state(&slots);
     Ok(())
+}
+
+/// Reads back the update the keyboard has been told about, and optionally ends
+/// it.
+///
+/// Only the left half serves this — the right runs no session of its own, only
+/// the claim the left repeats to it — so this takes no `--half`. It is the one
+/// place to look after a refusal: a host that was turned down needs to see what
+/// the board thinks is open before it can tell an expired session from a
+/// half-finished one from another program holding the lock.
+fn cmd_smp_session(close: bool, link: &LinkArgs) -> Result<()> {
+    let mut client = smp_connect(link, Half::Left)?;
+    let status = client
+        .session_status()
+        .context("Could not read the update session")?;
+    print_session(&status);
+
+    if !close {
+        return Ok(());
+    }
+    if !status.open {
+        println!();
+        println!("Nothing to close.");
+        return Ok(());
+    }
+
+    // By id, so this ends the session that was just read rather than whatever
+    // happens to be open by the time the write lands.
+    let closed = client
+        .session_close(Some(status.id))
+        .context("Could not close the update session")?;
+    println!();
+    if closed.open {
+        println!("The board still reports session {} open.", closed.id);
+    } else {
+        println!("Session {} closed.", status.id);
+    }
+    Ok(())
+}
+
+fn print_session(status: &Status) {
+    if status.open {
+        println!(
+            "Session {} · {} · {} s left",
+            status.id,
+            if status.version.is_empty() {
+                "(no version)"
+            } else {
+                &status.version
+            },
+            status.ttl_ms / 1000
+        );
+    } else {
+        println!("No update session is open.");
+    }
+
+    println!("  next   {}", next_of(status.next));
+    println!("  left   {}", half_of(true, status.left_done));
+    println!("  right  {}", half_of(status.right_seen, status.right_done));
+    if !status.left_hash.is_empty() {
+        println!(
+            "  the left is running {}",
+            smp::image::hex(&status.left_hash)
+        );
+    }
+    if let Some(tag) = &status.right_tag {
+        println!("  the right reports {}", smp::image::hex(tag));
+    }
+    println!(
+        "  guard  {}",
+        match status.guard {
+            true => "on: this board accepts only a declared update over Bluetooth",
+            false => "off: a development build, so the single-step subcommands work",
+        }
+    );
+}
+
+fn next_of(next: Next) -> String {
+    match next {
+        Next::None => "nothing is declared".to_string(),
+        Next::Right => "the right half".to_string(),
+        Next::Left => "the left half".to_string(),
+        Next::Complete => "nothing: both halves carry what was declared".to_string(),
+        Next::Unknown(code) => format!("a step this zapp does not know ({code})"),
+    }
+}
+
+/// One half's line. A half nobody can read is not a half that is unfinished,
+/// and the two must not print the same: the first is a keyboard to go and look
+/// at, the second is one to wait for.
+fn half_of(seen: bool, done: bool) -> &'static str {
+    match (seen, done) {
+        (false, _) => "not reporting: switched off, out of range, or older firmware",
+        (true, false) => "not carrying its declared image, or has not confirmed it",
+        (true, true) => "carrying its declared image, confirmed",
+    }
 }
 
 fn cmd_smp_reset(args: &SmpArgs) -> Result<()> {

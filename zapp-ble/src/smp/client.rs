@@ -6,6 +6,7 @@ use zapp_core::flash::FlashProgress;
 
 use super::img::{self, ImageSlot};
 use super::proto::{self, Header, Op, Reassembler, HEADER_LEN};
+use super::session::{self, Declaration, Status};
 use super::{cbor, image, SmpError};
 use crate::backend::GattChannel;
 
@@ -278,6 +279,41 @@ impl SmpClient {
         img::parse_state(&reply)
     }
 
+    /// Declares an update: both halves' images, by both hashes, and the build
+    /// they came from.
+    ///
+    /// Only the left half serves this. Declaring the *same* update again while
+    /// it is open is a renewal rather than a second session, so a host that
+    /// reconnected calls this again rather than working out whether it has to;
+    /// a different declaration while one is live is refused.
+    pub fn session_open(&mut self, declaration: &Declaration) -> Result<Status, SmpError> {
+        let payload = session::open_request(declaration);
+        let reply = self.transact(Op::Write, session::GROUP, session::CMD_OPEN, &payload)?;
+        session::parse_status(&reply)
+    }
+
+    /// What is declared, what is done, and what is next.
+    ///
+    /// Never refused, whether or not a session is open: it is how a host works
+    /// out why it is being turned down, so gating it would leave a refused host
+    /// with nowhere to look.
+    pub fn session_status(&mut self) -> Result<Status, SmpError> {
+        let payload = session::status_request();
+        let reply = self.transact(Op::Read, session::GROUP, session::CMD_STATUS, &payload)?;
+        session::parse_status(&reply)
+    }
+
+    /// Ends the session, and reports what it left behind.
+    ///
+    /// An id ends only that session; `None` ends whatever is open. Closing when
+    /// there is nothing to close is not an error — the caller wanted no session
+    /// and there is none.
+    pub fn session_close(&mut self, id: Option<u32>) -> Result<Status, SmpError> {
+        let payload = session::close_request(id);
+        let reply = self.transact(Op::Write, session::GROUP, session::CMD_CLOSE, &payload)?;
+        session::parse_status(&reply)
+    }
+
     /// Writes an image into the board's spare slot.
     ///
     /// The device decides where the next request starts, every time: this loop
@@ -450,6 +486,16 @@ mod tests {
         /// What it says when asked, as `(buf_size, buf_count)`. `None` is a
         /// build without the mcumgr-parameters command.
         buffers: Option<(usize, usize)>,
+        /// The update session it is holding, as `(id, the OPEN request that
+        /// declared it)`. The whole request is kept because that is what a
+        /// re-declaration has to match to count as a renewal.
+        session: Option<(u32, Vec<u8>)>,
+        /// The id the next new session gets.
+        next_session_id: u32,
+        /// What it answers `next` with while a session is open.
+        next_step: u32,
+        /// False for a build with the guard compiled out.
+        guard: bool,
         /// The largest request that ever reached it whole.
         largest: Arc<Mutex<usize>>,
         requests: Arc<Mutex<Vec<(u16, u8)>>>,
@@ -470,6 +516,10 @@ mod tests {
                 capacity: 2475,
                 silent_over: None,
                 buffers: Some((2475, 4)),
+                session: None,
+                next_session_id: 1,
+                next_step: 1,
+                guard: true,
                 largest: Arc::new(Mutex::new(0)),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 resets: Arc::new(Mutex::new(0)),
@@ -539,8 +589,87 @@ mod tests {
                     self.answer(header, state);
                 }
                 (img::GROUP, img::CMD_UPLOAD) => self.upload(header, body),
+                (session::GROUP, session::CMD_OPEN) => self.session_open(header, body),
+                (session::GROUP, session::CMD_STATUS) => {
+                    let status = self.session_status();
+                    self.answer(header, status);
+                }
+                (session::GROUP, session::CMD_CLOSE) => self.session_close(header, body),
                 _ => self.answer(header, cbor::map(vec![("rc", cbor::uint(8))])),
             }
+        }
+
+        /// What the firmware answers every group 67 command with.
+        fn session_status(&self) -> Value {
+            let (open, id) = match &self.session {
+                Some((id, _)) => (true, *id),
+                None => (false, 0),
+            };
+            let version = self
+                .session
+                .as_ref()
+                .and_then(|(_, request)| cbor::decode(request).ok())
+                .and_then(|request| {
+                    cbor::field(&request, "ver").and_then(cbor::as_text).map(str::to_string)
+                })
+                .unwrap_or_default();
+            cbor::map(vec![
+                ("open", Value::Bool(open)),
+                ("id", cbor::uint(id)),
+                ("ver", Value::Text(version)),
+                ("next", cbor::uint(if open { self.next_step } else { 0 })),
+                ("ldone", Value::Bool(false)),
+                ("rdone", Value::Bool(self.next_step >= 2)),
+                ("rseen", Value::Bool(true)),
+                ("lhash", cbor::bytes(&[0x11; 32])),
+                ("rtag", cbor::bytes(&[0xcd; 8])),
+                ("ttl", cbor::uint(if open { 299_000 } else { 0 })),
+                ("guard", Value::Bool(self.guard)),
+            ])
+        }
+
+        fn session_open(&mut self, header: Header, body: &[u8]) {
+            let declared = declaration_of(body);
+            // A different declaration while one is live is the one refusal an
+            // open has of its own: ZSA_MGMT_ERR_SESSION_BUSY.
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|(_, held)| *held != declared)
+            {
+                self.answer(
+                    header,
+                    cbor::map(vec![(
+                        "err",
+                        cbor::map(vec![
+                            ("group", cbor::uint(u32::from(crate::smp::zsa_err::GROUP))),
+                            ("rc", cbor::uint(16)),
+                        ]),
+                    )]),
+                );
+                return;
+            }
+            if self.session.is_none() {
+                self.session = Some((self.next_session_id, declared));
+                self.next_session_id += 1;
+            }
+            let status = self.session_status();
+            self.answer(header, status);
+        }
+
+        fn session_close(&mut self, header: Header, body: &[u8]) {
+            let asked = cbor::decode(body)
+                .ok()
+                .and_then(|request| cbor::field(&request, "id").and_then(cbor::as_u32));
+            let matches = self
+                .session
+                .as_ref()
+                .is_some_and(|(id, _)| asked.is_none_or(|asked| asked == *id));
+            if matches {
+                self.session = None;
+            }
+            let status = self.session_status();
+            self.answer(header, status);
         }
 
         fn upload(&mut self, header: Header, body: &[u8]) {
@@ -571,6 +700,22 @@ mod tests {
             }
             self.answer(header, cbor::map(reply));
         }
+    }
+
+    /// The declaration out of an OPEN request, with `redo` dropped.
+    ///
+    /// `redo` asks for the declared images to be written again and is not part
+    /// of what was declared, so setting it on an otherwise identical statement
+    /// must read as the same session rather than as a second host.
+    fn declaration_of(body: &[u8]) -> Vec<u8> {
+        let Ok(request) = cbor::decode(body) else {
+            return body.to_vec();
+        };
+        let entries: Vec<(&str, Value)> = ["lslot", "lup", "rslot", "rup", "ver"]
+            .into_iter()
+            .filter_map(|key| cbor::field(&request, key).map(|value| (key, value.clone())))
+            .collect();
+        cbor::encode(&cbor::map(entries))
     }
 
     impl GattChannel for FakeDevice {
@@ -1030,6 +1175,135 @@ mod tests {
         let err = client.upload(0, &[0x42; 5000], &|_| {}).unwrap_err();
         assert!(matches!(err, SmpError::Timeout(_)), "{err:?}");
         assert_eq!(client.request_limit(), 249);
+    }
+
+    fn declaration() -> session::Declaration {
+        session::Declaration {
+            left: session::Declared {
+                slot_hash: vec![0x11; 32],
+                upload_hash: vec![0x22; 32],
+            },
+            right: session::Declared {
+                slot_hash: vec![0x33; 32],
+                upload_hash: vec![0x44; 32],
+            },
+            version: "0.1.9".into(),
+            redo: false,
+        }
+    }
+
+    #[test]
+    fn declaring_an_update_reaches_the_board_as_a_group_67_write() {
+        let device = FakeDevice::new(244);
+        let requests = Arc::clone(&device.requests);
+        let status = client(device).session_open(&declaration()).unwrap();
+
+        assert!(status.open);
+        assert_eq!(status.id, 1);
+        assert_eq!(status.version, "0.1.9");
+        assert_eq!(status.next, session::Next::Right);
+        assert!(status.guard);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![(session::GROUP, session::CMD_OPEN)]
+        );
+    }
+
+    #[test]
+    fn declaring_the_same_update_again_renews_it_rather_than_starting_another() {
+        // What a host that lost its connection does, which is every reconnect
+        // in a bundle run: the id has to stand, or the close at the end names
+        // a session that is not the one it opened.
+        let mut client = client(FakeDevice::new(244));
+        let first = client.session_open(&declaration()).unwrap();
+        let again = client.session_open(&declaration()).unwrap();
+        assert_eq!(first.id, again.id);
+        assert!(again.open);
+    }
+
+    #[test]
+    fn asking_for_a_rewrite_renews_the_session_rather_than_colliding_with_it() {
+        // `redo` is not part of the declaration, so turning it on mid-run must
+        // not read as a second host installing something else.
+        let mut client = client(FakeDevice::new(244));
+        let first = client.session_open(&declaration()).unwrap();
+        let forced = client
+            .session_open(&session::Declaration {
+                redo: true,
+                ..declaration()
+            })
+            .unwrap();
+        assert_eq!(forced.id, first.id);
+        assert!(forced.open);
+    }
+
+    #[test]
+    fn a_second_host_declaring_something_else_is_refused_in_zsas_group() {
+        let mut client = client(FakeDevice::new(244));
+        client.session_open(&declaration()).unwrap();
+
+        let other = session::Declaration {
+            version: "0.2.0".into(),
+            ..declaration()
+        };
+        let err = client.session_open(&other).unwrap_err();
+        // Group 66, not 67, and a code this build has a sentence for.
+        assert!(
+            matches!(err, SmpError::Remote { group: 66, rc: 16, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("session"), "{err}");
+    }
+
+    #[test]
+    fn a_status_read_answers_whether_or_not_anything_is_declared() {
+        let device = FakeDevice::new(244);
+        let requests = Arc::clone(&device.requests);
+        let mut client = client(device);
+
+        let closed = client.session_status().unwrap();
+        assert!(!closed.open);
+        assert_eq!(closed.next, session::Next::None);
+        assert_eq!(closed.ttl_ms, 0);
+
+        client.session_open(&declaration()).unwrap();
+        let open = client.session_status().unwrap();
+        assert!(open.open);
+        assert_eq!(open.ttl_ms, 299_000);
+        assert_eq!(open.right_tag, Some(vec![0xcd; 8]));
+
+        assert_eq!(
+            requests.lock().unwrap()[0],
+            (session::GROUP, session::CMD_STATUS)
+        );
+    }
+
+    #[test]
+    fn closing_names_the_session_it_opened_and_leaves_nothing_behind() {
+        let mut client = client(FakeDevice::new(244));
+        let opened = client.session_open(&declaration()).unwrap();
+        let closed = client.session_close(Some(opened.id)).unwrap();
+        assert!(!closed.open);
+        assert_eq!(closed.id, 0);
+        // And closing again is not a failure: the caller wanted no session and
+        // there is none.
+        assert!(!client.session_close(Some(opened.id)).unwrap().open);
+    }
+
+    #[test]
+    fn closing_a_session_that_is_not_this_ones_leaves_it_alone() {
+        let mut client = client(FakeDevice::new(244));
+        let opened = client.session_open(&declaration()).unwrap();
+        let after = client.session_close(Some(opened.id + 99)).unwrap();
+        assert!(after.open, "someone else's id closed this session");
+        assert_eq!(after.id, opened.id);
+    }
+
+    #[test]
+    fn a_development_build_says_it_is_not_enforcing() {
+        let mut device = FakeDevice::new(244);
+        device.guard = false;
+        assert!(!client(device).session_status().unwrap().guard);
     }
 
     #[test]

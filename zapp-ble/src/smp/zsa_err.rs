@@ -31,12 +31,32 @@ pub enum Cause {
     /// An image is written and marked, and only the restart that runs the swap
     /// is being held off until the pack recovers.
     SwapHeld(Side),
-    /// Something else is already updating this keyboard.
+    /// Something else is already updating this keyboard. The session's own
+    /// one-at-a-time refusal is [`Cause::Session`] rather than this, because the
+    /// rule it names is the session rule and a bare subcommand that hits it
+    /// needs to be pointed at `zapp smp bundle`.
     Busy,
     /// The halves cannot reach each other well enough to carry the update.
     Link,
     /// A request this host had no business sending.
     Protocol,
+    /// The declared update session refused this: nothing declared, an image that
+    /// was not part of it, a session that has run out or already finished, one
+    /// somebody else holds, or a declaration the board could not read.
+    Session,
+    /// The halves have to be written in order and this was out of turn.
+    Order,
+}
+
+impl Cause {
+    /// Whether this is the declared-update guard talking.
+    ///
+    /// A bare subcommand that hits one of these has to explain the rule and
+    /// point at `zapp smp bundle`, rather than retry: the guard refuses the same
+    /// request every time by design.
+    pub fn is_guard(self) -> bool {
+        matches!(self, Self::Session | Self::Order)
+    }
 }
 
 /// One entry of the registry.
@@ -139,6 +159,81 @@ const REGISTRY: &[Refusal] = &[
                  carry, so it was dropped rather than passed on in pieces. That is a bug in \
                  this tool rather than anything wrong with the keyboard; nothing was written.",
     },
+    Refusal {
+        code: 11,
+        cause: Cause::Session,
+        short: "no update session is open",
+        advice: "The keyboard was offered firmware without being told what was being \
+                 installed. Over Bluetooth it only accepts a declared update: a host says \
+                 up front which image each half is getting, and every write after that is \
+                 checked against what was said. That is what lets it insist the right half \
+                 is finished before the left is touched. Run `zapp smp bundle <file.zsab>`, \
+                 which declares the update and then writes it. Nothing was written and \
+                 nothing was retried.",
+    },
+    Refusal {
+        code: 12,
+        cause: Cause::Session,
+        short: "that image is not part of the update that was declared",
+        advice: "An update session is open, but this is not one of the two images it \
+                 declared. Either it is the wrong file, or it is the right file aimed at \
+                 the wrong half. Run `zapp smp bundle <file.zsab>` with the bundle you mean \
+                 to install: it declares both halves' images and writes each to the half it \
+                 belongs to. Nothing was written.",
+    },
+    Refusal {
+        code: 13,
+        cause: Cause::Order,
+        short: "the right half has to be updated first",
+        advice: "The left half refused its own image because the right half is not \
+                 finished: it is not carrying the image that was declared for it, has not \
+                 confirmed it, or cannot be reached to say either way. The right half is \
+                 reached only through the left, and only while both halves are speaking the \
+                 same protocol, so a left updated first would cut off the only route to the \
+                 half still waiting. The order is not advice. Check the right half is \
+                 switched on, charged and near the left, then run `zapp smp bundle \
+                 <file.zsab>`, which does both halves in the right order.",
+    },
+    Refusal {
+        code: 14,
+        cause: Cause::Session,
+        short: "the update session timed out",
+        advice: "The update session expired before this write got to the keyboard. Nothing \
+                 is lost and nothing is half-written: whatever had been sent is sitting in a \
+                 spare slot and both halves are still running the firmware they were. Run \
+                 the update again. It picks up from what is already installed rather than \
+                 starting over.",
+    },
+    Refusal {
+        code: 15,
+        cause: Cause::Session,
+        short: "this update is already installed",
+        advice: "Both halves already carry the images this session declared, and both have \
+                 confirmed them, so there is nothing left for it to write. The keyboard is \
+                 on the firmware you asked for. Pass --force to write it again anyway: that \
+                 asks for a deliberate rewrite, and both halves go in the same order they \
+                 would have.",
+    },
+    Refusal {
+        code: 16,
+        cause: Cause::Session,
+        short: "another program has an update session open",
+        advice: "Something else has already declared an update on this keyboard — another \
+                 copy of this tool, or the desktop app. One at a time, because two hosts \
+                 installing different firmware into the two halves is exactly the mismatch \
+                 the session exists to prevent. Close the other one, or wait for it to \
+                 finish, and try again.",
+    },
+    Refusal {
+        code: 17,
+        cause: Cause::Session,
+        short: "the update this host declared was unusable",
+        advice: "The keyboard could not read the declaration this host sent it: an image \
+                 hash was missing, the wrong length, or all zeroes. That is a bug in this \
+                 tool rather than anything wrong with the keyboard, and nothing was written. \
+                 Check the file really is a complete .zsab bundle, and say which version of \
+                 zapp you are running when you report it.",
+    },
 ];
 
 /// The registry entry for a code, if this build knows it.
@@ -173,11 +268,41 @@ mod tests {
     fn every_code_the_firmware_defines_has_a_sentence() {
         // The numbers are the contract, so they are checked one by one rather
         // than by counting: a gap here means a refusal a user cannot read.
-        for code in 1..=10 {
+        for code in 1..=17 {
             let refusal = lookup(GROUP, code).unwrap_or_else(|| panic!("no entry for {code}"));
             assert_eq!(refusal.code, u16::try_from(code).unwrap());
             assert!(!refusal.short.is_empty());
             assert!(refusal.advice.len() > 40, "code {code} has no real advice");
+        }
+    }
+
+    #[test]
+    fn the_session_codes_name_the_rule_rather_than_the_mechanism() {
+        // 11 to 17 are the declared-update guard, and each has to be readable
+        // as a rule a person can act on rather than as an internal state.
+        for code in 11..=17 {
+            assert!(
+                lookup(GROUP, code).unwrap().cause.is_guard(),
+                "code {code} is not read as the guard talking"
+            );
+        }
+        assert_eq!(lookup(GROUP, 13).unwrap().cause, Cause::Order);
+        // And the codes that are not the guard are still not.
+        for code in 1..=10 {
+            assert!(!lookup(GROUP, code).unwrap().cause.is_guard(), "code {code}");
+        }
+    }
+
+    #[test]
+    fn the_codes_a_bare_subcommand_hits_send_the_user_to_the_bundle() {
+        // 11, 12 and 13 are what `zapp smp upload`, `test` and `confirm` get
+        // back from shipping firmware, so each has to name the supported path.
+        for code in [11, 12, 13] {
+            let advice = lookup(GROUP, code).unwrap().advice;
+            assert!(
+                advice.contains("zapp smp bundle <file.zsab>"),
+                "code {code} does not point anywhere: {advice}"
+            );
         }
     }
 
@@ -214,10 +339,11 @@ mod tests {
     #[test]
     fn a_code_from_a_newer_firmware_is_not_guessed_at() {
         // The case that matters: this build must never dress an unknown
-        // refusal up as one it knows.
-        assert_eq!(lookup(GROUP, 11), None);
+        // refusal up as one it knows. 18 is the next code the firmware header
+        // will assign, and this build has never heard of it.
+        assert_eq!(lookup(GROUP, 18), None);
         assert_eq!(lookup(GROUP, 9999), None);
-        assert_eq!(short(GROUP, 11), None);
+        assert_eq!(short(GROUP, 18), None);
     }
 
     #[test]

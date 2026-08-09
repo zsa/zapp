@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::smp::bundle::{self, Bundle, Step};
+use zapp_ble::smp::session::{self, Declaration, Next};
 use zapp_ble::smp::zsa_err::{self, Cause, Side};
 use zapp_ble::smp::{self, Half, ImageSlot, SmpClient, SmpError};
 use zapp_ble::{Battery, Level};
@@ -63,6 +64,11 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
     match run(&bundle, force, link, &mut progress) {
         Ok(()) => Ok(()),
         Err(err) => {
+            // Before anything is printed, while a connection is still likely to
+            // be there: a session left open holds the next attempt out until it
+            // expires, and closing it costs one round trip.
+            close_session(link, &progress);
+
             println!();
             println!("Update failed: {err:#}");
             if let Some(note) = refusal_note(&err, progress.battery, progress.charging) {
@@ -83,13 +89,24 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
 /// failure needs is entirely a question of how far it got.
 #[derive(Debug, Default, Clone, Copy)]
 struct Progress {
+    /// The update has been declared to the left half, so the board knows what
+    /// is being installed and will admit the writes that follow.
+    declared: bool,
+    /// The id the left gave that session, for the close that ends it.
+    session_id: Option<u32>,
     /// An image has been put into a spare slot, marked or not.
     written: bool,
     right_restarted: bool,
+    /// The right came back from that restart carrying what was declared, which
+    /// is what the board wants to see before the left is written.
+    right_back: bool,
     left_restarted: bool,
     /// The left still needs its image — so a restarted right is a right that
     /// is talking a protocol the left does not know.
     left_pending: bool,
+    /// The right still needs its image, which is what the left refuses to be
+    /// written before.
+    right_pending: bool,
     /// Both halves are back on their new images and only the confirm is left.
     settled: bool,
     /// What the packs read at the last look, and whether the keyboard was on
@@ -106,16 +123,36 @@ impl Progress {
         let rerun = format!("zapp smp bundle {}", path.display());
 
         if !self.written {
+            if self.declared {
+                return format!(
+                    "The update was declared to the keyboard, but nothing was written. Both\n\
+                     halves are still running the firmware they were and the keyboard works\n\
+                     exactly as it did.\n\n\
+                     The session the left is holding lives in its memory and is dropped on\n\
+                     any restart, so there is nothing to clean up. If it simply expired, that\n\
+                     is all that happened: re-run `{rerun}`, which declares the same update\n\
+                     again rather than starting a second one."
+                );
+            }
             return "Nothing was written. The keyboard is untouched and still working."
                 .to_string();
         }
 
         if !self.right_restarted && !self.left_restarted {
+            let order = if self.right_pending {
+                "\n\nThe right half has to be updated first, and the left will refuse its own\n\
+                 image until the right is carrying what was declared and has confirmed it.\n\
+                 Check the right half is switched on, charged and near the left."
+            } else {
+                ""
+            };
             return format!(
                 "An image was written into a spare slot, but nothing was marked and nothing\n\
                  was restarted. Both halves are still running the firmware they were, and\n\
                  the keyboard works exactly as it did.\n\n\
-                 Re-run `{rerun}` to try again."
+                 If the keyboard refused because the update session expired, nothing is\n\
+                 lost: re-run `{rerun}` and it picks up from what is already installed.\
+                 {order}"
             );
         }
 
@@ -127,6 +164,19 @@ impl Progress {
                  already running its image is confirmed rather than uploaded again.\n\
                  `zapp smp images` and `zapp smp images --half right` show which one is\n\
                  still pending."
+            );
+        }
+
+        if self.right_restarted && !self.right_back && !self.left_restarted && self.left_pending {
+            return format!(
+                "The right half was written and restarted, and it did not come back where\n\
+                 this could see it. The left was not touched, so it is still running the\n\
+                 firmware it was — and the keyboard is half working until the right is\n\
+                 back, because the two are on different builds.\n\n\
+                 Nothing was confirmed. The right was only marked for test, so it puts its\n\
+                 old firmware back by itself the next time it restarts.\n\n\
+                 Check the right half is switched on, charged and near the left, then\n\
+                 power-cycle the keyboard and re-run `{rerun}`."
             );
         }
 
@@ -216,15 +266,24 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         );
         return Ok(());
     }
-    progress.left_pending = plan
-        .iter()
-        .any(|(half, step)| *half == Half::Left && *step != Step::Installed);
+    let pending = |wanted: Half| {
+        plan.iter()
+            .any(|(half, step)| *half == wanted && *step != Step::Installed)
+    };
+    progress.left_pending = pending(Half::Left);
+    progress.right_pending = pending(Half::Right);
 
     let uploads = plan.iter().filter(|(_, step)| *step == Step::Upload).count();
     let restarting = uploads > 0;
     let confirming = plan.iter().any(|(_, step)| *step != Step::Installed);
+    // Only when both halves are being written: with one upload there is no
+    // right-half restart standing between this run and the left.
+    let waiting = uploads == 2;
     let mut steps = Steps {
-        total: uploads * 2 + usize::from(restarting) + usize::from(confirming),
+        total: uploads * 2
+            + usize::from(waiting)
+            + usize::from(restarting)
+            + usize::from(confirming),
         done: 0,
     };
 
@@ -234,6 +293,27 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         println!("blue — that is by design, not a fault. It takes a couple of minutes. Nothing");
         println!("is kept until it has proved itself, so a keyboard interrupted half-way gets");
         println!("its old firmware back on the next power cycle.");
+    }
+
+    // ---- Say what is being installed, before writing any of it -----------
+    //
+    // Over Bluetooth the board admits one shape of update: a host states both
+    // halves' images and the build they came from, and every write after that
+    // is checked against the statement. It is what turns the ordering rule
+    // below from an instruction this tool follows into one the keyboard
+    // enforces — without a declaration the left cannot tell a sanctioned
+    // upload from a stray one, nor tell that the right is finished.
+    let declaration = declare(bundle, force)?;
+    let opened = open_session(link, &declaration)?;
+    progress.declared = true;
+    progress.session_id = Some(opened.id);
+    announce_session(&declaration, &opened);
+    // Not under --force. There the plan writes both halves whatever they are
+    // carrying, so a board that says the update is already complete is right
+    // and is still going to take the images — that is what the declaration's
+    // rewrite flag asks for, and it is not a disagreement worth a line.
+    if !force && let Some(note) = cross_check(&plan, opened.next) {
+        println!("{note}");
     }
 
     // ---- Write, right half first ----------------------------------------
@@ -253,11 +333,28 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
             .hash(half)
             .with_context(|| format!("The bundle's {half} image carries no hash to mark it by"))?;
 
+        // The left is not writable until the right is back and reporting the
+        // image it was given: the board refuses the left's own upload with "the
+        // right half first" until then, and the right has only just restarted.
+        if half == Half::Left && progress.right_restarted {
+            steps.announce("Waiting for the right half to come back");
+            wait_for_right_ready(link, &declaration)?;
+            progress.right_back = true;
+        }
+
+        steps.announce(&format!(
+            "{} half — upload ({} KiB)",
+            titled(half),
+            image.len() / 1024
+        ));
+        let (mut client, renewed) = connect_declared(link, half, &declaration)?;
+        progress.session_id = Some(renewed.id);
+
         // Set before the upload, not after: an upload that fails part-way has
         // still put bytes in the spare slot, and the message for that is the
         // one about a slot written and nothing marked.
         progress.written = true;
-        let mut client = upload(&mut steps, link, half, image)?;
+        upload(&mut client, half, image)?;
         restart(&mut steps, &mut client, half, &hash)?;
         match half {
             Half::Right => progress.right_restarted = true,
@@ -272,6 +369,12 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // unreachable and its own confirm gate — which waits on that link — cannot
     // fire. That gap is expected. Once the left is back on the same build the
     // link comes up, the right becomes reachable again, and both can confirm.
+    //
+    // Which is why `wait_for_right_ready` above waits on the board's `next` and
+    // not on the right having confirmed: the board counts a right that carries
+    // its declared image and reports a version mismatch as ready, precisely so
+    // this gap does not deadlock the pair. The right's confirm lands here
+    // instead, once the left is back on the matching build and the link is up.
     let mut confirmed = [(Half::Right, false), (Half::Left, false)];
     if restarting {
         steps.announce("Waiting for the halves to come back");
@@ -309,12 +412,267 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         }
     }
 
+    // ---- Let the session go ---------------------------------------------
+    //
+    // Best effort, and quiet about it. If the left restarted, its own reboot
+    // already dropped the session: it lives in the left's memory and the
+    // firmware writes none of it to flash, which is the design rather than
+    // something that went wrong.
+    close_session(link, progress);
+
     println!();
     println!(
         "Done. Both halves are running {}.",
         named(&bundle.header.build_version)
     );
     Ok(())
+}
+
+/// What this bundle declares: both halves' images, by both of the hashes
+/// mcumgr names an image with, and the build they came from.
+///
+/// `force` carries straight through to the declaration. Without it a board that
+/// already has both images refuses every upload as finished, which is the right
+/// answer to "install this" and the wrong one to "install this again" — so
+/// --force has to be part of what is declared, not just of the local plan.
+fn declare(bundle: &Bundle, force: bool) -> Result<Declaration> {
+    let declared = |half: Half| {
+        session::Declared::of(bundle.image(half))
+            .with_context(|| format!("The bundle's {half} image carries no hash to declare it by"))
+    };
+    Ok(Declaration {
+        left: declared(Half::Left)?,
+        right: declared(Half::Right)?,
+        version: bundle.header.build_version.clone(),
+        redo: force,
+    })
+}
+
+/// Declares the update on the left half, and says what the board makes of it.
+///
+/// Only the left serves the session commands, and it is reachable throughout an
+/// update, so this is where a session lost to a reconnect comes back. Declaring
+/// the same update again renews the one already open rather than starting a
+/// second, so this is called whenever a connection is made rather than only once
+/// — and a board reporting no session is a board to declare to, not a failure.
+fn open_session(link: &LinkArgs, declaration: &Declaration) -> Result<session::Status> {
+    let mut client = smp_connect(link, Half::Left)?;
+    client
+        .session_open(declaration)
+        .context("Could not declare the update to the left half")
+}
+
+/// Connects to a half with the update declared and live.
+///
+/// Both writes need it: the left checks its own upload and the restart that
+/// installs it against the declaration, and the right checks the claim the left
+/// pushes over the halves' link. The renewal always goes to the left, because
+/// the relay channel carries no session commands of its own — the right runs no
+/// session, only the left's statement repeated to it.
+fn connect_declared(
+    link: &LinkArgs,
+    half: Half,
+    declaration: &Declaration,
+) -> Result<(SmpClient, session::Status)> {
+    if half == Half::Left {
+        thread::sleep(RELAY_SETTLE);
+    }
+    let mut left = smp_connect(link, Half::Left)?;
+    let status = left
+        .session_open(declaration)
+        .context("Could not declare the update to the left half")?;
+
+    match half {
+        Half::Left => Ok((left, status)),
+        // One more connection than a right-half upload strictly needs, and
+        // worth it: the declaration has to be renewed from the left, and the
+        // image has to go over the relay.
+        Half::Right => {
+            drop(left);
+            Ok((smp_connect(link, half)?, status))
+        }
+    }
+}
+
+/// Waits for the right half to come back, before the left is written.
+///
+/// The board's own `next` is the instrument, not `rdone`. It turns to the left
+/// once the right has done everything it can, and that is a wider condition than
+/// having confirmed: a right carrying its declared image but reporting a
+/// protocol mismatch counts too, because on a release that moves the halves'
+/// protocol it *cannot* confirm until the left is on the matching build, and
+/// insisting would deadlock the pair onto a cable. An unconfirmed right here is
+/// the ordinary middle of a sequence and not a warning; the confirm pass at the
+/// end is what closes it.
+///
+/// Asked of the left, over one connection held for the whole wait. The left is
+/// up throughout, it is the half that holds the session, and STATUS is never
+/// refused. Reading the right through the relay would work too and would say
+/// less for more.
+///
+/// Re-declaring on each poll is what keeps the session's idle timer alive
+/// through the wait; an identical declaration renews rather than collides.
+fn wait_for_right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
+    println!("  right: giving it a moment to restart");
+    thread::sleep(REBOOT_SETTLE);
+
+    let mut client = smp_connect(link, Half::Left)?;
+    let started = Instant::now();
+    let mut noted = Instant::now();
+    // Whether the right was ever reporting at all. A right that never says
+    // anything is a right that did not come back, which is a different thing
+    // to tell someone than one that came back on the wrong image.
+    let mut seen = false;
+
+    loop {
+        match client.session_open(declaration) {
+            Ok(status) => {
+                seen |= status.right_seen;
+                if matches!(status.next, Next::Left | Next::Complete) {
+                    println!(
+                        "  right: back after {} s{}",
+                        started.elapsed().as_secs(),
+                        match status.right_done {
+                            true => ", confirmed",
+                            false => ", not confirmed yet, which is normal here",
+                        }
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                log::debug!("the left stopped answering while waiting on the right: {err:#}");
+                client = smp_connect(link, Half::Left)?;
+            }
+        }
+
+        if started.elapsed() >= REBOOT_TIMEOUT {
+            break;
+        }
+        if noted.elapsed() >= NOTE_EVERY {
+            noted = Instant::now();
+            println!(
+                "  right: not back yet after {} s of {}",
+                started.elapsed().as_secs(),
+                REBOOT_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(RETRY_EVERY);
+    }
+
+    let waited = REBOOT_TIMEOUT.as_secs();
+    if seen {
+        bail!(
+            "The right half came back within {waited} s but is not carrying the image that \
+             was written to it, so the left half was left alone. MCUboot put its old image \
+             back, which means the new one did not boot."
+        )
+    }
+    bail!(
+        "The right half did not come back within {waited} s of its restart. The left was \
+         not touched and is still running the firmware it was. Check the right half is \
+         switched on, charged and near the left."
+    )
+}
+
+/// Ends the session, if there is one left to end.
+///
+/// Best effort by design, and never a reason to fail an update that worked. A
+/// left half that has restarted has already dropped it, and a board that will
+/// not answer here is one that has gone quiet after the last thing that mattered
+/// was already done.
+fn close_session(link: &LinkArgs, progress: &Progress) {
+    let Some(id) = progress.session_id else {
+        return;
+    };
+    if progress.left_restarted {
+        log::debug!("the left restarted, so update session {id} is already gone");
+        return;
+    }
+
+    let closed = smp_connect(link, Half::Left)
+        .and_then(|mut client| client.session_close(Some(id)).map_err(anyhow::Error::from));
+    match closed {
+        Ok(status) if !status.open => log::debug!("update session {id} closed"),
+        Ok(_) => log::debug!("the board still reports a session open after the close"),
+        Err(err) => log::debug!("could not close update session {id}: {err:#}"),
+    }
+}
+
+/// What the board said when the update was declared to it.
+fn announce_session(declaration: &Declaration, status: &session::Status) {
+    println!();
+    println!(
+        "Declared {} to the keyboard (session {})",
+        named(&declaration.version),
+        status.id
+    );
+    println!("  the board says {} next", next_as(status.next));
+    if declaration.redo {
+        println!("  asking for both halves to be written again, in the same order");
+    }
+    if !status.right_seen {
+        println!("  it cannot read the right half's image state at all");
+    }
+    if !status.guard {
+        println!("  this board is not enforcing declared updates: a development build");
+    }
+}
+
+/// What one of the board's own steps means, in the words the rest of this file
+/// uses for the halves.
+fn next_as(next: Next) -> String {
+    match next {
+        Next::None => "no update is declared".to_string(),
+        Next::Right => "the right half is".to_string(),
+        Next::Left => "the left half is".to_string(),
+        Next::Complete => "there is nothing".to_string(),
+        Next::Unknown(code) => format!("a step this zapp does not know ({code}) is"),
+    }
+}
+
+/// What the board ought to say is next, given the plan this run made.
+///
+/// A half counts as finished only when it is carrying its declared image *and*
+/// has confirmed it, which is the same rule the board applies: an unconfirmed
+/// image reverts on the next restart, so counting it would let the sequence
+/// finish on top of firmware that is about to disappear.
+fn expected_next(plan: &[(Half, Step)]) -> Next {
+    let step = |wanted: Half| {
+        plan.iter()
+            .find(|(half, _)| *half == wanted)
+            .map(|(_, step)| *step)
+    };
+    let done = |half: Half| step(half).is_none_or(|step| step == Step::Installed);
+
+    match (done(Half::Right), done(Half::Left)) {
+        (false, _) => Next::Right,
+        (true, false) => Next::Left,
+        (true, true) => Next::Complete,
+    }
+}
+
+/// A note for a board whose own sequencing disagrees with this run's plan.
+///
+/// The board's view is the one that decides: it can see what each half is
+/// carrying and whether the right has confirmed, and it refuses on that. Saying
+/// so is worth a line, because a disagreement here is the first sign of a half
+/// this end has read wrongly.
+fn cross_check(plan: &[(Half, Step)], next: Next) -> Option<String> {
+    let expected = expected_next(plan);
+    if next == expected {
+        return None;
+    }
+    Some(format!(
+        "  this run planned {} first, which is not what the board says.\n  \
+         The board's own view is what it enforces, so it is the one to follow.",
+        match expected {
+            Next::Right => "the right half",
+            Next::Left => "the left half",
+            Next::Complete => "nothing",
+            _ => "nothing in particular",
+        }
+    ))
 }
 
 fn restarted(progress: Progress, half: Half) -> bool {
@@ -324,8 +682,6 @@ fn restarted(progress: Progress, half: Half) -> bool {
     }
 }
 
-/// Sends one half's image into its spare slot, and leaves the session open for
-/// the marking that follows.
 /// The left holds one DFU lock for both halves, and relaying to the right takes
 /// it for the whole session — which lingers a few seconds past the last frame so
 /// a multi-frame exchange is not cut in half. Anything that touched the right,
@@ -333,17 +689,9 @@ fn restarted(progress: Progress, half: Half) -> bool {
 /// upload with "busy" until that lapses. Wait it out rather than racing it.
 const RELAY_SETTLE: Duration = Duration::from_secs(5);
 
-fn upload(steps: &mut Steps, link: &LinkArgs, half: Half, image: &[u8]) -> Result<SmpClient> {
-    steps.announce(&format!(
-        "{} half — upload ({} KiB)",
-        titled(half),
-        image.len() / 1024
-    ));
-    if half == Half::Left {
-        thread::sleep(RELAY_SETTLE);
-    }
-    let mut client = smp_connect(link, half)?;
-
+/// Sends one half's image into its spare slot, over a connection the caller has
+/// already declared the update on.
+fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
     let bar = ProgressBar::new(image.len() as u64);
     bar.set_style(
         ProgressStyle::default_bar()
@@ -362,7 +710,7 @@ fn upload(steps: &mut Steps, link: &LinkArgs, half: Half, image: &[u8]) -> Resul
     bar.finish_and_clear();
     result.with_context(|| format!("The {half} half's upload failed"))?;
     println!("  {} bytes written into the spare slot", image.len());
-    Ok(client)
+    Ok(())
 }
 
 /// Marks a half's new image for test and restarts it.
@@ -601,6 +949,33 @@ pub fn refusal_advice(err: &anyhow::Error) -> Option<String> {
     Some(wrap(refusal(err)?.advice))
 }
 
+/// The paragraph a single subcommand needs when the declared-update guard is
+/// what turned it down.
+///
+/// `zapp smp upload`, `test`, `confirm` and `reset` write firmware on nobody's
+/// authority but their own, which is exactly what shipping firmware refuses over
+/// Bluetooth. They are kept because they are the debugging surface and they work
+/// against a build with the guard compiled out, so the answer is to say which
+/// rule was hit and where the supported path is — never to retry, since the
+/// guard refuses the same request every time by design.
+///
+/// `None` for every other refusal, including a code newer than this build.
+pub fn guard_note(err: &anyhow::Error) -> Option<String> {
+    if !refusal(err)?.cause.is_guard() {
+        return None;
+    }
+    Some(wrap(
+        "Over Bluetooth this keyboard only accepts a declared update. `zapp smp bundle \
+         <file.zsab>` is the supported path: it states both halves' images up front, \
+         writes them in the order the keyboard insists on, and waits for each half to \
+         come back. The bare `upload`, `test`, `confirm` and `reset` subcommands declare \
+         nothing, so shipping firmware refuses them; they are the debugging surface and \
+         they only work against a development build with the guard compiled out \
+         (CONFIG_ZSA_UPDATE_GUARD=n). `zapp smp session` shows what the board currently \
+         has open. Nothing was written and nothing was retried.",
+    ))
+}
+
 /// The same, with the measured levels spliced in when the reason is a battery.
 fn refusal_note(err: &anyhow::Error, battery: Battery, charging: bool) -> Option<String> {
     let refusal = refusal(err)?;
@@ -785,6 +1160,51 @@ mod tests {
         progress.advice(Path::new("fw.zsab"))
     }
 
+    /// A signed image whose trailer carries a 64-byte hash, which is what this
+    /// product's images carry: MCUboot here is built for SHA-512.
+    fn signed_image(payload: u8, hash: &[u8; 64]) -> Vec<u8> {
+        const MCUBOOT_MAGIC: u32 = 0x96f3_b83d;
+        let body = vec![payload; 96];
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&MCUBOOT_MAGIC.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // load address
+        out.extend_from_slice(&32u16.to_le_bytes()); // header size
+        out.extend_from_slice(&0u16.to_le_bytes()); // protected tlvs
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&body);
+
+        out.extend_from_slice(&0x6907u16.to_le_bytes()); // tlv area
+        out.extend_from_slice(&((4 + 4 + hash.len()) as u16).to_le_bytes());
+        out.extend_from_slice(&0x0012u16.to_le_bytes()); // SHA-512
+        out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+        out.extend_from_slice(hash);
+        out
+    }
+
+    /// A whole .zsab, laid out the way `tools/zsa_bundle.py` writes one.
+    fn bundled() -> Vec<u8> {
+        let left = signed_image(0x11, &[0xa1; 64]);
+        let right = signed_image(0x22, &[0xb2; 64]);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ZSAB");
+        out.extend_from_slice(&1u16.to_le_bytes()); // format version
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0x3Cu32.to_le_bytes());
+        out.extend_from_slice(&(left.len() as u32).to_le_bytes());
+        out.extend_from_slice(&((0x3C + left.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&(right.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // key fingerprint
+        let mut version = [0u8; 32];
+        version[.."1.2.3-test".len()].copy_from_slice(b"1.2.3-test");
+        out.extend_from_slice(&version);
+        out.extend_from_slice(&left);
+        out.extend_from_slice(&right);
+        out
+    }
+
     #[test]
     fn a_failure_before_anything_was_written_says_the_keyboard_is_fine() {
         let advice = advice_of(Progress::default());
@@ -804,9 +1224,12 @@ mod tests {
     #[test]
     fn a_right_that_restarted_without_the_left_says_the_halves_disagree() {
         // The case that matters: half-working keyboard, and two ways out of it.
+        // The right came back from its restart — the left is only written once
+        // it has — and then the left's own write did not land.
         let advice = advice_of(Progress {
             written: true,
             right_restarted: true,
+            right_back: true,
             left_pending: true,
             ..Progress::default()
         });
@@ -814,6 +1237,36 @@ mod tests {
         assert!(advice.contains("puts its\nold firmware back"), "{advice}");
         assert!(advice.contains("re-run"), "{advice}");
         assert!(advice.contains("power-cycle"), "{advice}");
+    }
+
+    #[test]
+    fn a_right_that_never_came_back_from_its_restart_says_to_go_and_look_at_it() {
+        // The failure mode the wait between the halves adds: the right was
+        // written and restarted, the left was deliberately not touched, and
+        // this end never saw the right again.
+        let advice = advice_of(Progress {
+            declared: true,
+            written: true,
+            right_restarted: true,
+            right_back: false,
+            left_pending: true,
+            ..Progress::default()
+        });
+        assert!(advice.contains("did not come back"), "{advice}");
+        assert!(advice.contains("left was not touched"), "{advice}");
+        assert!(advice.contains("power-cycle"), "{advice}");
+        // And it is not the message for a right that did come back, which is a
+        // half-updated keyboard rather than a missing half.
+        let back = advice_of(Progress {
+            declared: true,
+            written: true,
+            right_restarted: true,
+            right_back: true,
+            left_pending: true,
+            ..Progress::default()
+        });
+        assert!(!back.contains("did not come back"), "{back}");
+        assert!(back.contains("different protocol versions"), "{back}");
     }
 
     #[test]
@@ -853,6 +1306,197 @@ mod tests {
         });
         assert!(advice.contains("not confirmed"), "{advice}");
         assert!(advice.contains("zapp smp images"), "{advice}");
+    }
+
+    #[test]
+    fn a_failure_after_the_declaration_but_before_any_write_says_nothing_is_pending() {
+        let advice = advice_of(Progress {
+            declared: true,
+            session_id: Some(3),
+            ..Progress::default()
+        });
+        assert!(advice.contains("nothing was written"), "{advice}");
+        assert!(advice.contains("dropped on"), "{advice}");
+        assert!(advice.contains("zapp smp bundle fw.zsab"), "{advice}");
+    }
+
+    #[test]
+    fn an_interrupted_write_says_an_expired_session_costs_nothing() {
+        let advice = advice_of(Progress {
+            declared: true,
+            written: true,
+            ..Progress::default()
+        });
+        assert!(advice.contains("session expired"), "{advice}");
+        assert!(advice.contains("picks up from what is already installed"), "{advice}");
+    }
+
+    #[test]
+    fn an_interrupted_write_with_the_right_still_pending_says_which_half_goes_first() {
+        // The refusal a left-half write hits when the right is not finished,
+        // told as a state of the keyboard rather than as an error code.
+        let advice = advice_of(Progress {
+            declared: true,
+            written: true,
+            right_pending: true,
+            ..Progress::default()
+        });
+        assert!(advice.contains("right half has to be updated first"), "{advice}");
+        // And a run whose right half was already done does not say it.
+        let done = advice_of(Progress {
+            declared: true,
+            written: true,
+            ..Progress::default()
+        });
+        assert!(!done.contains("has to be updated first"), "{done}");
+    }
+
+    /// A plan the way `run` builds one: the right first, then the left.
+    fn plan(right: Step, left: Step) -> [(Half, Step); 2] {
+        [(Half::Right, right), (Half::Left, left)]
+    }
+
+    #[test]
+    fn the_step_this_run_expects_is_the_one_the_board_should_name() {
+        assert_eq!(
+            expected_next(&plan(Step::Upload, Step::Upload)),
+            Next::Right
+        );
+        assert_eq!(
+            expected_next(&plan(Step::Installed, Step::Upload)),
+            Next::Left
+        );
+        assert_eq!(
+            expected_next(&plan(Step::Installed, Step::Installed)),
+            Next::Complete
+        );
+    }
+
+    #[test]
+    fn a_half_running_its_image_unconfirmed_is_not_finished() {
+        // The board counts a half done only once it has confirmed, because an
+        // unconfirmed image reverts on the next restart. This end has to agree
+        // or the cross-check fires on every resumed update.
+        assert_eq!(
+            expected_next(&plan(Step::Confirm, Step::Installed)),
+            Next::Right
+        );
+        assert_eq!(
+            expected_next(&plan(Step::Installed, Step::Confirm)),
+            Next::Left
+        );
+    }
+
+    #[test]
+    fn a_board_that_agrees_with_the_plan_is_not_worth_a_line() {
+        assert_eq!(
+            cross_check(&plan(Step::Upload, Step::Upload), Next::Right),
+            None
+        );
+        assert_eq!(
+            cross_check(&plan(Step::Installed, Step::Upload), Next::Left),
+            None
+        );
+    }
+
+    #[test]
+    fn a_board_that_disagrees_with_the_plan_says_so_and_defers_to_the_board() {
+        // What a right half this end read as up to date but the board can see
+        // has not confirmed looks like.
+        let note = cross_check(&plan(Step::Installed, Step::Upload), Next::Right).unwrap();
+        assert!(note.contains("the left half"), "{note}");
+        assert!(flat(&note).contains("what it enforces"), "{note}");
+
+        // And a step from a firmware newer than this build is a disagreement
+        // like any other rather than something to guess at.
+        assert!(cross_check(&plan(Step::Upload, Step::Upload), Next::Unknown(7)).is_some());
+        assert!(cross_check(&plan(Step::Upload, Step::Upload), Next::None).is_some());
+    }
+
+    #[test]
+    fn a_bundles_declaration_is_two_different_hashes_for_each_half() {
+        let bundle = bundle::parse(&bundled()).unwrap();
+        let declaration = declare(&bundle, false).unwrap();
+
+        assert_eq!(declaration.version, "1.2.3-test");
+        for half in [Half::Left, Half::Right] {
+            let declared = match half {
+                Half::Left => &declaration.left,
+                Half::Right => &declaration.right,
+            };
+            // The trailer's hash, cut to the 32 the wire field holds, and the
+            // whole file's — the second is what an upload announces in `sha`.
+            assert_eq!(declared.slot_hash.len(), 32);
+            assert_eq!(
+                declared.slot_hash,
+                bundle.hash(half).unwrap()[..32],
+                "{half}"
+            );
+            assert_eq!(
+                declared.upload_hash,
+                smp::image::sha256(bundle.image(half)).to_vec(),
+                "{half}"
+            );
+            assert_ne!(declared.slot_hash, declared.upload_hash, "{half}");
+        }
+        // The two halves are declared as two different images.
+        assert_ne!(declaration.left.slot_hash, declaration.right.slot_hash);
+    }
+
+    #[test]
+    fn the_declaration_never_disturbs_the_full_hash_the_plan_compares() {
+        // The truncation is the group 67 declaration's alone: `step_for` still
+        // compares the whole 64-byte trailer hash against what `image list`
+        // returns, which is what decides whether a half needs writing at all.
+        let bundle = bundle::parse(&bundled()).unwrap();
+        assert_eq!(bundle.hash(Half::Left).unwrap().len(), 64);
+        assert_eq!(declare(&bundle, false).unwrap().left.slot_hash.len(), 32);
+    }
+
+    #[test]
+    fn forcing_an_update_is_part_of_what_is_declared() {
+        // A board with both images already refuses every upload as finished,
+        // so --force that only changed the local plan would be refused by the
+        // keyboard and could not rewrite anything.
+        let bundle = bundle::parse(&bundled()).unwrap();
+        assert!(!declare(&bundle, false).unwrap().redo);
+        assert!(declare(&bundle, true).unwrap().redo);
+        // And it changes nothing else, so a re-declaration is still the same
+        // statement.
+        let plain = declare(&bundle, false).unwrap();
+        let forced = declare(&bundle, true).unwrap();
+        assert_eq!(plain.left, forced.left);
+        assert_eq!(plain.right, forced.right);
+        assert_eq!(plain.version, forced.version);
+    }
+
+    #[test]
+    fn the_guard_sends_a_single_subcommand_to_the_bundle_and_never_to_a_retry() {
+        // 11, 12 and 13 are what a bare `upload`, `test` or `confirm` gets from
+        // shipping firmware; each has to name the supported path and say the
+        // single-step commands need a build with the guard out.
+        for code in 11..=17 {
+            let note = guard_note(&refused(zsa_err::GROUP, code))
+                .unwrap_or_else(|| panic!("no note for code {code}"));
+            let note = flat(&note);
+            assert!(note.contains("zapp smp bundle <file.zsab>"), "code {code}");
+            assert!(note.contains("CONFIG_ZSA_UPDATE_GUARD=n"), "code {code}");
+            assert!(note.contains("nothing was retried"), "code {code}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_the_guard_gets_no_note_about_it() {
+        // A flat battery or a stalled radio link is not something a bundle run
+        // fixes, and saying so would send the user the wrong way.
+        for code in 1..=10 {
+            assert!(
+                guard_note(&refused(zsa_err::GROUP, code)).is_none(),
+                "code {code}"
+            );
+        }
+        assert!(guard_note(&refused(zsa_err::GROUP, 99)).is_none());
+        assert!(guard_note(&anyhow::anyhow!("something else")).is_none());
     }
 
     #[test]
