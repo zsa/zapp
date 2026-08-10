@@ -28,7 +28,7 @@ use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 use zbus::MatchRule;
 
 use super::bluez::{self, Objects, CHARACTERISTIC, DEVICE, SERVICE};
-use super::GattChannel;
+use super::{GattChannel, Usage};
 use crate::{identity, BleError};
 
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
@@ -68,6 +68,7 @@ pub fn open(
     device: &str,
     service: u128,
     characteristic: u128,
+    usage: Usage,
 ) -> Result<Box<dyn GattChannel>, BleError> {
     let tree = objects.get_managed_objects().map_err(bluez::platform)?;
     let properties = tree
@@ -94,13 +95,24 @@ pub fn open(
             "{device} does not carry characteristic {characteristic:032x}"
         ))
     })?;
-    log::debug!("SMP characteristic at {path}");
+    log::debug!("characteristic {characteristic:032x} at {path}");
 
-    match FdChannel::acquire(connection, &path) {
+    // Two characteristics have no socket path worth taking. One written with a
+    // response cannot have one at all — BlueZ offers AcquireWrite only where
+    // write-without-response is, and an acquired socket is a command write
+    // whatever the caller wanted. One that is never written could take
+    // AcquireNotify alone, but the pair is acquired together and a failed
+    // AcquireWrite after a successful AcquireNotify leaves a subscription
+    // nobody asked for; a characteristic carrying two bytes at a time is not
+    // worth that.
+    if usage.acknowledged || !usage.written {
+        return Ok(Box::new(DbusChannel::start(connection, &path, usage)?));
+    }
+    match FdChannel::acquire(connection, &path, usage) {
         Ok(channel) => Ok(Box::new(channel)),
         Err(err) => {
             log::info!("no socket path on this characteristic ({err}); falling back to D-Bus");
-            Ok(Box::new(DbusChannel::start(connection, &path)?))
+            Ok(Box::new(DbusChannel::start(connection, &path, usage)?))
         }
     }
 }
@@ -163,7 +175,8 @@ fn find_characteristic(
 /// The socket path: one file descriptor per direction.
 struct FdChannel {
     writer: UnixStream,
-    notifier: UnixStream,
+    /// Absent on a characteristic nothing subscribes to.
+    notifier: Option<UnixStream>,
     mtu: usize,
     path: String,
     /// Held open for as long as the sockets are: BlueZ ties what it acquired to
@@ -174,21 +187,29 @@ struct FdChannel {
 }
 
 impl FdChannel {
-    fn acquire(connection: &Connection, path: &str) -> Result<Self, BleError> {
+    fn acquire(connection: &Connection, path: &str, usage: Usage) -> Result<Self, BleError> {
         let proxy =
             Proxy::new(connection, bluez::BLUEZ, path, CHARACTERISTIC).map_err(bluez::platform)?;
         let options: HashMap<String, OwnedValue> = HashMap::new();
 
         // Notify first. Acquiring the write side locks WriteValue, so a failure
         // after it would leave the characteristic worse off than not trying.
-        let (notify_fd, notify_mtu) = proxy
-            .call::<_, _, (zbus::zvariant::OwnedFd, u16)>("AcquireNotify", &(&options,))
-            .map_err(bluez::platform)?;
+        let notify = match usage.notify {
+            true => Some(
+                proxy
+                    .call::<_, _, (zbus::zvariant::OwnedFd, u16)>("AcquireNotify", &(&options,))
+                    .map_err(bluez::platform)?,
+            ),
+            false => None,
+        };
         let (write_fd, write_mtu) = proxy
             .call::<_, _, (zbus::zvariant::OwnedFd, u16)>("AcquireWrite", &(&options,))
             .map_err(bluez::platform)?;
 
-        let notifier = socket(notify_fd)?;
+        let notify_mtu = notify.as_ref().map_or(u16::MAX, |(_, mtu)| *mtu);
+        let notifier = notify
+            .map(|(notify_fd, _)| socket(notify_fd))
+            .transpose()?;
         let writer = socket(write_fd)?;
 
         // Both are ATT MTUs, so both pay the ATT header, and a request cannot
@@ -276,15 +297,22 @@ impl GattChannel for FdChannel {
     }
 
     fn notification(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, BleError> {
+        // Nothing was ever subscribed, so nothing will ever arrive. Waiting it
+        // out is what the caller asked for and keeps a polling loop a loop
+        // rather than a spin.
+        let Some(notifier) = self.notifier.as_mut() else {
+            thread::sleep(timeout);
+            return Ok(None);
+        };
         if self.timeout != Some(timeout) {
-            self.notifier
+            notifier
                 .set_read_timeout(Some(timeout))
                 .map_err(|err| BleError::Platform(format!("cannot set a read timeout: {err}")))?;
             self.timeout = Some(timeout);
         }
 
         let mut buffer = vec![0u8; self.mtu.max(512)];
-        match self.notifier.read(&mut buffer) {
+        match notifier.read(&mut buffer) {
             Ok(0) => Err(BleError::Platform("the board closed the link".into())),
             Ok(read) => {
                 buffer.truncate(read);
@@ -305,20 +333,28 @@ struct DbusChannel {
     connection: Connection,
     path: String,
     mtu: usize,
-    notifications: Receiver<Vec<u8>>,
+    /// Absent on a characteristic nothing subscribes to.
+    notifications: Option<Receiver<Vec<u8>>>,
+    /// What BlueZ is told a write is: an ATT command, or a request it answers.
+    write_type: &'static str,
 }
 
 impl DbusChannel {
-    fn start(connection: &Connection, path: &str) -> Result<Self, BleError> {
+    fn start(connection: &Connection, path: &str, usage: Usage) -> Result<Self, BleError> {
         // Subscribed before StartNotify, or the first notification — which for
         // a request already in flight is the one that matters — is missed.
-        let notifications = watch_value(connection, path)?;
+        let notifications = match usage.notify {
+            true => Some(watch_value(connection, path)?),
+            false => None,
+        };
 
         let proxy =
             Proxy::new(connection, bluez::BLUEZ, path, CHARACTERISTIC).map_err(bluez::platform)?;
-        proxy
-            .call::<_, _, ()>("StartNotify", &())
-            .map_err(|err| BleError::Platform(format!("StartNotify on {path} failed: {err}")))?;
+        if usage.notify {
+            proxy
+                .call::<_, _, ()>("StartNotify", &())
+                .map_err(|err| BleError::Platform(format!("StartNotify on {path} failed: {err}")))?;
+        }
 
         // BlueZ 5.62 and later publish the ATT MTU here, header included, the
         // same as the acquired sockets report.
@@ -329,13 +365,20 @@ impl DbusChannel {
                 DEFAULT_MTU
             }
         };
-        log::debug!("notifying on {path} over D-Bus, {mtu} bytes per write");
+        log::debug!("{path} over D-Bus, {mtu} bytes per write");
 
         Ok(Self {
             connection: connection.clone(),
             path: path.to_string(),
             mtu,
             notifications,
+            // "command" is write-without-response; the default would be a
+            // request write, and BlueZ would turn one longer than the MTU into
+            // a long write, which a characteristic like SMP's does not accept.
+            write_type: match usage.acknowledged {
+                true => "request",
+                false => "command",
+            },
         })
     }
 }
@@ -400,18 +443,18 @@ impl GattChannel for DbusChannel {
         }
         let proxy = Proxy::new(&self.connection, bluez::BLUEZ, self.path.as_str(), CHARACTERISTIC)
             .map_err(bluez::platform)?;
-        // "command" is write-without-response, which is the only kind the SMP
-        // characteristic accepts; the default would be a request write, and
-        // BlueZ would turn one longer than the MTU into a long write, which the
-        // characteristic does not accept either.
-        let options = HashMap::from([("type", Value::from("command"))]);
+        let options = HashMap::from([("type", Value::from(self.write_type))]);
         proxy
             .call::<_, _, ()>("WriteValue", &(value, options))
             .map_err(|err| BleError::Platform(format!("WriteValue failed: {err}")))
     }
 
     fn notification(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, BleError> {
-        match self.notifications.recv_timeout(timeout) {
+        let Some(notifications) = self.notifications.as_ref() else {
+            thread::sleep(timeout);
+            return Ok(None);
+        };
+        match notifications.recv_timeout(timeout) {
             Ok(value) => Ok(Some(value)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
@@ -423,6 +466,9 @@ impl GattChannel for DbusChannel {
 
 impl Drop for DbusChannel {
     fn drop(&mut self) {
+        if self.notifications.is_none() {
+            return;
+        }
         let proxy = Proxy::new(&self.connection, bluez::BLUEZ, self.path.as_str(), CHARACTERISTIC);
         let call = proxy.and_then(|proxy| proxy.call::<_, _, ()>("StopNotify", &()));
         if let Err(err) = call {

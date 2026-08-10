@@ -33,6 +33,7 @@ pub use client::SmpClient;
 pub use img::ImageSlot;
 
 use crate::backend;
+use crate::pick::{self, Picked};
 use crate::{identity, Battery, BleError, BleSighting};
 
 /// The Zephyr SMP service, and the one characteristic everything rides on.
@@ -196,48 +197,15 @@ pub fn battery(hint: Option<&str>) -> Result<Battery, SmpError> {
 }
 
 /// The one board a hint names, out of everything the platform can see.
-///
-/// Pure, so the awkward cases — nothing, several, one that was never bonded —
-/// are settled without a radio.
 pub fn select<'a>(
     sightings: &'a [BleSighting],
     hint: Option<&str>,
 ) -> Result<&'a BleSighting, SmpError> {
-    let named = |sighting: &BleSighting| match hint {
-        None => true,
-        Some(hint) => {
-            sighting.key.eq_ignore_ascii_case(hint)
-                || sighting
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.to_lowercase().contains(&hint.to_lowercase()))
-        }
-    };
-
-    let matches: Vec<&BleSighting> = sightings
-        .iter()
-        .filter(|sighting| speaks_smp(sighting) && named(sighting))
-        .collect();
-
-    // A board already connected is the one a caller means, and is also the only
-    // one that will answer promptly.
-    let connected: Vec<&BleSighting> = matches
-        .iter()
-        .copied()
-        .filter(|sighting| sighting.connected)
-        .collect();
-    let shortlist = if connected.is_empty() {
-        matches
-    } else {
-        connected
-    };
-
-    match shortlist.as_slice() {
-        [] => Err(SmpError::NoBoard(hint.map(str::to_string))),
-        [only] => bonded(only),
-        several => Err(SmpError::Ambiguous(
-            several.iter().map(|sighting| describe(sighting)).collect(),
-        )),
+    match pick::pick(sightings, hint, &speaks_smp) {
+        Picked::One(sighting) => Ok(sighting),
+        Picked::None => Err(SmpError::NoBoard(hint.map(str::to_string))),
+        Picked::Several(names) => Err(SmpError::Ambiguous(names)),
+        Picked::Unbonded(name) => Err(BleError::NotBonded(name).into()),
     }
 }
 
@@ -253,23 +221,6 @@ fn speaks_smp(sighting: &BleSighting) -> bool {
     sighting.services.contains(&SMP_SERVICE)
         || sighting.services.contains(&RELAY_SERVICE)
         || identity::is_zsa_board(sighting)
-}
-
-fn bonded(sighting: &BleSighting) -> Result<&BleSighting, SmpError> {
-    if sighting.paired {
-        Ok(sighting)
-    } else {
-        Err(BleError::NotBonded(describe(sighting)).into())
-    }
-}
-
-fn describe(sighting: &BleSighting) -> String {
-    match (&sighting.name, identity::keyboard_for(sighting)) {
-        (Some(name), Some(keyboard)) => format!("{keyboard} {name:?}"),
-        (Some(name), None) => format!("{name:?}"),
-        (None, Some(keyboard)) => format!("{keyboard} ({})", sighting.key),
-        (None, None) => sighting.key.clone(),
-    }
 }
 
 #[cfg(test)]

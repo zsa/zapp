@@ -33,6 +33,56 @@ pub trait GattChannel: Send {
     fn notification(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, BleError>;
 }
 
+/// How a characteristic is going to be driven.
+///
+/// GATT characteristics are not interchangeable and the platform has to be told
+/// which kind it is opening: subscribing to one that does not notify fails, and
+/// a control opcode written as a command is a write nothing ever answers. One
+/// service can need all three shapes at once — ZSA's update service has a
+/// control characteristic that wants the acknowledgement, a data characteristic
+/// that must not pay for one, and a status characteristic that only notifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// Subscribe, so the board can speak first.
+    pub notify: bool,
+    /// Anything is ever written to it.
+    pub written: bool,
+    /// Write with a response, rather than fire-and-forget.
+    pub acknowledged: bool,
+}
+
+impl Usage {
+    /// Notifies, and takes command writes: the SMP characteristic.
+    pub const DUPLEX: Usage = Usage {
+        notify: true,
+        written: true,
+        acknowledged: false,
+    };
+
+    /// Write without response, nothing coming back. What bulk data wants: an
+    /// acknowledgement per packet would cost a connection interval each.
+    pub const STREAM: Usage = Usage {
+        notify: false,
+        written: true,
+        acknowledged: false,
+    };
+
+    /// Write with a response, nothing coming back. What a control opcode wants,
+    /// since the response is the only sign the board took it.
+    pub const COMMAND: Usage = Usage {
+        notify: false,
+        written: true,
+        acknowledged: true,
+    };
+
+    /// Read and subscribed to, never written.
+    pub const LISTEN: Usage = Usage {
+        notify: true,
+        written: false,
+        acknowledged: false,
+    };
+}
+
 pub trait Backend: Send {
     /// Every device the platform can see right now, ZSA or not.
     fn sightings(&mut self) -> Result<Vec<BleSighting>, BleError>;
@@ -62,7 +112,18 @@ pub trait Backend: Send {
         service: u128,
         characteristic: u128,
     ) -> Result<Box<dyn GattChannel>, BleError> {
-        let _ = (key, service, characteristic);
+        self.open_as(key, service, characteristic, Usage::DUPLEX)
+    }
+
+    /// The same, for a characteristic that is not the duplex kind.
+    fn open_as(
+        &mut self,
+        key: &str,
+        service: u128,
+        characteristic: u128,
+        usage: Usage,
+    ) -> Result<Box<dyn GattChannel>, BleError> {
+        let _ = (key, service, characteristic, usage);
         Err(BleError::Unsupported("GATT"))
     }
 }

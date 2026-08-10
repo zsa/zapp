@@ -15,7 +15,7 @@ use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::MatchRule;
 
-use super::{bluez_gatt, Backend, GattChannel};
+use super::{bluez_gatt, Backend, GattChannel, Usage};
 use crate::battery::{self, Battery};
 use crate::{identity, BleError, BleSighting};
 
@@ -205,13 +205,21 @@ impl Backend for Bluez {
         self.scanned_at = Some(Instant::now());
     }
 
-    fn open(
+    fn open_as(
         &mut self,
         key: &str,
         service: u128,
         characteristic: u128,
+        usage: Usage,
     ) -> Result<Box<dyn GattChannel>, BleError> {
-        bluez_gatt::open(&self.connection, &self.objects, key, service, characteristic)
+        bluez_gatt::open(
+            &self.connection,
+            &self.objects,
+            key,
+            service,
+            characteristic,
+            usage,
+        )
     }
 }
 

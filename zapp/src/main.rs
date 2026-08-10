@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use zapp_ble::dfu::{self, DfuClient, DfuError, Wait};
 use zapp_ble::smp::session::{Next, Status};
 use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Level, Presence};
@@ -101,6 +102,69 @@ enum Commands {
         #[command(subcommand)]
         command: SmpCommands,
     },
+    /// Flash the keyboard's own (QMK) firmware over Bluetooth
+    #[command(
+        long_about = "Flash the keyboard's own firmware over Bluetooth.\n\n\
+            A Voyager 2 has two chips. `zapp smp` updates the wireless one; \
+            this updates the other — the STM32 that runs QMK, scans the matrix \
+            and drives the LEDs. The image goes over ZSA's own update service \
+            on the left half, which relays it to the STM32 over the wire \
+            between them and into the ignition bootloader.\n\n\
+            The board must already be bonded to this machine: pairing is the \
+            desktop's job. The firmware is a plain .bin — what `qmk compile` \
+            leaves in .build, or what Oryx hands you.\n\n\
+            The STM32 has to be in its bootloader before anything is written. \
+            `zapp dfu flash` checks first and only reboots it if it is not, so \
+            a keyboard already sitting there is written straight away — \
+            including one you put there yourself with the reset button.",
+        after_long_help = "Examples:\n  \
+            zapp dfu flash voyager2_default.bin\n  \
+            zapp dfu flash .build/zsa_voyager_tng_fdprod.bin --device \"Voyager\"\n  \
+            zapp dfu status\n  \
+            zapp dfu enter\n  \
+            zapp dfu abort"
+    )]
+    Dfu {
+        #[command(subcommand)]
+        command: DfuCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DfuCommands {
+    /// Write a QMK .bin into the keyboard's STM32
+    #[command(after_long_help = "The image is written straight into the STM32's \
+        application region and the chip is restarted onto it. Nothing is kept \
+        in reserve and there is no going back to the old firmware, the same as \
+        flashing over USB — but the image is checksummed on the way in, and an \
+        STM32 that does not like what it got stays in its bootloader rather \
+        than booting it.")]
+    Flash {
+        /// Path to a QMK firmware .bin
+        firmware: PathBuf,
+        #[command(flatten)]
+        args: DfuArgs,
+    },
+    /// Say whether the STM32 is in its bootloader
+    Status(DfuArgs),
+    /// Reboot the STM32 into its bootloader and leave it there
+    Enter(DfuArgs),
+    /// Drop a transfer that was left open, and release the update lock
+    Abort(DfuArgs),
+}
+
+#[derive(clap::Args)]
+struct DfuArgs {
+    /// Which board, by advertised name or by the handle `zapp devices` shows
+    #[arg(long, short = 'd')]
+    device: Option<String>,
+    /// Bytes of image per Bluetooth write. Defaults to what the link
+    /// negotiated: the ATT MTU less its 3-byte header.
+    #[arg(long)]
+    chunk: Option<usize>,
+    /// Seconds to wait for the STM32 to reach its bootloader
+    #[arg(long, default_value_t = 30)]
+    wait: u64,
 }
 
 #[derive(Subcommand)]
@@ -278,6 +342,24 @@ fn main() -> Result<()> {
                     println!();
                     println!("{note}");
                 }
+            }
+            result
+        }
+        Commands::Dfu { command } => {
+            let result = match command {
+                DfuCommands::Flash { firmware, args } => cmd_dfu_flash(&firmware, &args),
+                DfuCommands::Status(args) => cmd_dfu_status(&args),
+                DfuCommands::Enter(args) => cmd_dfu_enter(&args),
+                DfuCommands::Abort(args) => cmd_dfu_abort(&args),
+            };
+            // The board's own reasons come back as a code and a sentence; the
+            // paragraph that says what to do about one is worth more than the
+            // line the error chain gives it.
+            if let Err(err) = &result
+                && let Some(advice) = dfu_advice(err)
+            {
+                println!();
+                println!("{advice}");
             }
             result
         }
@@ -965,6 +1047,170 @@ fn cmd_smp_reset(args: &SmpArgs) -> Result<()> {
     let mut client = smp_connect(&args.link, args.half)?;
     client.reset().context("Reset failed")?;
     println!("Resetting.");
+    Ok(())
+}
+
+/// Connects to the update service on the board these arguments name.
+fn dfu_connect(args: &DfuArgs) -> Result<DfuClient> {
+    let spinner = new_spinner("Connecting over Bluetooth...");
+    let client = dfu::open(args.device.as_deref());
+    spinner.finish_and_clear();
+
+    let mut client = client.context("Could not reach the keyboard over Bluetooth")?;
+    if let Some(chunk) = args.chunk {
+        client = client.with_chunk(chunk);
+    }
+    log::debug!("connected, {} bytes of image per write", client.chunk());
+    Ok(client)
+}
+
+/// The board's own advice about a refusal, wherever in the chain it is.
+fn dfu_advice(err: &anyhow::Error) -> Option<&'static str> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<DfuError>())
+        .and_then(DfuError::advice)
+}
+
+fn cmd_dfu_flash(path: &Path, args: &DfuArgs) -> Result<()> {
+    let file =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let image = firmware::load_raw_image(&file)
+        .with_context(|| format!("{} is not a firmware image this can flash", path.display()))?;
+
+    if image.data.is_empty() {
+        bail!("{} has no firmware in it", path.display());
+    }
+    // Refused here rather than by the keyboard: the board answers this with one
+    // error byte, and the sentence that names the file and both figures is the
+    // one that says what to do about it.
+    if image.data.len() > dfu::MAX_IMAGE {
+        bail!(
+            "{} is {} bytes, and the STM32's application region holds {} ({} KiB). \
+             This is a firmware built for another keyboard, or one built to run \
+             without the ignition bootloader under it.",
+            path.display(),
+            image.data.len(),
+            dfu::MAX_IMAGE,
+            dfu::MAX_IMAGE / 1024
+        );
+    }
+
+    println!(
+        "Firmware: {} bytes{}",
+        image.data.len(),
+        match image.pid {
+            Some(pid) => format!(" · {}", target_name_for_pid(pid)),
+            None => String::new(),
+        }
+    );
+    println!("CRC-32:   {:08x}", dfu::crc32(image.data));
+    // Not fatal, because nothing here can prove what is on the other end of the
+    // radio — but a Voyager image on a Voyager 2 is a keyboard that comes back
+    // in its bootloader, and the file said which one it was for.
+    if let Some(pid) = image.pid
+        && !matches!(pid, 0x1978 | 0x0792)
+    {
+        println!(
+            "Warning: this firmware says it is for a {}, and this command flashes a \
+             Voyager 2.",
+            target_name_for_pid(pid)
+        );
+    }
+
+    let mut client = dfu_connect(args)?;
+    println!();
+    client
+        .make_ready(Duration::from_secs(args.wait), &report_wait)
+        .context("The STM32 is not in its bootloader, so nothing was written")?;
+
+    let pb = ProgressBar::new(image.data.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    let started = Instant::now();
+    let result = client.flash(image.data, &|progress| match progress {
+        FlashProgress::Erasing { bytes_erased, .. } => {
+            pb.set_message(match bytes_erased {
+                0 => "Erasing...",
+                _ => "Erased",
+            });
+        }
+        FlashProgress::Writing { bytes_written, .. } => {
+            pb.set_position(bytes_written as u64);
+            pb.set_message("Writing...");
+        }
+        FlashProgress::Resetting => pb.set_message("Checking the image..."),
+        FlashProgress::Complete => pb.finish_with_message("Done!"),
+    });
+    pb.finish_and_clear();
+    result.context("The flash failed")?;
+
+    let took = started.elapsed();
+    println!(
+        "Wrote {} bytes in {:.1} s ({:.1} KiB/s).",
+        image.data.len(),
+        took.as_secs_f64(),
+        image.data.len() as f64 / took.as_secs_f64() / 1024.0
+    );
+    println!("The STM32 accepted the image and is restarting on it.");
+    Ok(())
+}
+
+/// What the readiness step is doing, said out loud.
+fn report_wait(wait: Wait) {
+    match wait {
+        Wait::Already => println!("The STM32 is already in its bootloader."),
+        Wait::Rebooting => println!("Rebooting the STM32 into its bootloader..."),
+        Wait::Waiting(waited) => println!(
+            "  not there yet after {} s — pressing the keyboard's reset button also works",
+            waited.as_secs()
+        ),
+        Wait::Arrived(waited) => println!("  in the bootloader after {} s", waited.as_secs()),
+    }
+}
+
+fn cmd_dfu_status(args: &DfuArgs) -> Result<()> {
+    let report = dfu_connect(args)?
+        .query()
+        .context("Could not ask the keyboard what the STM32 is doing")?;
+
+    println!(
+        "STM32: {}",
+        match report.status.in_bootloader() {
+            true => "in the ignition bootloader, ready to be flashed",
+            false => "running its own firmware",
+        }
+    );
+    println!("  the board reports {}", report.status);
+    if report.fault != dfu::Fault::None {
+        println!("  {}", report.fault);
+    }
+    if let Some(received) = report.received.filter(|received| *received > 0) {
+        println!("  {received} bytes of a transfer have reached it");
+    }
+    Ok(())
+}
+
+fn cmd_dfu_enter(args: &DfuArgs) -> Result<()> {
+    let mut client = dfu_connect(args)?;
+    client
+        .make_ready(Duration::from_secs(args.wait), &report_wait)
+        .context("The STM32 never reached its bootloader")?;
+    println!();
+    println!("Ready. `zapp dfu flash <firmware.bin>` writes an image into it.");
+    Ok(())
+}
+
+fn cmd_dfu_abort(args: &DfuArgs) -> Result<()> {
+    let report = dfu_connect(args)?
+        .abort()
+        .context("Could not drop the transfer")?;
+    println!("The board reports {}.", report.status);
+    println!("Nothing holds the update lock now.");
     Ok(())
 }
 

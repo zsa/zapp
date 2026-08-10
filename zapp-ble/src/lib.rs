@@ -8,8 +8,10 @@
 pub mod backend;
 pub mod battery;
 mod board;
+pub mod dfu;
 pub mod identity;
 mod monitor;
+pub mod pick;
 mod roster;
 pub mod smp;
 
