@@ -106,9 +106,106 @@ pub fn load_firmware_from_bytes(file_data: &[u8]) -> Result<Firmware, ZappError>
     )))
 }
 
+/// A raw application image and what the file said it was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawImage<'a> {
+    /// Exactly the bytes to write into flash: no suffix, no records.
+    pub data: &'a [u8],
+    /// The product the DFU suffix named, where the file carried one. `None` for
+    /// a bare `qmk compile` output, which says nothing about itself.
+    pub pid: Option<u16>,
+}
+
+/// Reads a file as a raw application image.
+///
+/// For the paths that write bytes straight into a flash region rather than
+/// handing a container to a bootloader that understands it — today, the
+/// Bluetooth update service. Three things this does that `load_firmware` does
+/// not:
+///
+/// · a bare `.bin` off `qmk compile` is a firmware, not a parse failure. It is
+///   what the build produces and there is nothing in it to validate against;
+/// · a DFU suffix is dropped. Oryx downloads carry one, and those sixteen bytes
+///   are metadata for a USB bootloader — written into flash they are sixteen
+///   bytes of rubbish past the end of the image and sixteen bytes the checksum
+///   would be computed over;
+/// · Intel HEX is refused by name. It carries addresses this path has nowhere
+///   to put, and silently flattening it would write it at the wrong offset.
+///
+/// None of which loosens `load_firmware`: the wired paths still need a
+/// container, because the bootloader they are talking to is chosen by the PID
+/// inside it.
+pub fn load_raw_image(file_data: &[u8]) -> Result<RawImage<'_>, ZappError> {
+    if file_data.is_empty() {
+        return Err(ZappError::InvalidFirmware("file is empty".into()));
+    }
+    if file_data[0] == b':' {
+        return Err(ZappError::InvalidFirmware(
+            "this is an Intel HEX file, and this path writes a raw image: \
+             build or download a .bin instead"
+                .into(),
+        ));
+    }
+
+    match dfu_bin::trailing_suffix(file_data) {
+        Some(suffix) => Ok(RawImage {
+            data: &file_data[..suffix.data_end],
+            pid: Some(suffix.pid),
+        }),
+        None => Ok(RawImage {
+            data: file_data,
+            pid: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_qmk_bin_is_a_firmware_rather_than_a_parse_failure() {
+        // What `qmk compile` leaves in .build: a flat image with no container
+        // around it. load_firmware refuses it, and must go on refusing it.
+        let image = vec![0x00, 0x40, 0x00, 0x20, 0xd5, 0x81, 0x00, 0x08];
+        let raw = load_raw_image(&image).unwrap();
+        assert_eq!(raw.data, image);
+        assert_eq!(raw.pid, None);
+        assert!(load_firmware_from_bytes(&image).is_err());
+    }
+
+    #[test]
+    fn a_dfu_suffix_is_left_out_of_the_image_and_names_the_product() {
+        // An Oryx download. The sixteen bytes are for a USB bootloader; flashed
+        // they are rubbish past the end of the image, and the checksum sent
+        // with it would cover them.
+        let image = vec![0xAA; 4096];
+        let mut file = image.clone();
+        file.extend_from_slice(&dfu_bin::build_test_suffix(0x3297, 0x1978));
+
+        let raw = load_raw_image(&file).unwrap();
+        assert_eq!(raw.data, image);
+        assert_eq!(raw.data.len(), file.len() - 16);
+        assert_eq!(raw.pid, Some(0x1978));
+    }
+
+    #[test]
+    fn intel_hex_is_refused_by_name_rather_than_flattened() {
+        let hex = b":04000000DEADBEEFC4\n:00000001FF\n";
+        let err = load_raw_image(hex).unwrap_err();
+        assert!(err.to_string().contains("Intel HEX"), "{err}");
+        assert!(err.to_string().contains(".bin"), "{err}");
+        // And the wired path still reads it.
+        assert!(matches!(
+            load_firmware_from_bytes(hex),
+            Ok(Firmware::IntelHex { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_file_is_not_an_image() {
+        assert!(load_raw_image(&[]).is_err());
+    }
 
     #[test]
     fn test_load_empty_file() {
