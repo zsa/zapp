@@ -1,14 +1,14 @@
-//! The request/response loop, over any GATT channel.
+//! The request/response loop, over any transport.
 
 use std::time::{Duration, Instant};
 
 use zapp_core::flash::FlashProgress;
 
-use super::img::{self, ImageSlot};
-use super::proto::{self, Header, Op, Reassembler, HEADER_LEN};
-use super::session::{self, Declaration, Status};
-use super::{cbor, image, SmpError};
-use crate::backend::GattChannel;
+use crate::img::{self, ImageSlot};
+use crate::proto::{self, Header, Op, Reassembler, HEADER_LEN};
+use crate::session::{self, Declaration, Status};
+use crate::transport::SmpTransport;
+use crate::{cbor, image, SmpError};
 
 /// os_mgmt, and the two commands this client uses from it.
 pub const OS_GROUP: u16 = 0;
@@ -56,7 +56,7 @@ pub struct McumgrParams {
 }
 
 pub struct SmpClient {
-    channel: Box<dyn GattChannel>,
+    channel: Box<dyn SmpTransport>,
     reassembler: Reassembler,
     seq: u8,
     /// Bytes one write puts on the wire: the ATT payload, header already off.
@@ -69,7 +69,7 @@ pub struct SmpClient {
 }
 
 impl SmpClient {
-    pub fn new(channel: Box<dyn GattChannel>) -> Self {
+    pub fn new(channel: Box<dyn SmpTransport>) -> Self {
         let mtu = channel.mtu();
         Self {
             channel,
@@ -156,7 +156,7 @@ impl SmpClient {
             if left.is_zero() {
                 return Err(SmpError::Timeout(self.timeout));
             }
-            match self.channel.notification(left)? {
+            match self.channel.read(left)? {
                 Some(notification) => self.reassembler.push(&notification),
                 None => return Err(SmpError::Timeout(self.timeout)),
             }
@@ -642,7 +642,7 @@ mod tests {
                     cbor::map(vec![(
                         "err",
                         cbor::map(vec![
-                            ("group", cbor::uint(u32::from(crate::smp::zsa_err::GROUP))),
+                            ("group", cbor::uint(u32::from(crate::zsa_err::GROUP))),
                             ("rc", cbor::uint(16)),
                         ]),
                     )]),
@@ -718,16 +718,12 @@ mod tests {
         cbor::encode(&cbor::map(entries))
     }
 
-    impl GattChannel for FakeDevice {
+    impl SmpTransport for FakeDevice {
         fn mtu(&self) -> usize {
             self.mtu
         }
 
-        fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-            Ok(Vec::new())
-        }
-
-        fn write(&mut self, value: &[u8]) -> Result<(), crate::BleError> {
+        fn write(&mut self, value: &[u8]) -> Result<(), crate::TransportError> {
             assert!(value.len() <= self.mtu, "a write longer than the MTU");
             self.incoming.push(value);
             while let Some((header, body)) = self.incoming.take().unwrap() {
@@ -736,7 +732,7 @@ mod tests {
             Ok(())
         }
 
-        fn notification(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, crate::BleError> {
+        fn read(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, crate::TransportError> {
             Ok(self.outgoing.pop_front())
         }
     }
@@ -799,22 +795,19 @@ mod tests {
         declared: Declared,
     }
 
-    impl GattChannel for Watched {
+    impl SmpTransport for Watched {
         fn mtu(&self) -> usize {
             self.inner.mtu()
         }
-        fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-            self.inner.read()
-        }
-        fn write(&mut self, value: &[u8]) -> Result<(), crate::BleError> {
+        fn write(&mut self, value: &[u8]) -> Result<(), crate::TransportError> {
             let out = self.inner.write(value);
             self.landed.lock().unwrap().clone_from(&self.inner.image);
             *self.declared.lock().unwrap() =
                 (self.inner.declared_len, self.inner.declared_sha.clone());
             out
         }
-        fn notification(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, crate::BleError> {
-            self.inner.notification(timeout)
+        fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, crate::TransportError> {
+            self.inner.read(timeout)
         }
     }
 
@@ -948,20 +941,17 @@ mod tests {
         struct Late {
             queued: VecDeque<Vec<u8>>,
         }
-        impl GattChannel for Late {
+        impl SmpTransport for Late {
             fn mtu(&self) -> usize {
                 244
             }
-            fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-                Ok(Vec::new())
-            }
-            fn write(&mut self, _value: &[u8]) -> Result<(), crate::BleError> {
+            fn write(&mut self, _value: &[u8]) -> Result<(), crate::TransportError> {
                 Ok(())
             }
-            fn notification(
+            fn read(
                 &mut self,
                 _timeout: Duration,
-            ) -> Result<Option<Vec<u8>>, crate::BleError> {
+            ) -> Result<Option<Vec<u8>>, crate::TransportError> {
                 Ok(self.queued.pop_front())
             }
         }
@@ -993,20 +983,17 @@ mod tests {
     #[test]
     fn a_reply_about_a_different_command_is_an_error() {
         struct Confused;
-        impl GattChannel for Confused {
+        impl SmpTransport for Confused {
             fn mtu(&self) -> usize {
                 244
             }
-            fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-                Ok(Vec::new())
-            }
-            fn write(&mut self, _value: &[u8]) -> Result<(), crate::BleError> {
+            fn write(&mut self, _value: &[u8]) -> Result<(), crate::TransportError> {
                 Ok(())
             }
-            fn notification(
+            fn read(
                 &mut self,
                 _timeout: Duration,
-            ) -> Result<Option<Vec<u8>>, crate::BleError> {
+            ) -> Result<Option<Vec<u8>>, crate::TransportError> {
                 Ok(Some(
                     proto::frame(Op::ReadRsp, 63, 7, 0, &[0xa0]).unwrap(),
                 ))
@@ -1027,17 +1014,14 @@ mod tests {
 
     /// A channel that answers nothing, for the cases where the board does not.
     struct Deaf;
-    impl GattChannel for Deaf {
+    impl SmpTransport for Deaf {
         fn mtu(&self) -> usize {
             249
         }
-        fn read(&mut self) -> Result<Vec<u8>, crate::BleError> {
-            Ok(Vec::new())
-        }
-        fn write(&mut self, _value: &[u8]) -> Result<(), crate::BleError> {
+        fn write(&mut self, _value: &[u8]) -> Result<(), crate::TransportError> {
             Ok(())
         }
-        fn notification(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, crate::BleError> {
+        fn read(&mut self, _timeout: Duration) -> Result<Option<Vec<u8>>, crate::TransportError> {
             Ok(None)
         }
     }

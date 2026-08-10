@@ -27,8 +27,8 @@
 
 use ciborium::value::Value;
 
-use super::proto;
-use super::{cbor, image, zsa_err, SmpError};
+use crate::proto;
+use crate::{cbor, image, zsa_err, SmpError};
 
 /// ZSA's update-session group, the next id after its error namespace.
 pub const GROUP: u16 = 67;

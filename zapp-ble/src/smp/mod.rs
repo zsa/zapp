@@ -1,5 +1,9 @@
 //! mcumgr's Simple Management Protocol, over BLE.
 //!
+//! The protocol itself lives in `zapp_smp`, which knows nothing about radios;
+//! this is the GATT transport under it, and is re-exported whole so a caller
+//! reaches both through one path.
+//!
 //! This is the standard Zephyr SMP service, the one nRF Connect Device Manager
 //! speaks, and it is what updates the firmware on the nRF itself. It is not
 //! `zapp_core::device::ids::ZSA_BLE_DFU_SERVICE`, which is ZSA's own service
@@ -9,30 +13,13 @@
 //! The right half runs the same SMP server behind a second ZSA service on the
 //! left, which relays whole frames over the ESB radio link without reading
 //! them. Same framing, same commands, same client: only the pair of UUIDs the
-//! channel is opened on changes, which is what `Half` picks.
-//!
-//! Everything below the transport is pure: framing in `proto`, payloads in
-//! `img`, and a client in `client` that is driven through a `GattChannel` and
-//! so can be run against a fake device with no radio in sight.
+//! channel is opened on changes, which is what `HalfChannel` picks.
 
-pub mod bundle;
-pub mod cbor;
-pub mod client;
-pub mod image;
-pub mod img;
-pub mod proto;
-pub mod session;
-pub mod zsa_err;
-
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
-pub use bundle::Bundle;
-pub use client::SmpClient;
-pub use img::ImageSlot;
+pub use zapp_smp::*;
 
-use crate::backend;
+use crate::backend::{self, GattChannel};
 use crate::pick::{self, Picked};
 use crate::{identity, Battery, BleError, BleSighting};
 
@@ -48,116 +35,52 @@ pub const SMP_CHARACTERISTIC: u128 = 0xda2e7828_fbce_4e01_ae9e_261174997c48;
 pub const RELAY_SERVICE: u128 = 0x32970201_e5aa_4f42_a596_1ea5a0200001;
 pub const RELAY_CHARACTERISTIC: u128 = 0x32970202_e5aa_4f42_a596_1ea5a0200001;
 
-/// Which half of the keyboard a session talks to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Half {
-    /// The left nRF's own SMP service, served by the chip the link ends at.
-    #[default]
-    Left,
-    /// The right nRF, reached through the left's relay and the ESB link.
-    Right,
+/// Where a half's frames go on this transport.
+///
+/// The left nRF serves its own SMP; the right is reached through the left's
+/// relay and the ESB link. Which pair of UUIDs that is is BLE's business, not
+/// the protocol's, so it hangs off `Half` from out here.
+pub trait HalfChannel {
+    fn channel(self) -> (u128, u128);
 }
 
-impl Half {
-    /// The service and characteristic a session on this half is opened on.
-    pub fn channel(self) -> (u128, u128) {
+impl HalfChannel for Half {
+    fn channel(self) -> (u128, u128) {
         match self {
             Half::Left => (SMP_SERVICE, SMP_CHARACTERISTIC),
             Half::Right => (RELAY_SERVICE, RELAY_CHARACTERISTIC),
         }
     }
+}
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Half::Left => "left",
-            Half::Right => "right",
-        }
+/// A GATT characteristic, driven as an SMP transport.
+///
+/// `GattChannel` has a `read` of its own that reads the characteristic's
+/// current value; SMP never wants that, only the next notification.
+impl SmpTransport for Box<dyn GattChannel> {
+    fn mtu(&self) -> usize {
+        (**self).mtu()
+    }
+
+    fn write(&mut self, packet: &[u8]) -> Result<(), TransportError> {
+        (**self).write(packet).map_err(TransportError::from)
+    }
+
+    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+        (**self).notification(timeout).map_err(TransportError::from)
     }
 }
 
-impl fmt::Display for Half {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+impl From<BleError> for TransportError {
+    fn from(err: BleError) -> Self {
+        TransportError::Io(err.to_string())
     }
 }
 
-impl FromStr for Half {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        match text.to_ascii_lowercase().as_str() {
-            "left" | "l" => Ok(Half::Left),
-            "right" | "r" => Ok(Half::Right),
-            other => Err(format!("{other:?} is not a half; expected left or right")),
-        }
+impl From<BleError> for SmpError {
+    fn from(err: BleError) -> Self {
+        SmpError::Transport(err.into())
     }
-}
-
-/// What can go wrong driving an update.
-#[derive(Debug, thiserror::Error)]
-pub enum SmpError {
-    #[error(transparent)]
-    Ble(#[from] BleError),
-
-    #[error("no bonded ZSA board to talk to{}", match .0 {
-        Some(hint) => format!(" matching {hint:?}"),
-        None => String::new(),
-    })]
-    NoBoard(Option<String>),
-
-    #[error("more than one board matches: {}; name one with --device", .0.join(", "))]
-    Ambiguous(Vec<String>),
-
-    #[error("a header needs 8 bytes, got {0}")]
-    ShortHeader(usize),
-
-    #[error("{0} is not an SMP op")]
-    BadOp(u8),
-
-    #[error("a payload of {0} bytes will not fit the 16-bit length field")]
-    PayloadTooLong(usize),
-
-    #[error("an MTU of {0} cannot carry anything")]
-    MtuTooSmall(usize),
-
-    #[error("{0} bytes per request leaves no room for image data")]
-    ChunkTooSmall(usize),
-
-    #[error("the reply is about group {}, command {} — this asked group {}, command {}",
-        .got.0, .got.1, .expected.0, .expected.1)]
-    Mismatch {
-        expected: (u16, u8),
-        got: (u16, u8),
-    },
-
-    #[error("no reply within {0:?}")]
-    Timeout(Duration),
-
-    #[error("bad CBOR from the board: {0}")]
-    Cbor(String),
-
-    #[error("{0}")]
-    Malformed(String),
-
-    /// The device said no. `rc` 0 is success and never reaches here.
-    #[error("the board refused: {meaning} (group {group}, rc {rc})")]
-    Remote {
-        group: u16,
-        rc: i64,
-        meaning: &'static str,
-    },
-
-    #[error("the board asked for offset {off} of a {total}-byte image")]
-    BadOffset { off: u32, total: u32 },
-
-    #[error("the board stopped taking the image at offset {0}")]
-    Stalled(u32),
-
-    #[error("an image of {0} bytes is too large to announce")]
-    ImageTooLarge(usize),
-
-    #[error("the image is empty")]
-    EmptyImage,
 }
 
 /// Opens an SMP session to a bonded board, on one half or the other.
@@ -175,7 +98,7 @@ pub fn open(hint: Option<&str>, half: Half) -> Result<SmpClient, SmpError> {
 
     let (service, characteristic) = half.channel();
     let channel = backend.open(&key, service, characteristic)?;
-    Ok(SmpClient::new(channel))
+    Ok(SmpClient::new(Box::new(channel)))
 }
 
 /// What the halves have left, in one look, without starting a monitor.
@@ -368,7 +291,7 @@ mod tests {
         };
         let err = select(&[nearby], None).unwrap_err();
         assert!(
-            matches!(err, SmpError::Ble(BleError::NotBonded(_))),
+            matches!(err, SmpError::Transport(TransportError::Io(_))),
             "{err:?}"
         );
         assert!(err.to_string().contains("pair it first"), "{err}");

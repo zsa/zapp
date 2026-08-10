@@ -14,8 +14,8 @@
 
 use ciborium::value::Value;
 
-use super::cbor;
-use super::SmpError;
+use crate::cbor;
+use crate::SmpError;
 
 pub const HEADER_LEN: usize = 8;
 

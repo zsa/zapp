@@ -22,7 +22,7 @@
 //! needs writing and deciding whether the pack has the charge to see it through
 //! are all settled from bytes, and all tested that way.
 
-use super::{image, Half, ImageSlot};
+use crate::{image, Half, ImageSlot};
 
 pub const MAGIC: [u8; 4] = *b"ZSAB";
 pub const FORMAT_VERSION: u16 = 1;

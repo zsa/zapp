@@ -2462,9 +2462,9 @@ dependencies = [
  "ciborium",
  "env_logger",
  "log",
- "sha2",
  "thiserror 2.0.18",
  "zapp-core",
+ "zapp-smp",
  "zbus",
 ]
 
@@ -2491,6 +2491,17 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "zapp-core",
+]
+
+[[package]]
+name = "zapp-smp"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "log",
+ "sha2",
  "thiserror 2.0.18",
  "zapp-core",
 ]

@@ -2,8 +2,8 @@
 
 use ciborium::value::Value;
 
-use super::proto::{self, HEADER_LEN};
-use super::{cbor, SmpError};
+use crate::proto::{self, HEADER_LEN};
+use crate::{cbor, SmpError};
 
 pub const GROUP: u16 = 1;
 pub const CMD_STATE: u8 = 0;

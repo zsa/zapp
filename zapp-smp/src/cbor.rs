@@ -8,7 +8,7 @@
 
 use ciborium::value::{Integer, Value};
 
-use super::SmpError;
+use crate::SmpError;
 
 pub fn encode(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
