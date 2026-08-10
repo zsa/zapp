@@ -2511,9 +2511,12 @@ name = "zapp-wired"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "env_logger",
+ "indicatif",
  "log",
  "nusb",
  "thiserror 2.0.18",
+ "zapp-core",
  "zapp-smp",
 ]
 
