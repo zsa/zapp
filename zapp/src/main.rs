@@ -1,3 +1,4 @@
+mod nrf_wired;
 mod zsab;
 
 use std::path::{Path, PathBuf};
@@ -128,6 +129,58 @@ enum Commands {
         #[command(subcommand)]
         command: DfuCommands,
     },
+    /// Update both nRF halves over the cable, through the bootloader
+    #[command(
+        long_about = "Update both nRF halves over the cable.\n\n\
+            The same nRF firmware `zapp smp bundle` writes over Bluetooth, \
+            written over USB instead. The STM32's ignition bootloader drives \
+            both halves into MCUboot itself — the left over the UART between \
+            them, the right over the TRRS I2C bus — and bridges MCUboot's \
+            serial recovery to this machine over one vendor interface. There \
+            is no radio in the path, so nothing depends on the halves being \
+            paired, on the left's application being alive, or on how much \
+            charge is in either pack.\n\n\
+            The keyboard has to be in its bootloader: press the reset button \
+            on the left half. Nothing here works against a keyboard running \
+            its own firmware.",
+        after_long_help = "Examples:\n  \
+            zapp nrf flash voyager2_0.1.9.zsab\n  \
+            zapp nrf status\n  \
+            zapp nrf end"
+    )]
+    Nrf {
+        #[command(subcommand)]
+        command: NrfCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum NrfCommands {
+    /// Write both halves from one .zsab bundle
+    #[command(
+        long_about = "Write both halves from one .zsab bundle.\n\n\
+            A bundle names both halves and they are always written together. \
+            There is deliberately no way to pick one: a keyboard whose halves \
+            are on different builds is a keyboard whose halves cannot talk to \
+            each other, and per-half flashing is how boards end up there.\n\n\
+            The right half goes first, then the left. A half already carrying \
+            the bundle's image is left alone rather than written again, and \
+            every upload is read back and checked before the half is \
+            restarted.",
+        after_long_help = "Examples:\n  \
+            zapp nrf flash voyager2_0.1.9.zsab"
+    )]
+    Flash {
+        /// Path to a .zsab firmware bundle
+        bundle: PathBuf,
+        /// Seconds to wait for each reply from a half
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
+    /// Say what the bootloader thinks is going on, and what is on the I2C bus
+    Status,
+    /// End a session that was left open and put the hardware back
+    End,
 }
 
 #[derive(Subcommand)]
@@ -363,6 +416,17 @@ fn main() -> Result<()> {
             }
             result
         }
+        // Nothing is added to a failure here: the wired path reads the
+        // bootloader's own status back and prints what it says, which is more
+        // than an error chain has, and it does it while the board is still
+        // plugged in and answering.
+        Commands::Nrf { command } => match command {
+            NrfCommands::Flash { bundle, timeout } => {
+                nrf_wired::flash(&bundle, Duration::from_secs(timeout))
+            }
+            NrfCommands::Status => nrf_wired::status(),
+            NrfCommands::End => nrf_wired::end(),
+        },
     }
 }
 

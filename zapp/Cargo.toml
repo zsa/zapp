@@ -7,8 +7,15 @@ edition = "2024"
 zapp-ble = { path = "../zapp-ble" }
 zapp-core = { path = "../zapp-core" }
 zapp-oryx = { path = "../zapp-oryx" }
+zapp-smp = { path = "../zapp-smp" }
+zapp-wired = { path = "../zapp-wired" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 indicatif = "0.17"
 log = "0.4"
+
+[dev-dependencies]
+# The wired orchestration is tested against the in-memory keyboard rather than
+# against a board, which needs the loopback stack compiled into the library.
+zapp-wired = { path = "../zapp-wired", features = ["loopback"] }

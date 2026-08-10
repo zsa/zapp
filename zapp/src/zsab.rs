@@ -1023,7 +1023,7 @@ fn refusal(err: &anyhow::Error) -> Option<zsa_err::Refusal> {
 }
 
 /// Folds a paragraph to the width the rest of this file is written at.
-fn wrap(text: &str) -> String {
+pub(crate) fn wrap(text: &str) -> String {
     const WIDTH: usize = 76;
 
     let mut out = String::new();
@@ -1137,7 +1137,7 @@ fn titled(half: Half) -> &'static str {
 }
 
 /// Enough of a hash to recognise, since a SHA-512 is 128 characters of hex.
-fn short(hash: &[u8]) -> String {
+pub(crate) fn short(hash: &[u8]) -> String {
     let hex = smp::image::hex(hash);
     match hex.len() > 20 {
         true => format!("{}…{}", &hex[..8], &hex[hex.len() - 8..]),
@@ -1145,7 +1145,7 @@ fn short(hash: &[u8]) -> String {
     }
 }
 
-fn named(version: &str) -> String {
+pub(crate) fn named(version: &str) -> String {
     match version.is_empty() {
         true => "(no version)".to_string(),
         false => version.to_string(),

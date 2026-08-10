@@ -2453,6 +2453,8 @@ dependencies = [
  "zapp-ble",
  "zapp-core",
  "zapp-oryx",
+ "zapp-smp",
+ "zapp-wired",
 ]
 
 [[package]]
