@@ -313,6 +313,125 @@ impl<L: IgnitionLink> Ignition<L> {
     }
 }
 
+/// How many times a control transfer is tried before its stall is believed.
+pub const CONTROL_ATTEMPTS: u32 = 4;
+
+/// How long to leave between those tries.
+///
+/// The window this exists to cross is microseconds wide, so this is three
+/// orders of magnitude more than it needs to be, and four attempts still add
+/// under 10 ms to a request that turns out to be genuinely refused.
+pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
+
+/// A link that submits a stalled control transfer again.
+///
+/// A host controller retries a NAK by itself and never a STALL, so a control
+/// request that races a state change on the device is a transient nothing below
+/// this layer will absorb. Ignition has exactly one such race: `BEGIN` returns
+/// the moment the request is queued and its main loop then runs the entry
+/// sequence — the MD assert and a 500 us reset blip — during which `usbd_poll`
+/// is not being called. A host that pipelines the next SETUP into that gap gets
+/// it stalled, and only that one: the request after it, microseconds later,
+/// answers normally. Measured on hardware, where any control transfer *with a
+/// data stage* stalls once immediately after `BEGIN` and never again.
+///
+/// Retrying is safe here rather than merely convenient: `nusb` documents that a
+/// control stall clears when the next request is submitted, so there is no halt
+/// to clear and nothing to reset, and every vendor request this crate sends is
+/// idempotent — `STATUS` and `I2C_SCAN` are reads, and `SELECT`, `RELEASE_MD`
+/// and `END` all set a state rather than advancing one.
+///
+/// Deliberately narrow:
+///
+/// * Only [`WiredError::Stalled`]. A timeout, a disconnect or a protocol error
+///   is not retried, because none of them go away by being asked again.
+/// * Only control transfers. A stalled bulk endpoint stays halted until it is
+///   cleared, so a blind retry there would spin rather than recover.
+/// * Bounded. A request the bootloader genuinely refuses stalls every single
+///   time — that is how it says no — and has to reach the caller as a refusal
+///   once the attempts are spent, not as a hang.
+pub struct Retrying<L> {
+    inner: L,
+    attempts: u32,
+    backoff: Duration,
+}
+
+impl<L> Retrying<L> {
+    pub fn new(inner: L) -> Self {
+        Self {
+            inner,
+            attempts: CONTROL_ATTEMPTS,
+            backoff: CONTROL_RETRY,
+        }
+    }
+
+    /// The same, with the policy spelled out. `attempts` counts the first try.
+    pub fn with_policy(inner: L, attempts: u32, backoff: Duration) -> Self {
+        Self {
+            inner,
+            attempts: attempts.max(1),
+            backoff,
+        }
+    }
+
+    pub fn into_inner(self) -> L {
+        self.inner
+    }
+}
+
+impl<L: IgnitionLink> Retrying<L> {
+    /// One control transfer, submitted again for as long as it stalls.
+    fn control<T>(
+        &mut self,
+        request: u8,
+        mut transfer: impl FnMut(&mut L) -> Result<T, WiredError>,
+    ) -> Result<T, WiredError> {
+        for attempt in 1..self.attempts {
+            match transfer(&mut self.inner) {
+                Err(WiredError::Stalled { .. }) => {
+                    log::debug!(
+                        "vendor request {request:#04x} stalled on attempt {attempt} of {}; \
+                         submitting it again in {:?}",
+                        self.attempts,
+                        self.backoff
+                    );
+                    // Not the kind of wait this crate got rid of: nothing is
+                    // being given time to happen, the bus is being let go of
+                    // for long enough that the device's control endpoint has
+                    // drained the transfer it is still finishing.
+                    std::thread::sleep(self.backoff);
+                }
+                settled => return settled,
+            }
+        }
+        // The last attempt's answer is the one the caller gets, stall included.
+        transfer(&mut self.inner)
+    }
+}
+
+impl<L: IgnitionLink> IgnitionLink for Retrying<L> {
+    fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
+        self.control(request, |link| link.control_out(request, value))
+    }
+
+    fn control_in(
+        &mut self,
+        request: u8,
+        value: u16,
+        length: usize,
+    ) -> Result<Vec<u8>, WiredError> {
+        self.control(request, |link| link.control_in(request, value, length))
+    }
+
+    fn bulk_out(&mut self, message: &[u8]) -> Result<(), WiredError> {
+        self.inner.bulk_out(message)
+    }
+
+    fn bulk_in(&mut self, timeout: Duration) -> Result<Vec<u8>, WiredError> {
+        self.inner.bulk_in(timeout)
+    }
+}
+
 /// The real thing: `nusb` against a plugged-in bootloader.
 ///
 /// Deliberately the thinnest layer in the crate. Everything it can get wrong
@@ -323,7 +442,7 @@ pub mod usb {
     use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
     use nusb::{Endpoint, Interface, MaybeFuture};
 
-    use super::{IgnitionLink, CONTROL_TIMEOUT, INTERFACE, PID, VID};
+    use super::{IgnitionLink, Retrying, CONTROL_TIMEOUT, INTERFACE, PID, VID};
     use crate::WiredError;
 
     /// How many maximum-size packets one read asks for.
@@ -341,7 +460,18 @@ pub mod usb {
 
     impl UsbLink {
         /// Claims interface 1 on the one attached bootloader.
-        pub fn open() -> Result<Self, WiredError> {
+        ///
+        /// Wrapped in [`Retrying`], which is how anything above this should
+        /// have it: ignition stalls the first control transfer submitted into
+        /// the gap `BEGIN` opens, and absorbing that is not a decision a caller
+        /// should have to remember to make. [`Self::open_bare`] is the
+        /// unwrapped link, for a caller doing its own.
+        pub fn open() -> Result<Retrying<Self>, WiredError> {
+            Ok(Retrying::new(Self::open_bare()?))
+        }
+
+        /// The same link, with nothing between it and the bus.
+        pub fn open_bare() -> Result<Self, WiredError> {
             let info = nusb::list_devices()
                 .wait()
                 .map_err(|err| WiredError::Usb(err.to_string()))?
@@ -400,6 +530,22 @@ pub mod usb {
         }
     }
 
+    /// A failed control transfer, with a stall kept apart from the rest.
+    ///
+    /// The distinction is the whole point: [`Retrying`] submits a stall again
+    /// and nothing else, so a timeout or a disconnect has to stay a
+    /// [`WiredError::Request`] or it would be tried three more times for
+    /// nothing.
+    fn control_error(request: u8, err: nusb::transfer::TransferError) -> WiredError {
+        match err {
+            nusb::transfer::TransferError::Stall => WiredError::Stalled { request },
+            other => WiredError::Request {
+                request,
+                reason: other.to_string(),
+            },
+        }
+    }
+
     impl IgnitionLink for UsbLink {
         fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
             self.interface
@@ -415,10 +561,7 @@ pub mod usb {
                     CONTROL_TIMEOUT,
                 )
                 .wait()
-                .map_err(|err| WiredError::Request {
-                    request,
-                    reason: err.to_string(),
-                })
+                .map_err(|err| control_error(request, err))
         }
 
         fn control_in(
@@ -440,10 +583,7 @@ pub mod usb {
                     CONTROL_TIMEOUT,
                 )
                 .wait()
-                .map_err(|err| WiredError::Request {
-                    request,
-                    reason: err.to_string(),
-                })
+                .map_err(|err| control_error(request, err))
         }
 
         fn bulk_out(&mut self, message: &[u8]) -> Result<(), WiredError> {
@@ -645,5 +785,176 @@ mod tests {
             ignition.status(),
             Err(WiredError::ShortStatus { got: 8 })
         ));
+    }
+
+    // ---- Stalls ---------------------------------------------------------
+
+    /// A link that stalls its first `stalls` control transfers, or every one.
+    ///
+    /// Counts bulk traffic separately, so a test can show that the retry never
+    /// reaches an endpoint where re-submitting would be the wrong thing.
+    #[derive(Default)]
+    struct Stalls {
+        /// Control transfers still to be stalled before one is answered.
+        stalls: u32,
+        /// Stall everything, the way a genuinely refused request behaves.
+        always: bool,
+        /// Fail with something that is not a stall, which must not be retried.
+        broken: bool,
+        controls: u32,
+        bulks: u32,
+    }
+
+    impl Stalls {
+        fn answer(&mut self, request: u8) -> Result<(), WiredError> {
+            self.controls += 1;
+            if self.broken {
+                return Err(WiredError::Request {
+                    request,
+                    reason: "the device went away".into(),
+                });
+            }
+            if self.always || self.stalls > 0 {
+                self.stalls = self.stalls.saturating_sub(1);
+                return Err(WiredError::Stalled { request });
+            }
+            Ok(())
+        }
+    }
+
+    impl IgnitionLink for Stalls {
+        fn control_out(&mut self, request: u8, _value: u16) -> Result<(), WiredError> {
+            self.answer(request)
+        }
+        fn control_in(
+            &mut self,
+            request: u8,
+            _value: u16,
+            length: usize,
+        ) -> Result<Vec<u8>, WiredError> {
+            self.answer(request)?;
+            let mut answer = status_bytes();
+            answer.truncate(length);
+            Ok(answer)
+        }
+        fn bulk_out(&mut self, _message: &[u8]) -> Result<(), WiredError> {
+            self.bulks += 1;
+            Err(WiredError::Stalled { request: 0 })
+        }
+        fn bulk_in(&mut self, _timeout: Duration) -> Result<Vec<u8>, WiredError> {
+            self.bulks += 1;
+            Err(WiredError::Stalled { request: 0 })
+        }
+    }
+
+    /// The policy under test, with the wait taken out of it.
+    fn retrying(link: Stalls) -> Retrying<Stalls> {
+        Retrying::with_policy(link, CONTROL_ATTEMPTS, Duration::ZERO)
+    }
+
+    /// The link the retry wrapped, once a run against it is over.
+    fn spent(ignition: Ignition<Retrying<Stalls>>) -> Stalls {
+        ignition.into_link().into_inner()
+    }
+
+    #[test]
+    fn a_control_read_that_stalls_once_is_submitted_again_and_answers() {
+        // The bug from the bench: BEGIN succeeds, the STATUS pipelined in
+        // behind it stalls, and the very next one is fine.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            stalls: 1,
+            ..Stalls::default()
+        }));
+        let status = ignition.status().expect("the second attempt");
+        assert_eq!(status.i2c_khz, 50);
+        assert_eq!(spent(ignition).controls, 2);
+    }
+
+    #[test]
+    fn a_control_write_that_stalls_is_submitted_again_too() {
+        // I2C_SCAN showed it is not request-specific, so it cannot be only the
+        // reads that are retried.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            stalls: 1,
+            ..Stalls::default()
+        }));
+        ignition.begin(Halves::BOTH).expect("the second attempt");
+        assert_eq!(spent(ignition).controls, 2);
+    }
+
+    #[test]
+    fn a_request_the_bootloader_really_refuses_still_fails_once_the_tries_are_spent() {
+        // A refusal stalls every time — that is how the bootloader says no —
+        // and has to reach the caller as one rather than as a hang.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            always: true,
+            ..Stalls::default()
+        }));
+        let err = ignition.status().unwrap_err();
+        assert!(
+            matches!(err, WiredError::Stalled { request: REQ_STATUS }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("refused"), "{err}");
+        // Bounded, and it spent every attempt it had rather than stopping early.
+        assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_failure_that_is_not_a_stall_is_not_tried_again() {
+        // A disconnect or a timeout does not go away by being asked twice, and
+        // retrying one would multiply a slow failure by four.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            broken: true,
+            ..Stalls::default()
+        }));
+        let err = ignition.status().unwrap_err();
+        assert!(matches!(err, WiredError::Request { .. }), "{err:?}");
+        assert_eq!(spent(ignition).controls, 1);
+    }
+
+    #[test]
+    fn a_stall_on_a_bulk_endpoint_is_left_alone() {
+        // A halted bulk endpoint stays halted until it is cleared, so a retry
+        // there would spin instead of recovering. Only control is re-submitted.
+        let mut link = retrying(Stalls::default());
+        assert!(link.bulk_out(b"anything").is_err());
+        assert!(link.bulk_in(Duration::ZERO).is_err());
+        let inner = link.into_inner();
+        assert_eq!(inner.bulks, 2);
+        assert_eq!(inner.controls, 0);
+    }
+
+    #[test]
+    fn a_link_that_never_stalls_costs_exactly_one_transfer_per_request() {
+        let mut ignition = Ignition::new(retrying(Stalls::default()));
+        ignition.status().unwrap();
+        ignition.select(Half::Left).unwrap();
+        ignition.end().unwrap();
+        assert_eq!(spent(ignition).controls, 3);
+    }
+
+    #[test]
+    fn the_policy_a_real_link_gets_recovers_and_still_gives_up() {
+        // Every test above sets its own policy, so all of them would pass with
+        // the shipped one set to a single attempt. This drives `Retrying::new`
+        // — the constants a plugged-in board actually gets — and pays the real
+        // backoff to do it.
+        let mut ignition = Ignition::new(Retrying::new(Stalls {
+            stalls: 2,
+            ..Stalls::default()
+        }));
+        ignition.status().expect("the third attempt");
+        assert_eq!(spent(ignition).controls, 3);
+
+        // And it is bounded: a link that stalls forever fails rather than
+        // hanging, in a time a person would not notice.
+        let started = std::time::Instant::now();
+        let mut ignition = Ignition::new(Retrying::new(Stalls {
+            always: true,
+            ..Stalls::default()
+        }));
+        assert!(ignition.status().is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

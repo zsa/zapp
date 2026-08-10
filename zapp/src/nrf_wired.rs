@@ -25,7 +25,9 @@ use zapp_smp::bundle::{self, Bundle};
 use zapp_smp::proto::{self, Op};
 use zapp_smp::{cbor, image, Half, ImageSlot, SmpClient, SmpError};
 use zapp_wired::ignition::{usb::UsbLink, Halves, SessionState, TargetState};
-use zapp_wired::{Ignition, IgnitionLink, LeftTransport, RightTransport, Status, WiredError};
+use zapp_wired::{
+    Ignition, IgnitionLink, LeftTransport, Retrying, RightTransport, Status, WiredError,
+};
 
 use crate::zsab::{named, short, wrap};
 
@@ -753,7 +755,11 @@ impl Steps {
 // ---------------------------------------------------------------------------
 
 /// Finds the one plugged-in bootloader.
-fn open() -> Result<UsbLink> {
+///
+/// The link comes back wrapped in `Retrying`, which absorbs the control stall
+/// ignition answers with in the gap `BEGIN` opens. Nothing above here has to
+/// know that, which is the point of it being the link's own behaviour.
+fn open() -> Result<Retrying<UsbLink>> {
     match UsbLink::open() {
         Ok(link) => {
             println!("Found the ZSA bootloader over USB.");

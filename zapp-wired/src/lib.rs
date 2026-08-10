@@ -25,7 +25,7 @@ pub mod nlip;
 pub mod pipe;
 pub mod transport;
 
-pub use ignition::{Ignition, IgnitionLink, Status};
+pub use ignition::{Ignition, IgnitionLink, Retrying, Status};
 pub use transport::{LeftTransport, RightTransport};
 
 /// What can go wrong on the way to a half.
@@ -45,6 +45,15 @@ pub enum WiredError {
 
     #[error("vendor request {request:#04x} failed: {reason}")]
     Request { request: u8, reason: String },
+
+    /// The device answered a control request with a STALL.
+    ///
+    /// Its own variant rather than a [`Self::Request`] with a string in it,
+    /// because it is the one control failure worth trying again: see
+    /// [`Retrying`]. A request the bootloader genuinely refuses stalls every
+    /// time and reaches a caller as this, once the retries are spent.
+    #[error("the bootloader refused vendor request {request:#04x}: it stalled")]
+    Stalled { request: u8 },
 
     #[error("a status response needs {expected} bytes, got {got}", expected = ignition::STATUS_LEN)]
     ShortStatus { got: usize },
