@@ -12,6 +12,8 @@
 pub mod bundle;
 pub mod cbor;
 pub mod client;
+#[cfg(any(test, feature = "test-double"))]
+pub mod fake;
 pub mod image;
 pub mod img;
 pub mod proto;

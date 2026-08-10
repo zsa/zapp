@@ -13,3 +13,8 @@ log = "0.4"
 sha2 = "0.10"
 thiserror = "2"
 zapp-core = { path = "../zapp-core" }
+
+[features]
+# Compiles the in-memory SMP device into the library, so another crate can
+# drive its own stack through it.
+test-double = []
