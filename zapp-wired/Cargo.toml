@@ -1,0 +1,14 @@
+[package]
+name = "zapp-wired"
+version = "0.1.0"
+edition = "2021"
+description = "Wired nRF updates over ignition's vendor interface"
+
+[dependencies]
+# MCUboot's serial recovery is line-based and base64, which is the one thing
+# in the codec worth taking from a crate rather than writing again.
+base64 = "0.22"
+log = "0.4"
+thiserror = "2"
+zapp-smp = { path = "../zapp-smp" }
+

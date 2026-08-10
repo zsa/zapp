@@ -2507,6 +2507,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zapp-wired"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "log",
+ "thiserror 2.0.18",
+ "zapp-smp",
+]
+
+[[package]]
 name = "zbus"
 version = "5.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
