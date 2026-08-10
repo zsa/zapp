@@ -9,6 +9,16 @@ description = "Wired nRF updates over ignition's vendor interface"
 # in the codec worth taking from a crate rather than writing again.
 base64 = "0.22"
 log = "0.4"
+nusb = "0.2"
 thiserror = "2"
 zapp-smp = { path = "../zapp-smp" }
 
+[dev-dependencies]
+# The loopback stack drives zapp-smp's in-memory device, so the tests need it
+# compiled into the library.
+zapp-smp = { path = "../zapp-smp", features = ["test-double"] }
+
+[features]
+# Makes the loopback stack part of the library for callers other than this
+# crate's own tests.
+loopback = ["zapp-smp/test-double"]
