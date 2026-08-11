@@ -52,6 +52,11 @@ enum Commands {
     Flash {
         /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
         firmware: String,
+        /// Write a half even if it already carries the image, or the bundle is
+        /// older than what is installed. Only means anything for .zsab bundles:
+        /// a keyboard image is always written.
+        #[arg(long)]
+        force: bool,
     },
     /// Check Oryx for updates on your layout and flash if available
     #[command(
@@ -361,11 +366,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Flash { firmware } => {
+        Commands::Flash { firmware, force } => {
             if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
             } else {
-                cmd_flash_file(&PathBuf::from(firmware))
+                cmd_flash_file(&PathBuf::from(firmware), force)
             }
         }
         Commands::Update => cmd_update(),
@@ -722,14 +727,21 @@ fn describe_usb(device: &UsbDevice) -> String {
     }
 }
 
-fn cmd_flash_file(path: &PathBuf) -> Result<()> {
+fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
     // A bundle carries both halves' wireless firmware and goes over the cable
     // through the bootloader; everything else is a keyboard image for the
     // STM32. Told apart by what the file says it is rather than by its name,
     // so a renamed bundle still does the right thing instead of failing deep
     // inside the DFU loader.
     if is_bundle(path) {
-        return nrf_wired::flash(path, false, Duration::from_secs(15));
+        return nrf_wired::flash(path, force, Duration::from_secs(15));
+    }
+
+    if force {
+        // Said rather than ignored: a keyboard image is always written, so the
+        // flag is not doing anything here and silently accepting it would
+        // suggest otherwise.
+        println!("--force only applies to .zsab bundles; a keyboard image is always written.");
     }
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
