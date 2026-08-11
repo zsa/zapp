@@ -59,7 +59,7 @@ const SCANNED: [(u8, &str); 5] = [
 // ---------------------------------------------------------------------------
 
 /// Writes both halves from one bundle.
-pub fn flash(path: &Path, timeout: Duration) -> Result<()> {
+pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
     let blob = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let bundle = bundle::parse(&blob)
         .with_context(|| format!("{} is not a bundle this build can read", path.display()))?;
@@ -68,7 +68,7 @@ pub fn flash(path: &Path, timeout: Duration) -> Result<()> {
     let shared = Shared::new(open()?);
     let mut ignition = Ignition::new(shared.clone());
 
-    match run(&shared, &mut ignition, &bundle, timeout) {
+    match run(&shared, &mut ignition, &bundle, force, timeout) {
         Ok(()) => {
             // Only once everything landed: an END on the way out of a failure
             // would throw away the STATUS the failure is explained from.
@@ -188,6 +188,7 @@ fn run<L: IgnitionLink + 'static>(
     shared: &Shared<L>,
     ignition: &mut Ignition<Shared<L>>,
     bundle: &Bundle,
+    force: bool,
     timeout: Duration,
 ) -> Result<()> {
     let mut steps = Steps { total: 3, done: 0 };
@@ -214,7 +215,7 @@ fn run<L: IgnitionLink + 'static>(
     // leaves a keyboard with one working half rather than none.
     for half in [Half::Right, Half::Left] {
         steps.announce(&format!("{} half", titled(half)));
-        write_half(shared, ignition, half, bundle, &status, timeout)?;
+        write_half(shared, ignition, half, bundle, &status, force, timeout)?;
     }
     Ok(())
 }
@@ -226,6 +227,7 @@ fn write_half<L: IgnitionLink + 'static>(
     half: Half,
     bundle: &Bundle,
     status: &Status,
+    force: bool,
     timeout: Duration,
 ) -> Result<()> {
     ignition
@@ -242,9 +244,21 @@ fn write_half<L: IgnitionLink + 'static>(
         .with_context(|| format!("Could not read the {half} half's image state"))?;
     report_slot(&before);
 
-    if installed(&before, &wanted) {
+    if installed(&before, &wanted) && !force {
         println!("  already carrying this image — not written again");
     } else {
+        // Refuse to go backwards. A bundle built from a stale directory writes
+        // an old half onto a keyboard whose other half has moved on, and two
+        // halves on different builds is a keyboard that hangs the moment they
+        // are wired together — which is exactly how this check came to exist.
+        // The versions are already in hand and were already being printed;
+        // nothing was comparing them.
+        if let Some(older) = (!force)
+            .then(|| going_backwards(&before, bundle.image(half), half))
+            .flatten()
+        {
+            bail!("{older}");
+        }
         // The right half only. Its settings partition holds the pairing state
         // the two halves share, and a right that comes back on a new build
         // reading an old one is the failure this avoids.
@@ -422,6 +436,42 @@ fn primary(slots: &[ImageSlot]) -> Option<&ImageSlot> {
 }
 
 /// Whether the primary slot already holds this exact image.
+/// `major.minor.patch` out of an MCUboot version, ignoring any `+build`.
+///
+/// Anything unparseable returns None, which is read as "cannot tell" and lets
+/// the write through: refusing on a version string nobody can read would be a
+/// worse failure than the one this guards against.
+fn ordering_of(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.split('+').next()?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Says so if the bundle would put an older image on than the half carries.
+///
+/// Two halves on different builds is a keyboard whose halves cannot talk over
+/// the wire between them, and the way boards get there is a bundle built from
+/// a directory that was rebuilt afterwards — the versions are right there in
+/// the output, going backwards, and nothing was reading them.
+fn going_backwards(slots: &[ImageSlot], image: &[u8], half: Half) -> Option<String> {
+    let installed = ordering_of(&slots.iter().find(|slot| slot.slot == 0)?.version)?;
+    let offered_text = image::inspect(image)?.version;
+    let offered = ordering_of(&offered_text)?;
+    if offered >= installed {
+        return None;
+    }
+    let (a, b, c) = installed;
+    Some(format!(
+        "The bundle's {half} image is v{offered_text}, older than the v{a}.{b}.{c} that half \
+         is already carrying. Writing it would leave the halves on different builds, which is \
+         a keyboard whose halves cannot talk to each other over the wire between them — the \
+         usual cause is a bundle built from a directory that was rebuilt afterwards, so check \
+         the bundle is the one you meant. Pass --force if the downgrade is deliberate."
+    ))
+}
+
 fn installed(slots: &[ImageSlot], wanted: &[u8]) -> bool {
     primary(slots).is_some_and(|slot| slot.hash == wanted)
 }
@@ -849,7 +899,16 @@ mod tests {
     const DEVICE_HASH: [u8; 32] = [0x11; 32];
 
     /// A signed image whose trailer names it by `hash`.
+    ///
+    /// Versioned to match what the fake board reports it is carrying, so the
+    /// downgrade guard has nothing to object to. A test that wants the guard
+    /// to fire asks for an older one with `signed_v`.
     fn signed(payload: u8, hash: &[u8]) -> Vec<u8> {
+        signed_v(payload, hash, (9, 9, 9))
+    }
+
+    /// The same, at a stated `major.minor.revision`.
+    fn signed_v(payload: u8, hash: &[u8], version: (u8, u8, u16)) -> Vec<u8> {
         const MCUBOOT_MAGIC: u32 = 0x96f3_b83d;
         let body = vec![payload; 512];
 
@@ -859,7 +918,12 @@ mod tests {
         out.extend_from_slice(&32u16.to_le_bytes()); // header size
         out.extend_from_slice(&0u16.to_le_bytes()); // protected tlvs
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.push(version.0); // image_version: major
+        out.push(version.1); // minor
+        out.extend_from_slice(&version.2.to_le_bytes()); // revision
+        out.extend_from_slice(&0u32.to_le_bytes()); // build number
+        out.extend_from_slice(&0u32.to_le_bytes()); // pad
         out.extend_from_slice(&body);
 
         out.extend_from_slice(&0x6907u16.to_le_bytes()); // tlv area
@@ -891,12 +955,30 @@ mod tests {
 
     /// Runs the whole orchestration against the in-memory keyboard.
     fn flash_loopback(blob: &[u8]) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+        flash_loopback_with(blob, false)
+    }
+
+    /// The same, with the downgrade and skip guards overridden.
+    fn flash_loopback_forced(blob: &[u8]) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+        flash_loopback_with(blob, true)
+    }
+
+    fn flash_loopback_with(
+        blob: &[u8],
+        force: bool,
+    ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
         let bundle = bundle::parse(blob).expect("a bundle");
         let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
         let shared = Shared::new(link);
         let mut ignition = Ignition::new(shared.clone());
 
-        let result = run(&shared, &mut ignition, &bundle, Duration::from_millis(50));
+        let result = run(
+            &shared,
+            &mut ignition,
+            &bundle,
+            force,
+            Duration::from_millis(50),
+        );
         // END the way `flash` does, so the recorded sequence is the whole one.
         if result.is_ok() {
             ignition.end().unwrap();
@@ -1027,6 +1109,46 @@ mod tests {
             count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
             1,
             "the right half was not reset out of MCUboot"
+        );
+    }
+
+    #[test]
+    fn a_bundle_older_than_what_is_installed_is_refused_and_nothing_is_written() {
+        // The mistake this exists to stop: a bundle built from a directory
+        // that was rebuilt afterwards carried an image eleven versions behind
+        // the half it was written to, and the resulting keyboard hung the
+        // moment its halves were wired together. The board reports 9.9.9.
+        let blob = bundled(
+            &signed_v(0x11, &[0xAA; 32], (0, 1, 0)),
+            &signed_v(0x22, &[0xBB; 32], (0, 1, 0)),
+        );
+        let (result, _control, device) = flash_loopback(&blob);
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("older"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        assert_eq!(
+            count(&device, (img::GROUP, img::CMD_UPLOAD)),
+            0,
+            "a refused downgrade still wrote something"
+        );
+    }
+
+    #[test]
+    fn a_downgrade_goes_through_when_it_is_asked_for() {
+        let blob = bundled(
+            &signed_v(0x11, &[0xAA; 32], (0, 1, 0)),
+            &signed_v(0x22, &[0xBB; 32], (0, 1, 0)),
+        );
+        let (_result, _control, device) = flash_loopback_forced(&blob);
+
+        // Only that the write was attempted. The run still fails afterwards,
+        // because the fake reports a fixed hash whatever it was sent and the
+        // read-back check correctly disbelieves it — which is the same reason
+        // no test here can watch a successful upload all the way through.
+        assert!(
+            count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0,
+            "--force did not get past the downgrade guard"
         );
     }
 

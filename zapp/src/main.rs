@@ -173,6 +173,10 @@ enum NrfCommands {
     Flash {
         /// Path to a .zsab firmware bundle
         bundle: PathBuf,
+        /// Write a half even if it already carries the image, or the bundle is
+        /// older than what is installed
+        #[arg(long)]
+        force: bool,
         /// Seconds to wait for each reply from a half
         #[arg(long, default_value_t = 15)]
         timeout: u64,
@@ -421,9 +425,11 @@ fn main() -> Result<()> {
         // than an error chain has, and it does it while the board is still
         // plugged in and answering.
         Commands::Nrf { command } => match command {
-            NrfCommands::Flash { bundle, timeout } => {
-                nrf_wired::flash(&bundle, Duration::from_secs(timeout))
-            }
+            NrfCommands::Flash {
+                bundle,
+                force,
+                timeout,
+            } => nrf_wired::flash(&bundle, force, Duration::from_secs(timeout)),
             NrfCommands::Status => nrf_wired::status(),
             NrfCommands::End => nrf_wired::end(),
         },
