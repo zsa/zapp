@@ -59,9 +59,6 @@ pub enum NlipError {
 
     #[error("the frame's checksum is {read:#06x}, the bytes come to {computed:#06x}")]
     BadCrc { read: u16, computed: u16 },
-
-    #[error("a continuation line with no frame open")]
-    Orphan,
 }
 
 /// CRC-16/XMODEM: polynomial 0x1021, initial value zero, no reflection, no
@@ -172,18 +169,58 @@ pub fn decode(base64: &[u8]) -> Result<Vec<u8>, NlipError> {
     Ok(frame.to_vec())
 }
 
-/// Frames out of a byte stream that arrives however it arrives.
+/// Where the next line starts, at or after `from`.
 ///
-/// Splits on newlines, follows the markers, and accumulates base64 the way the
-/// device does, so a frame comes out only once the length field and the
-/// checksum both agree. Lines with no marker are the board talking to itself —
-/// a banner, a log line — and are dropped.
+/// Scanning for the markers is sound rather than a heuristic: base64 is
+/// `A-Za-z0-9+/=`, every character of it `0x2b` or above, so neither marker's
+/// bytes can occur inside a line's body. `\r` and `\n` are not marker bytes
+/// either. The only place `\x06\x09` or `\x04\x14` can appear is in front of a
+/// line.
+fn marker_at(bytes: &[u8], from: usize) -> Option<usize> {
+    let at = bytes
+        .get(from..)?
+        .windows(START.len())
+        .position(|pair| pair == START || pair == CONT)?;
+    Some(at + from)
+}
+
+/// Frames out of a byte stream that arrives however it arrives, and wherever
+/// it is joined.
+///
+/// Follows the markers and accumulates base64 the way the device does, so a
+/// frame comes out only once the length field and the checksum both agree.
+///
+/// The discipline is resynchronisation, not splitting: a line begins at a
+/// marker, never at wherever the last one happened to end. That is what a byte
+/// stream you can join at an arbitrary point requires, and it is not
+/// hypothetical here. Ignition's rings survive a session, so a fresh `BEGIN`
+/// and `SELECT` can be followed by hundreds of bytes of the *previous*
+/// exchange's tail before the host has sent anything at all. Assuming a line
+/// starts where the buffer starts glues that tail onto the front of the real
+/// reply's first line, which then has no marker, is discarded whole, and takes
+/// the reply with it — a working link that times out.
+///
+/// So nothing here is fatal, and [`Self::take`] cannot fail. Everything that is
+/// not a whole well-formed frame is something to skip and count:
+///
+/// * Bytes before the first marker — a stale tail, a boot banner, line noise.
+/// * A continuation line with no frame open, which is what joining mid-frame
+///   looks like from here.
+/// * A line that never ended, when the next line's marker has already arrived.
+/// * A frame whose base64, length or checksum does not come out.
+///
+/// Each of those is logged with its size and leaves the assembler ready for the
+/// next marker, so one bad line never costs the frame behind it. [`Self::discarded`]
+/// is the running total, because bytes quietly going missing is exactly the
+/// failure this is meant to survive and it should still be visible afterwards.
 #[derive(Debug, Default)]
 pub struct LineAssembler {
     /// Bytes not yet cut into lines.
     stream: Vec<u8>,
     /// Base64 of the frame being assembled.
     base64: Vec<u8>,
+    /// Bytes thrown away for want of a marker, over this assembler's life.
+    discarded: usize,
 }
 
 impl LineAssembler {
@@ -192,42 +229,97 @@ impl LineAssembler {
     }
 
     /// The next whole frame, if the lines so far make one.
-    pub fn take(&mut self) -> Result<Option<Vec<u8>>, NlipError> {
-        while let Some(end) = self.stream.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.stream.drain(..=end).collect();
-            let mut line = &line[..end];
-            if line.last() == Some(&b'\r') {
-                line = &line[..line.len() - 1];
+    pub fn take(&mut self) -> Option<Vec<u8>> {
+        loop {
+            // ---- Line up on a marker ----
+            match marker_at(&self.stream, 0) {
+                Some(0) => {}
+                Some(at) => self.throw_away(at, "before the first marker"),
+                None => {
+                    // Nothing buffered begins a line. All of it goes, except a
+                    // marker that might be split across this push and the next.
+                    let keep = self.stream.len().min(START.len() - 1);
+                    self.throw_away(self.stream.len() - keep, "with no marker in them");
+                    return None;
+                }
             }
 
-            if line.starts_with(&START) {
-                self.base64.clear();
-                self.base64.extend_from_slice(&line[START.len()..]);
-            } else if line.starts_with(&CONT) {
-                if self.base64.is_empty() {
-                    return Err(NlipError::Orphan);
+            // ---- Find where the line ends ----
+            let newline = self.stream.iter().position(|byte| *byte == b'\n');
+            let next = marker_at(&self.stream, START.len());
+            let end = match (newline, next) {
+                (Some(end), None) => end,
+                (Some(end), Some(next)) if end < next => end,
+                // The line never ended and the one after it has already begun,
+                // so it is a line the device cut short. It cannot decode, and
+                // the frame it belonged to cannot either.
+                (_, Some(next)) => {
+                    self.base64.clear();
+                    self.throw_away(next, "of a line that never ended");
+                    continue;
                 }
-                self.base64.extend_from_slice(&line[CONT.len()..]);
+                // Still arriving.
+                (None, None) => return None,
+            };
+
+            // ---- Take it ----
+            let line: Vec<u8> = self.stream.drain(..=end).collect();
+            let wire = line.len();
+            let mut body = &line[..end];
+            if body.last() == Some(&b'\r') {
+                body = &body[..body.len() - 1];
+            }
+
+            if body.starts_with(&START) {
+                self.base64.clear();
+                self.base64.extend_from_slice(&body[START.len()..]);
             } else {
-                log::debug!("ignoring a line with no marker: {} bytes", line.len());
-                continue;
+                // A continuation, since the resync above landed on one of the
+                // two markers. With no frame open it is the tail of an exchange
+                // this assembler never saw the start of: normal after a
+                // reconnect, and nothing to continue.
+                if self.base64.is_empty() {
+                    self.count(wire, "of a continuation with no frame open");
+                    continue;
+                }
+                self.base64.extend_from_slice(&body[CONT.len()..]);
             }
 
             match self.complete() {
                 Ok(Some(frame)) => {
                     self.base64.clear();
-                    return Ok(Some(frame));
+                    return Some(frame);
                 }
                 Ok(None) => continue,
-                // A frame that will never decode is over. Keeping it would
-                // fail every line after it too.
+                // A frame that will never decode is over. Keeping it would fail
+                // every line after it too, and the reply that matters may well
+                // be the next thing on the wire.
                 Err(err) => {
+                    self.count(self.base64.len(), "of a frame that will not decode");
+                    log::debug!("the frame was dropped because {err}");
                     self.base64.clear();
-                    return Err(err);
+                    continue;
                 }
             }
         }
-        Ok(None)
+    }
+
+    /// Drops `count` bytes off the front of the stream, and says so.
+    fn throw_away(&mut self, count: usize, why: &str) {
+        if count == 0 {
+            return;
+        }
+        self.stream.drain(..count);
+        self.count(count, why);
+    }
+
+    /// Notes bytes that went nowhere, wherever they were held.
+    fn count(&mut self, bytes: usize, why: &str) {
+        self.discarded += bytes;
+        log::debug!(
+            "discarding {bytes} bytes {why}; {} in all so far",
+            self.discarded
+        );
     }
 
     /// Whether what has accumulated is a whole frame yet.
@@ -255,14 +347,33 @@ impl LineAssembler {
     }
 
     /// Throws away a frame half-arrived, for a caller starting again.
+    ///
+    /// The resync makes this an optimisation rather than a correctness fix —
+    /// stale bytes would be skipped anyway — but a new session should not start
+    /// by rediscovering that the last one left something behind. The discard
+    /// total is deliberately kept: it is a diagnostic for the whole run, not
+    /// for one session of it.
     pub fn reset(&mut self) {
+        let stale = self.stream.len() + self.base64.len();
         self.stream.clear();
         self.base64.clear();
+        if stale > 0 {
+            self.count(stale, "left over from an exchange that is over");
+        }
     }
 
     /// Bytes held back waiting for the rest of a frame.
     pub fn pending(&self) -> usize {
         self.stream.len() + self.base64.len()
+    }
+
+    /// Bytes this assembler has thrown away for want of a marker.
+    ///
+    /// Zero on a clean stream. Anything else is the host having joined
+    /// mid-exchange or having been sent something that is not a frame, which is
+    /// worth being able to say out loud after a transfer that went wrong.
+    pub fn discarded(&self) -> usize {
+        self.discarded
     }
 }
 
@@ -315,8 +426,8 @@ mod tests {
     fn that_same_line_decodes_back_to_the_frame() {
         let mut assembler = LineAssembler::default();
         assembler.push(b"\x06\x09AAsIAAABAAEAAKCvAQ==\n");
-        assert_eq!(assembler.take().unwrap(), Some(STATE_READ.to_vec()));
-        assert_eq!(assembler.take().unwrap(), None);
+        assert_eq!(assembler.take(), Some(STATE_READ.to_vec()));
+        assert_eq!(assembler.take(), None);
     }
 
     /// A 300-byte frame, `(i * 7 + 3) % 251`, run through Python's base64.
@@ -405,7 +516,7 @@ mod tests {
             let frame: Vec<u8> = (0..size).map(|byte| (byte % 251) as u8).collect();
             let mut assembler = LineAssembler::default();
             assembler.push(&encode_concat(&frame).unwrap());
-            assert_eq!(assembler.take().unwrap(), Some(frame), "{size} bytes");
+            assert_eq!(assembler.take(), Some(frame), "{size} bytes");
             assert_eq!(assembler.pending(), 0);
         }
     }
@@ -418,7 +529,7 @@ mod tests {
         let mut seen = None;
         for byte in &wire {
             assembler.push(&[*byte]);
-            if let Some(done) = assembler.take().unwrap() {
+            if let Some(done) = assembler.take() {
                 seen = Some(done);
             }
         }
@@ -434,9 +545,9 @@ mod tests {
 
         let mut assembler = LineAssembler::default();
         assembler.push(&wire);
-        assert_eq!(assembler.take().unwrap(), Some(first));
-        assert_eq!(assembler.take().unwrap(), Some(second));
-        assert_eq!(assembler.take().unwrap(), None);
+        assert_eq!(assembler.take(), Some(first));
+        assert_eq!(assembler.take(), Some(second));
+        assert_eq!(assembler.take(), None);
     }
 
     #[test]
@@ -446,7 +557,7 @@ mod tests {
         wire.extend(encode_concat(&frame).unwrap());
         let mut assembler = LineAssembler::default();
         assembler.push(&wire);
-        assert_eq!(assembler.take().unwrap(), Some(frame));
+        assert_eq!(assembler.take(), Some(frame));
     }
 
     #[test]
@@ -456,16 +567,25 @@ mod tests {
         let mut assembler = LineAssembler::default();
         // The first line of one frame, then a whole other frame.
         assembler.push(&lines[0]);
-        assert_eq!(assembler.take().unwrap(), None);
+        assert_eq!(assembler.take(), None);
         assembler.push(&encode_concat(b"short").unwrap());
-        assert_eq!(assembler.take().unwrap(), Some(b"short".to_vec()));
+        assert_eq!(assembler.take(), Some(b"short".to_vec()));
     }
 
     #[test]
-    fn a_continuation_with_nothing_to_continue_is_an_error() {
+    fn a_continuation_with_nothing_to_continue_is_dropped_rather_than_failed() {
+        // Joining a stream mid-frame is the ordinary case this has to survive,
+        // not an error: it is what a fresh session sees while the previous
+        // exchange's tail is still coming out of the bootloader's rings.
         let mut assembler = LineAssembler::default();
         assembler.push(b"\x04\x14AAAA\n");
-        assert_eq!(assembler.take(), Err(NlipError::Orphan));
+        assert_eq!(assembler.take(), None);
+        // The whole line, markers and newline included: what came off the wire.
+        assert_eq!(assembler.discarded(), 7);
+
+        // And the frame behind it still arrives.
+        assembler.push(&encode_concat(b"after").unwrap());
+        assert_eq!(assembler.take(), Some(b"after".to_vec()));
     }
 
     #[test]
@@ -510,10 +630,10 @@ mod tests {
         let mut assembler = LineAssembler::default();
         assembler.push(&wire[..wire.len() - 41]);
         assembler.push(b"\n");
-        assert_eq!(assembler.take().unwrap(), None);
+        assert_eq!(assembler.take(), None);
 
         assembler.push(&encode_concat(b"after").unwrap());
-        assert_eq!(assembler.take().unwrap(), Some(b"after".to_vec()));
+        assert_eq!(assembler.take(), Some(b"after".to_vec()));
     }
 
     #[test]
@@ -526,13 +646,170 @@ mod tests {
         line.extend_from_slice(STANDARD.encode(&packet).as_bytes());
         line.push(b'\n');
         assembler.push(&line);
-        assert!(matches!(
-            assembler.take(),
-            Err(NlipError::LengthMismatch { .. })
-        ));
+        assert_eq!(assembler.take(), None);
+        assert!(assembler.discarded() > 0);
 
         assembler.push(&encode_concat(b"after").unwrap());
-        assert_eq!(assembler.take().unwrap(), Some(b"after".to_vec()));
+        assert_eq!(assembler.take(), Some(b"after".to_vec()));
+    }
+
+    // ---- Joining the stream part-way through ---------------------------
+
+    /// What the bootloader had waiting on the endpoint after a fresh BEGIN and
+    /// SELECT, before the host had sent anything: the tail of the exchange
+    /// before, cut off wherever the rings happened to hold it.
+    ///
+    /// Deliberately ends mid-line, with no newline. That is the case that broke
+    /// it: splitting on newlines glues this onto the front of the next line, so
+    /// the real reply's `START` ends up in the middle of a line that has no
+    /// marker of its own and the whole thing is dropped.
+    fn stale_tail() -> Vec<u8> {
+        let previous = encode_concat(&long_frame()).unwrap();
+        previous[120..391].to_vec()
+    }
+
+    #[test]
+    fn a_stale_tail_in_front_of_a_reply_is_skipped_and_the_reply_still_arrives() {
+        let frame: Vec<u8> = (0..80u8).collect();
+        let mut wire = stale_tail();
+        assert!(!wire.ends_with(b"\n"), "the tail has to end mid-line");
+        wire.extend(encode_concat(&frame).unwrap());
+
+        let mut assembler = LineAssembler::default();
+        assembler.push(&wire);
+        assert_eq!(assembler.take(), Some(frame));
+        assert!(assembler.discarded() > 0);
+        assert_eq!(assembler.pending(), 0);
+    }
+
+    #[test]
+    fn a_stale_tail_arriving_in_usb_sized_pieces_is_skipped_just_the_same() {
+        // The tail and the reply do not arrive as one buffer on a real link,
+        // and a marker landing across a push boundary must not be missed.
+        let frame: Vec<u8> = (0..200u8).collect();
+        let mut wire = stale_tail();
+        wire.extend(encode_concat(&frame).unwrap());
+
+        let mut assembler = LineAssembler::default();
+        let mut seen = None;
+        for packet in wire.chunks(64) {
+            assembler.push(packet);
+            if let Some(done) = assembler.take() {
+                seen = Some(done);
+            }
+        }
+        assert_eq!(seen, Some(frame));
+    }
+
+    #[test]
+    fn a_marker_split_across_two_pushes_is_still_found() {
+        // One byte at a time is the worst case: the resync must hold back a
+        // lone marker byte rather than discarding it as unmarked noise.
+        let frame: Vec<u8> = (0..30u8).collect();
+        let mut wire = b"noise with no marker in it".to_vec();
+        wire.extend(encode_concat(&frame).unwrap());
+
+        let mut assembler = LineAssembler::default();
+        let mut seen = None;
+        for byte in &wire {
+            assembler.push(&[*byte]);
+            if let Some(done) = assembler.take() {
+                seen = Some(done);
+            }
+        }
+        assert_eq!(seen, Some(frame));
+    }
+
+    #[test]
+    fn a_corrupt_line_between_two_good_frames_costs_only_itself() {
+        let first: Vec<u8> = (0..40u8).collect();
+        let second: Vec<u8> = (100..180u8).collect();
+
+        // A frame whose checksum will not come out, between two that will.
+        let mut broken = packet(&(0..50u8).collect::<Vec<_>>()).unwrap();
+        let last = broken.len() - 1;
+        broken[last] ^= 0xff;
+        let mut corrupt = START.to_vec();
+        corrupt.extend_from_slice(STANDARD.encode(&broken).as_bytes());
+        corrupt.push(b'\n');
+
+        let mut wire = encode_concat(&first).unwrap();
+        wire.extend(corrupt);
+        wire.extend(encode_concat(&second).unwrap());
+
+        let mut assembler = LineAssembler::default();
+        assembler.push(&wire);
+        assert_eq!(assembler.take(), Some(first));
+        assert_eq!(assembler.take(), Some(second));
+        assert_eq!(assembler.take(), None);
+    }
+
+    #[test]
+    fn a_line_that_never_ended_does_not_swallow_the_frame_behind_it() {
+        // A line the device cut short, with the next frame's marker arriving
+        // before its newline ever did.
+        let frame: Vec<u8> = (0..60u8).collect();
+        let mut wire = b"\x06\x09AAsIAAABAAEAAKCv".to_vec();
+        wire.extend(encode_concat(&frame).unwrap());
+
+        let mut assembler = LineAssembler::default();
+        assembler.push(&wire);
+        assert_eq!(assembler.take(), Some(frame));
+        assert_eq!(assembler.discarded(), 18);
+    }
+
+    #[test]
+    fn a_clean_stream_discards_nothing_at_all() {
+        // The property that keeps the resync honest: it must cost nothing on a
+        // link behaving itself, or it is hiding something rather than surviving it.
+        for size in [0usize, 1, 182, 183, 1000, 5000] {
+            let frame: Vec<u8> = (0..size).map(|byte| (byte % 251) as u8).collect();
+            let mut assembler = LineAssembler::default();
+            assembler.push(&encode_concat(&frame).unwrap());
+            assert_eq!(assembler.take(), Some(frame), "{size} bytes");
+            assert_eq!(assembler.discarded(), 0, "{size} bytes");
+            assert_eq!(assembler.pending(), 0, "{size} bytes");
+        }
+    }
+
+    #[test]
+    fn a_reset_forgets_a_frame_half_arrived_and_counts_what_it_dropped() {
+        let lines = encode(&long_frame()).unwrap();
+        let mut assembler = LineAssembler::default();
+        assembler.push(&lines[0]);
+        assert_eq!(assembler.take(), None);
+        assert!(assembler.pending() > 0);
+
+        assembler.reset();
+        assert_eq!(assembler.pending(), 0);
+        assert_eq!(assembler.discarded(), 248);
+
+        // And what follows is read as a frame of its own rather than as the
+        // continuation of the one that was abandoned.
+        assembler.push(&encode_concat(b"next").unwrap());
+        assert_eq!(assembler.take(), Some(b"next".to_vec()));
+    }
+
+    #[test]
+    fn a_reset_on_a_clean_assembler_is_free() {
+        let mut assembler = LineAssembler::default();
+        assembler.reset();
+        assembler.push(&encode_concat(b"clean").unwrap());
+        assert_eq!(assembler.take(), Some(b"clean".to_vec()));
+        assert_eq!(assembler.discarded(), 0);
+    }
+
+    #[test]
+    fn nothing_but_noise_is_not_accumulated_for_ever() {
+        // A stream carrying no markers at all must not grow the buffer without
+        // limit: all but a possible split marker goes on every look.
+        let mut assembler = LineAssembler::default();
+        for _ in 0..100 {
+            assembler.push(&[0x41; 512]);
+            assert_eq!(assembler.take(), None);
+            assert!(assembler.pending() <= START.len(), "{}", assembler.pending());
+        }
+        assert!(assembler.discarded() >= 100 * 512 - START.len());
     }
 
     #[test]

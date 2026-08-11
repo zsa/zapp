@@ -250,7 +250,7 @@ impl IgnitionLink for LoopbackLink {
                 named => named,
             };
             self.lines.push(&payload);
-            while let Some(frame) = self.lines.take()? {
+            while let Some(frame) = self.lines.take() {
                 self.deliver(target, &frame);
             }
         }

@@ -40,14 +40,26 @@ impl<L: IgnitionLink> Wired<L> {
         log::debug!(
             "{target:?}: {payload_budget} bytes per message is {frame_budget} bytes of frame"
         );
-        Self {
+        let mut wired = Self {
             ignition,
             target,
             frame_budget,
             lines: nlip::LineAssembler::default(),
             messages: pipe::Reassembler::default(),
             events: Vec::new(),
-        }
+        };
+        // Both assemblers are already empty here. Doing it anyway is what makes
+        // "a transport starts from a known state" a property of the type rather
+        // than of how it happens to be built today.
+        wired.reset();
+        wired
+    }
+
+    /// Forgets everything half-arrived, on both layers.
+    fn reset(&mut self) {
+        self.messages.reset();
+        self.lines.reset();
+        self.events.clear();
     }
 
     /// A frame as one message: every line run together.
@@ -97,7 +109,11 @@ impl<L: IgnitionLink> Wired<L> {
             match self.messages.take() {
                 Ok(Some(Inbound::Data { payload, .. })) => {
                     self.lines.push(&payload);
-                    if let Some(frame) = self.lines.take()? {
+                    // Cannot fail: everything that is not a whole frame is
+                    // skipped and counted rather than reported, because a
+                    // stream you can join anywhere has no such thing as a
+                    // byte the caller could act on.
+                    if let Some(frame) = self.lines.take() {
                         return Ok(Some(frame));
                     }
                 }
@@ -159,6 +175,26 @@ macro_rules! transport {
             /// What the bridge has reported, oldest first.
             pub fn events(&self) -> &[Event] {
                 &self.inner.events
+            }
+
+            /// Forgets a frame half-arrived and everything reported so far.
+            ///
+            /// For a caller that has just pointed the bridge somewhere else:
+            /// whatever is still buffered belongs to the half that was
+            /// selected before, and the events belong to that exchange too.
+            /// A transport built fresh per half — which is what both callers
+            /// in this workspace do — gets this from its constructor.
+            pub fn reset(&mut self) {
+                self.inner.reset();
+            }
+
+            /// Bytes thrown away for want of a marker.
+            ///
+            /// Non-zero after joining a stream mid-exchange, which is worth
+            /// being able to report when a transfer times out on a link that
+            /// looks otherwise healthy.
+            pub fn discarded(&self) -> usize {
+                self.inner.lines.discarded()
             }
 
             pub fn into_ignition(self) -> Ignition<L> {
@@ -340,6 +376,39 @@ mod tests {
             transport.read(Duration::from_millis(50)).unwrap(),
             Some(frame)
         );
+    }
+
+    /// The hardware failure, end to end through the transport.
+    ///
+    /// After a fresh BEGIN and SELECT, ignition's rings still hold the tail of
+    /// the exchange before and push it out before the host has sent anything.
+    /// Read as the start of a line, that tail swallows the real reply's first
+    /// line and the transfer times out on a link that is working perfectly.
+    #[test]
+    fn a_reply_behind_the_previous_exchanges_tail_still_comes_back() {
+        let previous: Vec<u8> = (0..300u32).map(|byte| byte as u8).collect();
+        let previous = nlip::encode_concat(&previous).unwrap();
+        // Cut mid-line, the way a ring buffer holds whatever it happens to.
+        let stale = &previous[120..391];
+        assert!(!stale.ends_with(b"\n"));
+        let frame = b"the reply that matters".to_vec();
+
+        let mut inbound = VecDeque::new();
+        inbound.push_back(pipe::data(Target::Left, stale).unwrap());
+        inbound.push_back(pipe::data(Target::Left, &nlip::encode_concat(&frame).unwrap()).unwrap());
+
+        let mut transport = LeftTransport::with_payload_budget(
+            Ignition::new(Wire {
+                inbound,
+                ..Wire::default()
+            }),
+            1024,
+        );
+        assert_eq!(
+            transport.read(Duration::from_millis(50)).unwrap(),
+            Some(frame)
+        );
+        assert!(transport.discarded() > 0, "the tail was not counted");
     }
 
     #[test]
