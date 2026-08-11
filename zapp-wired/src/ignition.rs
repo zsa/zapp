@@ -281,6 +281,18 @@ impl<L: IgnitionLink> Ignition<L> {
         self.link.control_out(REQ_RESET_TARGET, half_value(half))
     }
 
+    /// Restarts the STM32 itself, so it leaves the bootloader for the keyboard
+    /// firmware.
+    ///
+    /// The bootloader defers the reset until the request's status stage has
+    /// gone out, so this returns before the device disappears — but only just,
+    /// and the device is gone from the bus immediately afterwards. Treat a
+    /// failure here as the reset having happened rather than not.
+    pub fn reset_self(&mut self) -> Result<(), WiredError> {
+        log::debug!("RESET_TARGET self");
+        self.link.control_out(REQ_RESET_TARGET, 0)
+    }
+
     /// What the bootloader thinks is going on.
     pub fn status(&mut self) -> Result<Status, WiredError> {
         let bytes = self.link.control_in(REQ_STATUS, 0, STATUS_LEN)?;

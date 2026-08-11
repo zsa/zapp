@@ -75,9 +75,22 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
             if let Err(err) = ignition.end() {
                 log::debug!("could not end the session: {err}");
             }
+
+            // Leave a keyboard, not a bootloader. Both halves are back on
+            // their own firmware by this point, and the STM32 is the only
+            // thing still sitting in recovery — it has no reason to, and
+            // otherwise the update ends with the board needing a power cycle
+            // before it types anything. The bootloader answers this and then
+            // reboots, so the device vanishing is the success case.
+            match ignition.reset_self() {
+                Ok(()) => {}
+                Err(err) => log::debug!("the bootloader went down with the reset: {err}"),
+            }
+
             println!();
             println!(
-                "Done. Both halves are running {}.",
+                "Done. Both halves are running {}, and the keyboard has restarted \
+                 on its own firmware.",
                 named(&bundle.header.build_version)
             );
             Ok(())
