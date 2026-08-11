@@ -299,6 +299,7 @@ impl<L: IgnitionLink> Ignition<L> {
 
     /// One pipe message onto the bulk endpoint.
     pub fn send(&mut self, target: Target, payload: &[u8]) -> Result<(), WiredError> {
+        log::trace!("-> {target:?} {} bytes: {:?}", payload.len(), Preview(payload));
         self.link.bulk_out(&pipe::data(target, payload)?)
     }
 
@@ -309,7 +310,30 @@ impl<L: IgnitionLink> Ignition<L> {
 
     /// Whatever has come back, if anything has by `timeout`.
     pub fn receive(&mut self, timeout: Duration) -> Result<Vec<u8>, WiredError> {
-        self.link.bulk_in(timeout)
+        let got = self.link.bulk_in(timeout)?;
+        if !got.is_empty() {
+            log::trace!("<- {} bytes: {:?}", got.len(), Preview(&got));
+        }
+        Ok(got)
+    }
+}
+
+/// Renders the front of a buffer as text where it is printable, so a trace
+/// shows an NLIP line as a line rather than as hex.
+struct Preview<'a>(&'a [u8]);
+
+impl std::fmt::Debug for Preview<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0.iter().take(48) {
+            match byte {
+                0x20..=0x7e => write!(formatter, "{}", *byte as char)?,
+                _ => write!(formatter, "\\x{byte:02x}")?,
+            }
+        }
+        if self.0.len() > 48 {
+            write!(formatter, "…")?;
+        }
+        Ok(())
     }
 }
 
