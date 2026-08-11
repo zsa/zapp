@@ -846,23 +846,77 @@ impl Steps {
 /// ignition answers with in the gap `BEGIN` opens. Nothing above here has to
 /// know that, which is the point of it being the link's own behaviour.
 fn open() -> Result<Retrying<UsbLink>> {
+    open_waiting(WAIT_FOR_BOOTLOADER)
+}
+
+/// How long to wait for someone to press the reset button.
+///
+/// Long enough to walk over to the keyboard, because that is the actual task.
+const WAIT_FOR_BOOTLOADER: Duration = Duration::from_secs(60);
+
+/// Finds the bootloader, waiting for it to show up rather than giving up.
+///
+/// The keyboard is nearly always running its own firmware when someone decides
+/// to update it, so "not plugged in" is the normal starting state, not an
+/// error. Waiting matches what flashing a QMK image already does and turns the
+/// whole thing into one command and one button press.
+fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
     match UsbLink::open() {
         Ok(link) => {
             println!("Found the ZSA bootloader over USB.");
-            Ok(link)
+            return Ok(link);
         }
-        Err(WiredError::NoBootloader) => bail!(
-            "No ZSA bootloader is plugged in.\n\n{}",
-            wrap(
-                "Press the reset button on the left half: that is what puts the STM32 into \
-                 ignition, and ignition is what this whole path goes through. The keyboard \
-                 should come back as a USB device within a second or two, and `zapp devices` \
-                 will list it. A keyboard running its own firmware does not serve any of \
-                 this."
-            )
-        ),
-        Err(err) => Err(err).context("Could not open the ZSA bootloader"),
+        Err(WiredError::NoBootloader) => {}
+        Err(err) => return Err(err).context("Could not open the ZSA bootloader"),
     }
+
+    let spinner = new_spinner(
+        "Waiting for the bootloader — press the reset button on the left half of the keyboard",
+    );
+    let deadline = Instant::now() + limit;
+
+    loop {
+        match UsbLink::open() {
+            Ok(link) => {
+                spinner.finish_and_clear();
+                println!("Found the ZSA bootloader over USB.");
+                return Ok(link);
+            }
+            Err(WiredError::NoBootloader) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(WiredError::NoBootloader) => {
+                spinner.finish_and_clear();
+                bail!(
+                    "No ZSA bootloader appeared in {} seconds.\n\n{}",
+                    limit.as_secs(),
+                    wrap(
+                        "Pressing the reset button on the left half is what puts the STM32 into \
+                         ignition, and ignition is what this whole path goes through. A keyboard \
+                         running its own firmware does not serve any of it. `zapp devices` lists \
+                         what is plugged in."
+                    )
+                )
+            }
+            Err(err) => {
+                spinner.finish_and_clear();
+                return Err(err).context("Could not open the ZSA bootloader");
+            }
+        }
+    }
+}
+
+/// A spinner that says what is being waited for.
+fn new_spinner(message: &str) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message(message.to_string());
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner
 }
 
 /// One link, held by the control path and by a transport at the same time.

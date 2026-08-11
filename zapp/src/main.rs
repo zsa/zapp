@@ -1,6 +1,8 @@
 mod nrf_wired;
 mod zsab;
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,16 +37,20 @@ enum Commands {
     /// Flash firmware from a local file or Oryx URL
     #[command(
         long_about = "Flash firmware from a local file or Oryx URL.\n\n\
-            Supports .bin (DFU) and .hex (Intel HEX) firmware files, as well as \
-            Oryx layout URLs. When given a URL, the firmware is downloaded and \
-            flashed directly.",
+            Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
+            bundles carrying both wireless halves, and Oryx layout URLs. When \
+            given a URL, the firmware is downloaded and flashed directly.\n\n\
+            Whichever it is, plug the keyboard in and press the reset button on \
+            the left half when asked: this waits for the bootloader to appear \
+            rather than expecting it to be there already.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
+            zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
     Flash {
-        /// Path to firmware file (.bin or .hex), or an Oryx URL.
+        /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
         firmware: String,
     },
     /// Check Oryx for updates on your layout and flash if available
@@ -717,9 +723,26 @@ fn describe_usb(device: &UsbDevice) -> String {
 }
 
 fn cmd_flash_file(path: &PathBuf) -> Result<()> {
+    // A bundle carries both halves' wireless firmware and goes over the cable
+    // through the bootloader; everything else is a keyboard image for the
+    // STM32. Told apart by what the file says it is rather than by its name,
+    // so a renamed bundle still does the right thing instead of failing deep
+    // inside the DFU loader.
+    if is_bundle(path) {
+        return nrf_wired::flash(path, false, Duration::from_secs(15));
+    }
+
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
     print_firmware_info(&fw);
     wait_and_flash(&fw)
+}
+
+/// Whether the file leads with the .zsab magic.
+fn is_bundle(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok_and(|()| &magic == b"ZSAB")
 }
 
 /// Download a revision's firmware, showing a spinner while it transfers.
