@@ -87,12 +87,7 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
                 Err(err) => log::debug!("the bootloader went down with the reset: {err}"),
             }
 
-            println!();
-            println!(
-                "Done. Both halves are running {}, and the keyboard has restarted \
-                 on its own firmware.",
-                named(&bundle.header.build_version)
-            );
+            println!("Done! Both halves updated and the keyboard restarted.");
             Ok(())
         }
         Err(err) => {
@@ -211,12 +206,11 @@ fn run<L: IgnitionLink + 'static>(
         .begin(Halves::BOTH)
         .context("Could not open a session on the bootloader")?;
     let status = wait_active(ignition)?;
-    println!(
-        "  active · TRRS at {} kHz · {} bytes per message · pipe v{}",
-        status.i2c_khz, status.max_payload, status.proto_version
-    );
-    println!(
-        "  left {} · right {}",
+    log::debug!(
+        "session active: TRRS {} kHz, {} bytes per message, pipe v{}, left {}, right {}",
+        status.i2c_khz,
+        status.max_payload,
+        status.proto_version,
         running(status.left_state),
         running(status.right_state)
     );
@@ -258,7 +252,7 @@ fn write_half<L: IgnitionLink + 'static>(
     report_slot(&before);
 
     if installed(&before, &wanted) && !force {
-        println!("  already carrying this image — not written again");
+        log::debug!("{half}: already carrying this image, not written again");
     } else {
         // Refuse to go backwards. A bundle built from a stale directory writes
         // an old half onto a keyboard whose other half has moved on, and two
@@ -290,8 +284,8 @@ fn write_half<L: IgnitionLink + 'static>(
             .image_state()
             .with_context(|| format!("Could not read the {half} half's image state back"))?;
         landed(&after, &wanted, half)?;
-        println!(
-            "  {} bytes written · slot 0 now carries {}",
+        log::debug!(
+            "{half}: {} bytes written, slot 0 now carries {}",
             image.len(),
             short(&wanted)
         );
@@ -306,7 +300,7 @@ fn write_half<L: IgnitionLink + 'static>(
             ignition
                 .release_md()
                 .context("Could not release the left half's MD pin")?;
-            println!("  released the MD pin, so it boots its application");
+            log::debug!("released the MD pin so the left boots its application");
             ignition
                 .reset_target(half)
                 .context("Could not restart the left half")?;
@@ -332,7 +326,7 @@ fn write_half<L: IgnitionLink + 'static>(
                 .context("Could not point the bridge away from the right half")?;
         }
     }
-    println!("  restarting");
+    log::debug!("{half}: restarting");
     Ok(())
 }
 
@@ -407,14 +401,14 @@ fn erase_storage(client: &mut SmpClient) -> Result<()> {
 
     match cbor::decode(&reply).and_then(|value| proto::check_rc(&value, BASIC_GROUP)) {
         Ok(()) => {
-            println!("  erased the settings partition");
+            log::debug!("erased the settings partition");
             Ok(())
         }
         Err(SmpError::Remote {
             rc: MGMT_ERR_ENOTSUP,
             ..
         }) => {
-            println!("  this MCUboot has no storage-erase command; leaving the settings alone");
+            log::debug!("this MCUboot has no storage-erase command; leaving the settings alone");
             Ok(())
         }
         Err(err) => Err(err).context("Could not erase the right half's settings partition"),
@@ -430,12 +424,13 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
             .unwrap()
             .progress_chars("█▓░"),
     );
+    let label = format!("{} half", titled(half));
     let result = client.upload(0, image, &|progress| match progress {
         FlashProgress::Writing { bytes_written, .. } => {
             bar.set_position(bytes_written as u64);
-            bar.set_message("Uploading...");
+            bar.set_message(label.clone());
         }
-        FlashProgress::Complete => bar.finish_with_message("Done"),
+        FlashProgress::Complete => bar.finish_with_message(label.clone()),
         _ => {}
     });
     bar.finish_and_clear();
@@ -528,14 +523,14 @@ fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
 fn report_slot(slots: &[ImageSlot]) {
     match primary(slots) {
         Some(slot) if slot.hash.is_empty() => {
-            println!("  slot 0 is empty or unverifiable")
+            log::debug!("slot 0 is empty or unverifiable")
         }
-        Some(slot) => println!(
-            "  slot 0 carries {} ({})",
+        Some(slot) => log::debug!(
+            "slot 0 carries {} ({})",
             short(&slot.hash),
             named(&slot.version)
         ),
-        None => println!("  it reports no primary slot"),
+        None => log::debug!("it reports no primary slot"),
     }
 }
 
@@ -707,33 +702,23 @@ fn event_advice(err: &anyhow::Error) -> Option<String> {
 // Printing
 // ---------------------------------------------------------------------------
 
-fn announce(bundle: &Bundle, path: &Path, len: usize) {
+fn announce(bundle: &Bundle, _path: &Path, _len: usize) {
+    let sizes: Vec<String> = [Half::Left, Half::Right]
+        .iter()
+        .map(|half| format!("{} {} bytes", half.as_str(), bundle.image(*half).len()))
+        .collect();
     println!(
-        "Bundle {} · {} · {len} bytes",
-        path.display(),
-        named(&bundle.header.build_version)
+        "Bundle loaded: {} ({})",
+        named(&bundle.header.build_version),
+        sizes.join(" + ")
     );
     for half in [Half::Left, Half::Right] {
-        let blob = bundle.image(half);
-        let version = image::inspect(blob)
-            .map(|info| info.version)
-            .unwrap_or_else(|| "no MCUboot header".to_string());
-        println!(
-            "  {:<5}  v{version} · {} bytes · {}",
-            half.as_str(),
-            blob.len(),
-            bundle
-                .hash(half)
-                .map(|hash| short(&hash))
-                .unwrap_or_else(|| "no hash".to_string())
-        );
+        if let Some(info) = image::inspect(bundle.image(half)) {
+            let named_hash = bundle.hash(half).map(|hash| short(&hash)).unwrap_or_default();
+            log::debug!("{half}: v{} {named_hash}", info.version);
+        }
     }
-    match bundle.header.key_fingerprint {
-        // Nothing stamps this yet, so every bundle built today carries zero and
-        // it reads as "unknown" rather than as a mismatch.
-        0 => println!("  radio key: not stamped, so not checked"),
-        fingerprint => println!("  radio key: {fingerprint:08x}"),
-    }
+    log::debug!("radio key fingerprint {:08x}", bundle.header.key_fingerprint);
 }
 
 fn print_status(status: &Status) {
@@ -829,10 +814,12 @@ struct Steps {
 }
 
 impl Steps {
+    /// The steps are the progress bar's labels now rather than headings of
+    /// their own: flashing a keyboard image prints four lines in total and
+    /// this should not look like a different program.
     fn announce(&mut self, label: &str) {
         self.done += 1;
-        println!();
-        println!("Step {}/{} · {label}", self.done, self.total);
+        log::debug!("step {}/{}: {label}", self.done, self.total);
     }
 }
 
@@ -863,7 +850,7 @@ const WAIT_FOR_BOOTLOADER: Duration = Duration::from_secs(60);
 fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
     match UsbLink::open() {
         Ok(link) => {
-            println!("Found the ZSA bootloader over USB.");
+            log::debug!("found the ZSA bootloader over USB");
             return Ok(link);
         }
         Err(WiredError::NoBootloader) => {}
@@ -879,7 +866,7 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
         match UsbLink::open() {
             Ok(link) => {
                 spinner.finish_and_clear();
-                println!("Found the ZSA bootloader over USB.");
+                log::debug!("found the ZSA bootloader over USB");
                 return Ok(link);
             }
             Err(WiredError::NoBootloader) if Instant::now() < deadline => {
