@@ -87,7 +87,7 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
                 Err(err) => log::debug!("the bootloader went down with the reset: {err}"),
             }
 
-            println!("Done! Both halves updated and the keyboard restarted.");
+            println!("Done!");
             Ok(())
         }
         Err(err) => {
@@ -420,17 +420,20 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
     let bar = ProgressBar::new(image.len() as u64);
     bar.set_style(
         ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
+            // The half's name rides next to the bolt rather than trailing the
+            // bar: it says what is being written, so it belongs at the front,
+            // and padding it keeps the two bars lined up under each other.
+            .template("⚡ {msg:<5} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec}")
             .unwrap()
             .progress_chars("█▓░"),
     );
-    let label = format!("{} half", titled(half));
+    let label = titled(half);
     let result = client.upload(0, image, &|progress| match progress {
         FlashProgress::Writing { bytes_written, .. } => {
             bar.set_position(bytes_written as u64);
-            bar.set_message(label.clone());
+            bar.set_message(label);
         }
-        FlashProgress::Complete => bar.finish_with_message(label.clone()),
+        FlashProgress::Complete => bar.finish_with_message(label),
         _ => {}
     });
     bar.finish_and_clear();
