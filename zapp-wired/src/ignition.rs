@@ -338,13 +338,17 @@ impl std::fmt::Debug for Preview<'_> {
 }
 
 /// How many times a control transfer is tried before its stall is believed.
-pub const CONTROL_ATTEMPTS: u32 = 4;
+pub const CONTROL_ATTEMPTS: u32 = 7;
 
-/// How long to leave between those tries.
+/// How long to leave before trying again, doubling each time.
 ///
-/// The window this exists to cross is microseconds wide, so this is three
-/// orders of magnitude more than it needs to be, and four attempts still add
-/// under 10 ms to a request that turns out to be genuinely refused.
+/// Measured rather than guessed: the window after `BEGIN` was around 7 ms on
+/// the bench, and it moves with whatever the bootloader does before its main
+/// loop comes round again. A fixed 2 ms four times over covered 6 ms and was
+/// therefore already marginal — the failure that motivated this was the window
+/// growing slightly and outrunning it. Doubling reaches ~126 ms in total,
+/// which is far past anything the entry sequence does, while a request that is
+/// genuinely refused still fails in well under a fifth of a second.
 pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
 
 /// A link that submits a stalled control transfer again.
@@ -410,20 +414,25 @@ impl<L: IgnitionLink> Retrying<L> {
         request: u8,
         mut transfer: impl FnMut(&mut L) -> Result<T, WiredError>,
     ) -> Result<T, WiredError> {
+        let mut backoff = self.backoff;
         for attempt in 1..self.attempts {
             match transfer(&mut self.inner) {
                 Err(WiredError::Stalled { .. }) => {
                     log::debug!(
                         "vendor request {request:#04x} stalled on attempt {attempt} of {}; \
-                         submitting it again in {:?}",
+                         submitting it again in {backoff:?}",
                         self.attempts,
-                        self.backoff
                     );
                     // Not the kind of wait this crate got rid of: nothing is
                     // being given time to happen, the bus is being let go of
                     // for long enough that the device's control endpoint has
                     // drained the transfer it is still finishing.
-                    std::thread::sleep(self.backoff);
+                    std::thread::sleep(backoff);
+                    // Doubling, because the window is not a fixed length: it
+                    // is however long the bootloader takes to come round, and
+                    // a policy that only covers the window it was measured
+                    // against fails the moment the firmware does slightly more.
+                    backoff = backoff.saturating_mul(2);
                 }
                 settled => return settled,
             }
