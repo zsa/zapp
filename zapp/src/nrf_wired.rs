@@ -270,18 +270,32 @@ fn write_half<L: IgnitionLink + 'static>(
         );
     }
 
-    // Both halves are reset whether or not they were written: ignition's BEGIN
-    // put them in their bootloaders, and END does not take them out again.
-    if half == Half::Left {
-        // Or the left comes straight back into MCUboot, MD still held.
-        ignition
-            .release_md()
-            .context("Could not release the left half's MD pin")?;
-        println!("  released the MD pin, so it boots its application");
+    // Both halves are restarted whether or not they were written: ignition's
+    // BEGIN put them in their bootloaders, and END does not take them out.
+    // How they leave differs, because only the left has a reset line.
+    match half {
+        Half::Left => {
+            // Or it comes straight back into MCUboot, MD still held.
+            ignition
+                .release_md()
+                .context("Could not release the left half's MD pin")?;
+            println!("  released the MD pin, so it boots its application");
+            ignition
+                .reset_target(half)
+                .context("Could not restart the left half")?;
+        }
+        Half::Right => {
+            // RESET_TARGET is the wrong instrument here: with the MCP23018
+            // path gone the STM32 cannot reach the right half's reset line,
+            // so it asks the right's *application* to reboot into MCUboot —
+            // the wrong direction, and unanswerable anyway while MCUboot is
+            // what is running. Leaving serial recovery is MCUboot's own job,
+            // and its SMP reset is how you ask.
+            client
+                .reset()
+                .context("Could not restart the right half out of MCUboot")?;
+        }
     }
-    ignition
-        .reset_target(half)
-        .with_context(|| format!("Could not restart the {half} half"))?;
     println!("  restarting");
     Ok(())
 }
@@ -825,7 +839,7 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zapp_smp::img;
+    use zapp_smp::{client, img};
     use zapp_wired::ignition;
     use zapp_wired::loopback::{LoopbackDevice, LoopbackLink};
     use zapp_wired::pipe;
@@ -984,13 +998,15 @@ mod tests {
             vec![
                 (ignition::REQ_BEGIN, Halves::BOTH.bits()),
                 (ignition::REQ_SELECT, 2),
-                (ignition::REQ_RESET_TARGET, 2),
                 (ignition::REQ_SELECT, 1),
                 (ignition::REQ_RELEASE_MD, 0),
                 (ignition::REQ_RESET_TARGET, 1),
                 (ignition::REQ_END, 0),
             ]
         );
+        // Only the left is reset through ignition. The right has no reset line
+        // the STM32 can reach, so it leaves recovery by its own SMP reset —
+        // asserted in a_right_half_is_restarted_by_its_own_smp_reset.
     }
 
     #[test]
@@ -1003,12 +1019,36 @@ mod tests {
         result.unwrap();
 
         assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
-        for half in [1u16, 2] {
-            assert!(
-                control.contains(&(ignition::REQ_RESET_TARGET, half)),
-                "{control:?}"
-            );
-        }
+        assert!(
+            control.contains(&(ignition::REQ_RESET_TARGET, 1)),
+            "the left half was not reset: {control:?}"
+        );
+        assert_eq!(
+            count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
+            1,
+            "the right half was not reset out of MCUboot"
+        );
+    }
+
+    #[test]
+    fn a_right_half_is_restarted_by_its_own_smp_reset_not_by_reset_target() {
+        // RESET_TARGET on the right asks its *application* to reboot into
+        // MCUboot: the wrong direction, and unanswerable while MCUboot is
+        // what is running, so a right half restarted that way is left sitting
+        // in recovery. It has to be MCUboot's own reset.
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let (result, control, device) = flash_loopback(&blob);
+        result.unwrap();
+
+        assert!(
+            !control.contains(&(ignition::REQ_RESET_TARGET, 2)),
+            "the right half was sent RESET_TARGET: {control:?}"
+        );
+        assert_eq!(
+            count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
+            1,
+            "expected exactly one SMP reset, for the right half"
+        );
     }
 
     #[test]
