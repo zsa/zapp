@@ -308,6 +308,15 @@ fn write_half<L: IgnitionLink + 'static>(
             client
                 .reset()
                 .context("Could not restart the right half out of MCUboot")?;
+
+            // Point the bridge away before the reboot finishes. Ignition polls
+            // whichever half is selected, so leaving it on the right means it
+            // keeps addressing a mailbox on a chip that is coming back up —
+            // one of those polls lands mid-reboot and costs a bus recovery,
+            // reliably one per update. The left is where the run goes next.
+            ignition
+                .select(Half::Left)
+                .context("Could not point the bridge away from the right half")?;
         }
     }
     println!("  restarting");
@@ -1059,8 +1068,10 @@ mod tests {
             .filter(|(request, _)| *request == ignition::REQ_SELECT)
             .map(|(_, value)| *value)
             .collect();
-        // 2 is right and 1 is left, in the order the requests take them.
-        assert_eq!(selects, vec![2, 1]);
+        // 2 is right, then 1 twice: the bridge is pointed away from the right
+        // as soon as it has been told to reboot, and then at the left again as
+        // the left's own turn begins.
+        assert_eq!(selects, vec![2, 1, 1]);
     }
 
     #[test]
@@ -1080,6 +1091,11 @@ mod tests {
             vec![
                 (ignition::REQ_BEGIN, Halves::BOTH.bits()),
                 (ignition::REQ_SELECT, 2),
+                // Twice: once to stop the bridge polling the right half while
+                // it reboots, then again as the left's own turn begins. The
+                // second is redundant and costs one control transfer, which is
+                // cheaper than the bus recovery the first one avoids.
+                (ignition::REQ_SELECT, 1),
                 (ignition::REQ_SELECT, 1),
                 (ignition::REQ_RELEASE_MD, 0),
                 (ignition::REQ_RESET_TARGET, 1),
