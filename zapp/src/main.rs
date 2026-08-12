@@ -40,9 +40,11 @@ enum Commands {
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
             bundles carrying both wireless halves, and Oryx layout URLs. When \
             given a URL, the firmware is downloaded and flashed directly.\n\n\
-            Whichever it is, plug the keyboard in and press the reset button on \
-            the left half when asked: this waits for the bootloader to appear \
-            rather than expecting it to be there already.",
+            A .zsab goes over whichever way the keyboard is reachable: the \
+            cable if it is sitting in its bootloader, Bluetooth otherwise. \
+            Keyboard firmware goes over the cable, and this waits for the \
+            bootloader to appear rather than expecting it to be there already \
+            — press the reset button on the left half when asked.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
@@ -354,8 +356,30 @@ pub struct LinkArgs {
     #[arg(long)]
     chunk: Option<usize>,
     /// Seconds to wait for each reply
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = DEFAULT_LINK_TIMEOUT)]
     timeout: u64,
+}
+
+/// Seconds to wait for a reply, when nobody said otherwise.
+const DEFAULT_LINK_TIMEOUT: u64 = 15;
+
+impl Default for LinkArgs {
+    /// The same link a bare command line produces.
+    ///
+    /// Written out rather than derived: clap fills `timeout` in from its
+    /// attribute, and a derived `Default` does not — it gives zero, and every
+    /// request then times out before it has been sent. Anything reached other
+    /// than from the command line, like a bundle routed here because the
+    /// keyboard is on Bluetooth, comes through this.
+    fn default() -> Self {
+        Self {
+            device: None,
+            mtu: None,
+            writes: None,
+            chunk: None,
+            timeout: DEFAULT_LINK_TIMEOUT,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -734,7 +758,7 @@ fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
     // so a renamed bundle still does the right thing instead of failing deep
     // inside the DFU loader.
     if is_bundle(path) {
-        return nrf_wired::flash(path, force, Duration::from_secs(15));
+        return flash_bundle(path, force);
     }
 
     if force {
@@ -747,6 +771,29 @@ fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
     print_firmware_info(&fw);
     wait_and_flash(&fw)
+}
+
+/// A bundle, over whichever way the keyboard is reachable.
+///
+/// The same firmware goes over either, so which one is not a decision worth
+/// making twice: a board sitting in its bootloader is plugged in and wants the
+/// cable, and a board that is not is on Bluetooth. Being wrong is cheap —
+/// both paths say what they could not find.
+fn flash_bundle(path: &Path, force: bool) -> Result<()> {
+    if nrf_wired::bootloader_present() {
+        return nrf_wired::flash(path, force, Duration::from_secs(15));
+    }
+
+    println!("No bootloader on USB — going over Bluetooth.");
+    let result = zsab::update(path, force, &LinkArgs::default());
+    if result.is_err() {
+        println!();
+        println!(
+            "If you meant to update over the cable, press the reset button on \
+             the left half to put the keyboard in its bootloader and run this again."
+        );
+    }
+    result
 }
 
 /// Whether the file leads with the .zsab magic.
