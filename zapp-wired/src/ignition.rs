@@ -56,6 +56,21 @@ pub const I2C_SCAN_LEN: usize = 16;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long one message may take to get onto the bulk endpoint.
+///
+/// Not a measure of USB, which is instant here, but of how long the bridge can
+/// refuse to take it. Ignition NAKs the endpoint while its ring is full, and
+/// the ring drains at whatever the target runs at — for the right half a
+/// 50 kHz I2C bus with MCUboot erasing a sector behind it, which stops the
+/// mailbox accepting anything for as long as it takes.
+///
+/// It has to be generous, because a timeout here cannot be retried: a
+/// cancelled bulk transfer may have delivered some of its bytes, and sending
+/// them again would corrupt the stream. Anything genuinely wrong is caught by
+/// the SMP layer's own timeout, which reports it in terms of the half that
+/// stopped answering rather than as a USB error.
+const BULK_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Which halves a session covers. Bit 0 is left, bit 1 is right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Halves(u16);
@@ -249,9 +264,24 @@ impl<L: IgnitionLink> Ignition<L> {
     }
 
     /// Opens a session covering these halves.
+    ///
+    /// A bootloader that still has a session open refuses this, and the way
+    /// one is left open is a host that went away without closing it — an
+    /// interrupted transfer, or a process that died. Closing it and asking
+    /// again is what a person would do, and there is only ever one host, so
+    /// the session being open means nothing is using it. Newer firmware
+    /// supersedes it on its own; this is what makes an older one recoverable
+    /// without the operator having to know about `nrf end`.
     pub fn begin(&mut self, halves: Halves) -> Result<(), WiredError> {
         log::debug!("BEGIN {:#04b}", halves.bits());
-        self.link.control_out(REQ_BEGIN, halves.bits())
+        match self.link.control_out(REQ_BEGIN, halves.bits()) {
+            Err(WiredError::Stalled { .. }) => {
+                log::debug!("BEGIN refused; closing the session left open and asking again");
+                self.end()?;
+                self.link.control_out(REQ_BEGIN, halves.bits())
+            }
+            settled => settled,
+        }
     }
 
     /// Points the pipe at one half.
@@ -487,7 +517,7 @@ pub mod usb {
     use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
     use nusb::{Endpoint, Interface, MaybeFuture};
 
-    use super::{IgnitionLink, Retrying, CONTROL_TIMEOUT, INTERFACE, PID, VID};
+    use super::{IgnitionLink, Retrying, BULK_WRITE_TIMEOUT, CONTROL_TIMEOUT, INTERFACE, PID, VID};
     use crate::WiredError;
 
     /// How many maximum-size packets one read asks for.
@@ -633,7 +663,7 @@ pub mod usb {
 
         fn bulk_out(&mut self, message: &[u8]) -> Result<(), WiredError> {
             self.endpoint_out
-                .transfer_blocking(message.to_vec().into(), Duration::from_secs(5))
+                .transfer_blocking(message.to_vec().into(), BULK_WRITE_TIMEOUT)
                 .into_result()
                 .map(|_| ())
                 .map_err(|err| WiredError::Usb(err.to_string()))
@@ -977,6 +1007,50 @@ mod tests {
         ignition.select(Half::Left).unwrap();
         ignition.end().unwrap();
         assert_eq!(spent(ignition).controls, 3);
+    }
+
+    /// A bootloader that refuses BEGIN until the open session is closed,
+    /// which is what one looks like after a host was interrupted mid-transfer.
+    #[derive(Default)]
+    struct SessionLeftOpen {
+        ended: bool,
+        requests: Vec<u8>,
+    }
+
+    impl IgnitionLink for SessionLeftOpen {
+        fn control_out(&mut self, request: u8, _value: u16) -> Result<(), WiredError> {
+            self.requests.push(request);
+            match request {
+                REQ_END => {
+                    self.ended = true;
+                    Ok(())
+                }
+                REQ_BEGIN if !self.ended => Err(WiredError::Stalled { request }),
+                _ => Ok(()),
+            }
+        }
+        fn control_in(&mut self, _r: u8, _v: u16, len: usize) -> Result<Vec<u8>, WiredError> {
+            Ok(vec![0; len])
+        }
+        fn bulk_out(&mut self, _message: &[u8]) -> Result<(), WiredError> {
+            Ok(())
+        }
+        fn bulk_in(&mut self, _timeout: Duration) -> Result<Vec<u8>, WiredError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_session_someone_left_open_is_closed_and_begun_again() {
+        let mut ignition = Ignition::new(SessionLeftOpen::default());
+        ignition.begin(Halves::BOTH).unwrap();
+
+        // Refused, closed, asked again — rather than surfacing a stall the
+        // operator would have to know to answer with `nrf end`.
+        assert_eq!(
+            ignition.into_link().requests,
+            vec![REQ_BEGIN, REQ_END, REQ_BEGIN]
+        );
     }
 
     #[test]
