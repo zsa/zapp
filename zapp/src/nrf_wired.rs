@@ -241,6 +241,18 @@ fn write_half<L: IgnitionLink + 'static>(
         .select(half)
         .with_context(|| format!("Could not point the bridge at the {half} half"))?;
 
+    // Close whatever line the half was left half-way through. Everything on
+    // this side of the bridge is flushed by BEGIN and SELECT, but the buffer
+    // that matters here is MCUboot's own: a transfer interrupted part-way
+    // through a line — Ctrl-C during an upload — leaves it holding a fragment
+    // and waiting for the newline that ends it. The next request lands on the
+    // back of that fragment and never parses. A bare newline finishes it, and
+    // MCUboot discards the nonsense it completes; a half that was not
+    // mid-line sees an empty line and ignores it just the same.
+    if let Err(err) = ignition.send(half.into(), b"\n") {
+        log::debug!("could not send the {half} half a resync newline: {err}");
+    }
+
     let mut client = connect(shared, half, status.payload_budget(), timeout);
     let wanted = bundle
         .hash(half)
@@ -837,6 +849,25 @@ impl Steps {
 /// know that, which is the point of it being the link's own behaviour.
 fn open() -> Result<Retrying<UsbLink>> {
     open_waiting(WAIT_FOR_BOOTLOADER)
+}
+
+/// Whether a bootloader is plugged in right now, without waiting for one.
+///
+/// For deciding which way to send a bundle. Waiting would defeat the point:
+/// the answer "not here" is what routes it over Bluetooth instead.
+pub fn bootloader_present() -> bool {
+    match UsbLink::open() {
+        Ok(_) => true,
+        Err(WiredError::NoBootloader) => false,
+        Err(err) => {
+            // Something is plugged in that cannot be opened — a permissions
+            // problem, most likely. Say so rather than silently going over
+            // the radio, where the same board would work and the cause would
+            // stay hidden.
+            log::warn!("a bootloader is present but could not be opened: {err}");
+            false
+        }
+    }
 }
 
 /// How long to wait for someone to press the reset button.
