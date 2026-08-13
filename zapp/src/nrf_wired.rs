@@ -70,10 +70,6 @@ const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
 /// stall, so the ceiling is deliberately long.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The same ceiling when neither half was written. There is no swap to sit
-/// through, only the reboot `write_half` asks for either way.
-const REBOOT_ONLY: Duration = Duration::from_secs(3);
-
 /// How long the halves are left alone between read-backs.
 ///
 /// Every read-back costs them the install they are running: ignition's entry
@@ -119,7 +115,14 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
         REPLY_TIMEOUT,
         SETTLE_TIMEOUT,
     ) {
-        Ok(()) => {
+        Ok(outcome) => {
+            // Nothing was written and nothing was checked, so this one line is
+            // the whole of the output. The session is still put back the same
+            // way, because BEGIN left both halves in their bootloaders.
+            if outcome == Outcome::UpToDate {
+                println!("The keyboard is up to date, skipping the flash.");
+            }
+
             // Only once everything landed: an END on the way out of a failure
             // would throw away the STATUS the failure is explained from.
             if let Err(err) = ignition.end() {
@@ -141,17 +144,19 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // their bootloaders, which is what says the flash took; this asks
             // QMK, which is a different firmware on a different chip and may
             // not be there at all.
-            if !came_back(CONFIRM_WINDOW) {
-                println!(
-                    "{}",
-                    wrap(
-                        "Note: both halves match the bundle, but the keyboard has not come \
-                         back on USB. Unplug it and plug it back in."
-                    )
-                );
-            }
+            if outcome == Outcome::Flashed {
+                if !came_back(CONFIRM_WINDOW) {
+                    println!(
+                        "{}",
+                        wrap(
+                            "Note: both halves match the bundle, but the keyboard has not come \
+                             back on USB. Unplug it and plug it back in."
+                        )
+                    );
+                }
 
-            println!("Done!");
+                println!("Done!");
+            }
             Ok(())
         }
         Err(err) => {
@@ -186,6 +191,15 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
 // The flash itself
 // ---------------------------------------------------------------------------
 
+/// What a run did to the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// At least one half was written.
+    Flashed,
+    /// Both halves already carried the bundle, so nothing was.
+    UpToDate,
+}
+
 fn run<L: IgnitionLink + 'static>(
     shared: &Shared<L>,
     ignition: &mut Ignition<Shared<L>>,
@@ -193,7 +207,7 @@ fn run<L: IgnitionLink + 'static>(
     force: bool,
     timeout: Duration,
     settle: Duration,
-) -> Result<()> {
+) -> Result<Outcome> {
     let mut steps = Steps { total: 5, done: 0 };
 
     steps.announce("Opening a session on both halves");
@@ -213,11 +227,11 @@ fn run<L: IgnitionLink + 'static>(
     // back at all, and finding that out before the left has been rewritten
     // leaves a keyboard with one working half rather than none.
     let mut carried = Vec::new();
-    let mut swapping = false;
+    let mut wrote = false;
     for half in [Half::Right, Half::Left] {
         steps.announce(&format!("{} half", titled(half)));
         let (version, staged) = write_half(shared, ignition, half, bundle, &status, force, timeout)?;
-        swapping |= staged == Staged::Image;
+        wrote |= staged == Staged::Image;
         carried.push(Carried {
             half,
             version,
@@ -225,11 +239,18 @@ fn run<L: IgnitionLink + 'static>(
         });
     }
 
+    // Both halves were already carrying the bundle, so nothing was uploaded and
+    // nothing was staged. There is no swap to sit through and no read-back to
+    // make: what the halves are running is what was checked before the decision
+    // to skip them. Only `--force` writes a half that already matches, so this
+    // is unreachable with it.
+    if !wrote {
+        log::debug!("neither half needed writing");
+        return Ok(Outcome::UpToDate);
+    }
+
     // Before `flash` resets the STM32: once it is back in QMK there is no
     // reliable way into ignition again, so this is the last chance to look.
-    //
-    // Nothing staged means nothing to swap, so the halves are only booting and
-    // the wait is the reboot rather than an install.
     steps.announce("Reading both halves back after they restarted");
     verify(
         shared,
@@ -237,16 +258,13 @@ fn run<L: IgnitionLink + 'static>(
         bundle,
         &mut carried,
         timeout,
-        if swapping {
-            settle
-        } else {
-            settle.min(REBOOT_ONLY)
-        },
+        settle,
         WAIT_FOR_RIGHT,
     )?;
 
     steps.announce("Checking both halves came out on the bundle's version");
-    agreed(bundle, &carried)
+    agreed(bundle, &carried)?;
+    Ok(Outcome::Flashed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,19 +1582,30 @@ mod tests {
     }
 
     /// Runs the whole orchestration against the in-memory keyboard.
-    fn flash_loopback(blob: &[u8]) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+    fn flash_loopback(blob: &[u8]) -> (Result<Outcome>, Vec<(u8, u16)>, LoopbackDevice) {
         flash_loopback_with(blob, false)
     }
 
     /// The same, with the downgrade and skip guards overridden.
-    fn flash_loopback_forced(blob: &[u8]) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+    fn flash_loopback_forced(blob: &[u8]) -> (Result<Outcome>, Vec<(u8, u16)>, LoopbackDevice) {
         flash_loopback_with(blob, true)
+    }
+
+    /// A run that writes both halves and reads them back carrying the bundle.
+    ///
+    /// Its images are named by a hash the board is not already reporting, so
+    /// neither half is skipped and the run goes through both passes.
+    fn flash_loopback_written() -> (Result<Outcome>, Vec<(u8, u16)>, LoopbackDevice) {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
+        })
     }
 
     fn flash_loopback_with(
         blob: &[u8],
         force: bool,
-    ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+    ) -> (Result<Outcome>, Vec<(u8, u16)>, LoopbackDevice) {
         flash_loopback_setup(blob, force, |_| {})
     }
 
@@ -1585,7 +1614,7 @@ mod tests {
         blob: &[u8],
         force: bool,
         setup: impl FnOnce(&LoopbackDevice),
-    ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+    ) -> (Result<Outcome>, Vec<(u8, u16)>, LoopbackDevice) {
         let bundle = bundle::parse(blob).expect("a bundle");
         let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
         setup(&device);
@@ -1625,12 +1654,49 @@ mod tests {
         let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
         let (result, _control, device) = flash_loopback(&blob);
 
-        result.expect("nothing to write is not a failure");
+        assert_eq!(
+            result.expect("nothing to write is not a failure"),
+            Outcome::UpToDate
+        );
         assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
         // And the storage erase belongs to an upload, not to a skipped half.
         assert_eq!(count(&device, (BASIC_GROUP, BASIC_CMD_ERASE_STORAGE)), 0);
-        // Two reads per half: once before deciding, once after the restart.
-        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 4);
+        // One read per half, which is the read that decided it.
+        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 2);
+    }
+
+    #[test]
+    fn a_keyboard_that_already_carries_the_bundle_stops_before_the_read_back() {
+        // Nothing was staged, so there is nothing to swap and nothing to check:
+        // a second session and a settle wait would both be spent on a keyboard
+        // that was never touched.
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let (result, control, device) = flash_loopback(&blob);
+        assert_eq!(result.unwrap(), Outcome::UpToDate);
+
+        assert_eq!(
+            control
+                .iter()
+                .filter(|(request, _)| *request == ignition::REQ_BEGIN)
+                .count(),
+            1,
+            "the halves were re-entered to read them back: {control:?}"
+        );
+        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 2);
+        assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
+    }
+
+    #[test]
+    fn force_writes_a_keyboard_that_already_carries_the_bundle() {
+        // The skip is what --force is for: an image the board is already
+        // carrying is written again rather than reported as up to date.
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let (_result, _control, device) = flash_loopback_forced(&blob);
+
+        assert!(
+            count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0,
+            "--force skipped a half anyway"
+        );
     }
 
     #[test]
@@ -1669,10 +1735,7 @@ mod tests {
 
     #[test]
     fn a_written_half_stages_into_image_two_and_marks_it_for_test_never_confirmed() {
-        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
-        let (result, _control, device) = flash_loopback_setup(&blob, false, |device| {
-            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
-        });
+        let (result, _control, device) = flash_loopback_written();
         result.expect("both halves swapped and confirmed");
 
         // Image 2 is slot1_partition under direct image upload. Image 0 or 1
@@ -1691,11 +1754,11 @@ mod tests {
 
     #[test]
     fn a_swap_that_completed_and_was_confirmed_passes_the_read_back() {
-        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
-        let (result, control, device) = flash_loopback_setup(&blob, false, |device| {
-            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
-        });
-        result.expect("both halves swapped and confirmed");
+        let (result, control, device) = flash_loopback_written();
+        assert_eq!(
+            result.expect("both halves swapped and confirmed"),
+            Outcome::Flashed
+        );
 
         assert!(count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0);
         // Two sessions: the one that wrote, and the one that read back after
@@ -1746,8 +1809,7 @@ mod tests {
 
     #[test]
     fn the_right_half_is_selected_before_the_left() {
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
-        let (result, control, _device) = flash_loopback(&blob);
+        let (result, control, _device) = flash_loopback_written();
         result.unwrap();
 
         let selects: Vec<u16> = control
@@ -1763,8 +1825,7 @@ mod tests {
 
     #[test]
     fn the_write_pass_and_the_read_back_pass_are_one_session_each_and_one_end() {
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
-        let (result, control, _device) = flash_loopback(&blob);
+        let (result, control, _device) = flash_loopback_written();
         result.unwrap();
 
         // Every vendor request, in order, with the STATUS polling dropped: it
@@ -1804,18 +1865,18 @@ mod tests {
         // still has to be restarted or it is left sitting in recovery.
         let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
         let (result, control, device) = flash_loopback(&blob);
-        result.unwrap();
+        assert_eq!(result.unwrap(), Outcome::UpToDate);
 
         assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
         assert!(
             control.contains(&(ignition::REQ_RESET_TARGET, 1)),
             "the left half was not reset: {control:?}"
         );
-        // Once for the write pass and once for the read-back pass, both of
-        // which put the halves back in their bootloaders.
+        // One pass, so one reset: the read-back that would make a second is
+        // not run when nothing was written.
         assert_eq!(
             count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
-            2,
+            1,
             "the right half was not reset out of MCUboot"
         );
     }
@@ -1866,8 +1927,7 @@ mod tests {
         // MCUboot: the wrong direction, and unanswerable while MCUboot is
         // what is running, so a right half restarted that way is left sitting
         // in recovery. It has to be MCUboot's own reset.
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
-        let (result, control, device) = flash_loopback(&blob);
+        let (result, control, device) = flash_loopback_written();
         result.unwrap();
 
         assert!(
@@ -1883,8 +1943,7 @@ mod tests {
 
     #[test]
     fn the_left_halfs_md_pin_is_released_before_it_is_reset_and_never_after() {
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
-        let (result, control, _device) = flash_loopback(&blob);
+        let (result, control, _device) = flash_loopback_written();
         result.unwrap();
 
         let md = control
@@ -1929,13 +1988,13 @@ mod tests {
 
     #[test]
     fn both_halves_are_read_again_after_they_restart_and_a_match_passes() {
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
-        let (result, control, device) = flash_loopback(&blob);
+        let (result, control, device) = flash_loopback_written();
         result.expect("both halves still carry the bundle after their restart");
 
-        // Two state reads per half: the one the write pass makes, and the one
-        // that happens on a session opened after both halves restarted.
-        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 4);
+        // Four state commands per half: the read that decides, the read after
+        // the upload, the mark that arms it — a write of the same command —
+        // and the read on a session opened after both halves restarted.
+        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 8);
         assert_eq!(
             control
                 .iter()
@@ -1948,14 +2007,12 @@ mod tests {
 
     #[test]
     fn a_half_that_stops_carrying_the_bundles_image_after_it_restarts_fails_the_run() {
-        // Two reads land in the write pass and the third is the right half's
-        // read-back, by which point the board reports something else. Nothing
-        // before it went wrong, which is the whole reason to look again.
-        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        // Both halves take the whole image and land it, and the slot they are
+        // running afterwards carries something else. Nothing before it went
+        // wrong, which is the whole reason to look again.
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
         let (result, _control, _device) = flash_loopback_setup(&blob, false, |device| {
-            device.tweak(|fake| {
-                fake.slot_hashes = vec![DEVICE_HASH.to_vec(), DEVICE_HASH.to_vec(), vec![0x99; 32]]
-            })
+            device.tweak(|fake| fake.listings = a_whole_run(settled(&[0x99; 32], &DEVICE_HASH)))
         });
 
         let err = format!("{:#}", result.unwrap_err());
@@ -2313,15 +2370,17 @@ mod tests {
 
     #[test]
     fn a_keyboard_whose_halves_disagree_is_not_a_success() {
-        // Both halves already carry the bundle's images, so neither is
-        // written and the run gets all the way to the end — and still has to
-        // fail, because what they are carrying is not what the bundle names.
+        // Both halves take the bundle's images and read back carrying them, so
+        // every check up to here passed — and the run still has to fail,
+        // because the version they came out on is not the one the bundle names.
         let blob = bundled_v(
-            &signed(0x11, &DEVICE_HASH),
-            &signed(0x22, &DEVICE_HASH),
+            &signed(0x11, &BUNDLE_HASH),
+            &signed(0x22, &BUNDLE_HASH),
             "0.1.9",
         );
-        let (result, _control, _device) = flash_loopback(&blob);
+        let (result, _control, _device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
+        });
 
         let err = format!("{:#}", result.unwrap_err());
         assert!(
