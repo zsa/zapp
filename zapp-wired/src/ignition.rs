@@ -61,7 +61,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Not a measure of USB, which is instant here, but of how long the bridge can
 /// refuse to take it. Ignition NAKs the endpoint while its ring is full, and
 /// the ring drains at whatever the target runs at — for the right half a
-/// 50 kHz I2C bus with MCUboot erasing a sector behind it, which stops the
+/// 400 kHz I2C bus with MCUboot erasing a sector behind it, which stops the
 /// mailbox accepting anything for as long as it takes.
 ///
 /// It has to be generous, because a timeout here cannot be retried: a
@@ -152,7 +152,7 @@ pub struct Status {
     /// `SESSION_ERR_*`, zero for none.
     pub error: u16,
     /// What the TRRS bus is actually clocking at.
-    pub i2c_khz: u8,
+    pub i2c_khz: u16,
     /// How many times the bus has needed recovering since the session opened.
     pub recover_count: u8,
     /// Bytes the bridge dropped on the way back from the target. Non-zero
@@ -180,7 +180,7 @@ impl Status {
             left_state: TargetState::from_code(bytes[3]),
             right_state: TargetState::from_code(bytes[4]),
             error: u16::from_le_bytes([bytes[5], bytes[6]]),
-            i2c_khz: bytes[7],
+            i2c_khz: i2c_khz(bytes),
             recover_count: bytes[8],
             rx_drops: bytes[9],
             max_payload: u16::from_le_bytes([bytes[10], bytes[11]]),
@@ -209,6 +209,19 @@ impl Status {
             Half::Left => self.left_state,
             Half::Right => self.right_state,
         }
+    }
+}
+
+/// The bus speed, from the 16-bit field at `[13..14]`.
+///
+/// Byte 7 held it until 400 kHz stopped fitting in a byte, and a firmware old
+/// enough to leave the wide field zeroed still has a speed that fits there. A
+/// new firmware saturates byte 7 rather than wrapping it, so preferring the
+/// wide field is what keeps the two readings from disagreeing.
+fn i2c_khz(bytes: &[u8]) -> u16 {
+    match u16::from_le_bytes([bytes[13], bytes[14]]) {
+        0 => bytes[7] as u16,
+        wide => wide,
     }
 }
 
@@ -720,6 +733,22 @@ mod tests {
         assert_eq!(status.rx_drops, 7);
         assert_eq!(status.max_payload, 1024);
         assert_eq!(status.proto_version, 1);
+    }
+
+    /// 400 kHz does not fit in byte 7, which is why the wide field exists.
+    #[test]
+    fn a_bus_speed_wider_than_a_byte_is_read_from_the_wide_field() {
+        let mut bytes = status_bytes();
+        bytes[7] = 255; // saturated, not wrapped
+        bytes[13] = 0x90;
+        bytes[14] = 0x01;
+        assert_eq!(Status::parse(&bytes).unwrap().i2c_khz, 400);
+    }
+
+    /// A firmware from before the wide field zeroes it, and its speed fits.
+    #[test]
+    fn a_zeroed_wide_field_falls_back_to_byte_seven() {
+        assert_eq!(Status::parse(&status_bytes()).unwrap().i2c_khz, 50);
     }
 
     /// The whole reason byte 0 exists. Version 1 was eight bytes with the
