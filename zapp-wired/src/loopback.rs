@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use zapp_smp::fake::FakeDevice;
+use zapp_smp::fake::{FakeDevice, Mark};
 use zapp_smp::proto::Reassembler as FrameReassembler;
 use zapp_smp::{Half, SmpTransport, TransportError};
 
@@ -53,6 +53,16 @@ impl LoopbackDevice {
     /// How many times it has been told to reboot.
     pub fn resets(&self) -> u32 {
         *self.fake.lock().unwrap().resets.lock().unwrap()
+    }
+
+    /// The `image` number each upload announced, in order.
+    pub fn uploads(&self) -> Vec<u32> {
+        self.fake.lock().unwrap().uploads.lock().unwrap().clone()
+    }
+
+    /// Every state write it was sent, as `(hash, confirm)`.
+    pub fn marks(&self) -> Vec<Mark> {
+        self.fake.lock().unwrap().marks.lock().unwrap().clone()
     }
 
     /// The largest request that reached it whole.

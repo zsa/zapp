@@ -271,7 +271,7 @@ impl<L: IgnitionLink> Ignition<L> {
     /// again is what a person would do, and there is only ever one host, so
     /// the session being open means nothing is using it. Newer firmware
     /// supersedes it on its own; this is what makes an older one recoverable
-    /// without the operator having to know about `nrf end`.
+    /// without the operator having to unplug the keyboard.
     pub fn begin(&mut self, halves: Halves) -> Result<(), WiredError> {
         log::debug!("BEGIN {:#04b}", halves.bits());
         match self.link.control_out(REQ_BEGIN, halves.bits()) {
@@ -1046,7 +1046,7 @@ mod tests {
         ignition.begin(Halves::BOTH).unwrap();
 
         // Refused, closed, asked again — rather than surfacing a stall the
-        // operator would have to know to answer with `nrf end`.
+        // operator would have nothing to do about but unplug the keyboard.
         assert_eq!(
             ignition.into_link().requests,
             vec![REQ_BEGIN, REQ_END, REQ_BEGIN]

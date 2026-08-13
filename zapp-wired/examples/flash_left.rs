@@ -1,6 +1,6 @@
 //! Writes the **left** half's nRF from a `.zsab`, and nothing else.
 //!
-//! A bring-up tool, not a product: `zapp nrf flash` is the supported way to
+//! A bring-up tool, not a product: `zapp flash` is the supported way to
 //! update a keyboard and it always writes both halves together, because halves
 //! on different builds cannot talk to each other. This deliberately does the
 //! thing the product refuses to do, for one reason.

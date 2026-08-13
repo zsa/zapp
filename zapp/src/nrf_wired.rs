@@ -9,18 +9,23 @@
 //! reconnect between halves, and nothing that waits on a radio.
 //!
 //! What is left is an order and a set of checks, which is what this file is.
-//! Every wait polls: either ignition's STATUS or an SMP reply. There are no
-//! fixed sleeps anywhere in here, and there is nothing to tear down and rebuild
-//! between the two halves.
+//! Every wait polls: ignition's STATUS, an SMP reply, or the slot listing that
+//! says a half has finished installing — see [`SETTLE_TIMEOUT`].
+//!
+//! The write goes into the spare slot and is marked for test, the same as the
+//! Bluetooth path: MCUboot swaps it in on the next boot, the application
+//! confirms it, and a half that does not confirm is reverted.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use zapp_core::device::{self, Keyboard};
 use zapp_core::flash::FlashProgress;
+use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
 use zapp_smp::proto::{self, Op};
 use zapp_smp::{cbor, image, Half, ImageSlot, SmpClient, SmpError};
@@ -38,6 +43,53 @@ use crate::zsab::{named, short, wrap};
 /// is waiting for nothing.
 const BEGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long to wait for each reply from a half.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long to keep asking for a session while the right half is missing.
+///
+/// One attempt is one five-second window, because that is where ignition's own
+/// entry sequence gives up. The way a right half that did not show up is
+/// rescued is power-cycling it — unplug the TRRS cable and plug it back in —
+/// while the bootloader is polling for it, so what matters is that a poll is
+/// running when it comes back. On the bench that was the third or fourth
+/// attempt, never the first.
+const WAIT_FOR_RIGHT: Duration = Duration::from_secs(30);
+
+/// A pause between attempts, so a bootloader that refuses one straight away is
+/// not asked several thousand times.
+const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
+
+/// How long both halves get to swap, boot and confirm before the read-back
+/// gives up on them.
+///
+/// A ceiling rather than a wait: the read-back re-reads both halves every
+/// [`SETTLE_POLL`] and stops the moment they carry the bundle. Swap-using-move
+/// carries a 0xb2000 slot through RRAM sector by sector, which is minutes of
+/// the seconds-per-sector that made a whole-slot erase a "tens-of-seconds"
+/// stall, so the ceiling is deliberately long.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The same ceiling when neither half was written. There is no swap to sit
+/// through, only the reboot `write_half` asks for either way.
+const REBOOT_ONLY: Duration = Duration::from_secs(3);
+
+/// How long the halves are left alone between read-backs.
+///
+/// Every read-back costs them the install they are running: ignition's entry
+/// sequence holds the left half's MD pin and blips its reset, and hard-resets
+/// the right (`ignition/src/session.c:107,139`), and neither bootloader swaps
+/// while it is in recovery. MCUboot picks an interrupted swap up where it
+/// stopped, so this is the uninterrupted time it gets to make progress in.
+const SETTLE_POLL: Duration = Duration::from_secs(5);
+
+/// The image number a recovery upload names the spare slot by.
+///
+/// `CONFIG_MCUBOOT_SERIAL_DIRECT_IMAGE_UPLOAD` maps 0 and 1 to
+/// `slot0_partition` and 2 to `slot1_partition`
+/// (`bootloader/mcuboot/boot/zephyr/flash_map_extended.c:129`).
+const SPARE_IMAGE: u32 = 2;
+
 /// The zephyr basic group, and the command that erases the settings partition.
 const BASIC_GROUP: u16 = 63;
 const BASIC_CMD_ERASE_STORAGE: u8 = 0;
@@ -45,21 +97,12 @@ const BASIC_CMD_ERASE_STORAGE: u8 = 0;
 /// `MGMT_ERR_ENOTSUP`: a build that does not carry the command at all.
 const MGMT_ERR_ENOTSUP: i64 = 8;
 
-/// What the diagnostic scan probes, in the order ignition reports it.
-const SCANNED: [(u8, &str); 5] = [
-    (0x20, "MCP23018, the right half's matrix expander"),
-    (0x45, "the right nRF's MCUboot mailbox"),
-    (0x54, "the right nRF's application"),
-    (0x74, "IS31FL3731, the left half's LEDs"),
-    (0x77, "IS31FL3731, the right half's LEDs"),
-];
-
 // ---------------------------------------------------------------------------
-// Subcommands
+// The command
 // ---------------------------------------------------------------------------
 
 /// Writes both halves from one bundle.
-pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
+pub fn flash(path: &Path, force: bool) -> Result<()> {
     let blob = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let bundle = bundle::parse(&blob)
         .with_context(|| format!("{} is not a bundle this build can read", path.display()))?;
@@ -68,7 +111,14 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
     let shared = Shared::new(open()?);
     let mut ignition = Ignition::new(shared.clone());
 
-    match run(&shared, &mut ignition, &bundle, force, timeout) {
+    match run(
+        &shared,
+        &mut ignition,
+        &bundle,
+        force,
+        REPLY_TIMEOUT,
+        SETTLE_TIMEOUT,
+    ) {
         Ok(()) => {
             // Only once everything landed: an END on the way out of a failure
             // would throw away the STATUS the failure is explained from.
@@ -87,6 +137,20 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
                 Err(err) => log::debug!("the bootloader went down with the reset: {err}"),
             }
 
+            // Advisory only. Both halves were read back against the bundle in
+            // their bootloaders, which is what says the flash took; this asks
+            // QMK, which is a different firmware on a different chip and may
+            // not be there at all.
+            if !came_back(CONFIRM_WINDOW) {
+                println!(
+                    "{}",
+                    wrap(
+                        "Note: both halves match the bundle, but the keyboard has not come \
+                         back on USB. Unplug it and plug it back in."
+                    )
+                );
+            }
+
             println!("Done!");
             Ok(())
         }
@@ -96,96 +160,26 @@ pub fn flash(path: &Path, force: bool, timeout: Duration) -> Result<()> {
             // notes are read out of a session that is still open, and the next
             // attempt needs one that is not — the bootloader refuses BEGIN
             // outright while a session is active.
-            let notes = advice(&mut ignition, &err);
+            let notes = advice(&mut ignition);
             if let Err(err) = ignition.end() {
                 log::debug!("could not end the session after the failure: {err}");
             }
 
-            println!();
-            println!("Update failed: {err:#}");
+            // One line. The chain underneath it names bridges, mailboxes and
+            // event codes, which is what this looks like from the inside and
+            // no help at all to someone holding a keyboard — it goes to the
+            // debug log, where it is still there when it is wanted.
+            log::debug!("failure detail: {err:#}");
+            let mut line = format!("Error: {err}.");
             for note in notes {
-                println!();
-                println!("{note}");
+                line.push(' ');
+                line.push_str(&note);
             }
             println!();
-            println!("{}", wrap(LEFT_BEHIND));
-            bail!("the keyboard was not fully updated")
+            println!("{}", wrap(&line));
+            std::process::exit(1);
         }
     }
-}
-
-/// What is left on a keyboard whose wired update stopped part-way.
-///
-/// Short, because there is genuinely little to say: a recovery upload writes
-/// the primary slot, so an interrupted one leaves a half with no image rather
-/// than with its old one, and the way out is the same command again.
-const LEFT_BEHIND: &str = "Both halves are still in their bootloaders and will stay there \
-     until something resets them, which is what makes this recoverable: the session has been \
-     closed, so running the same command again picks up from where this stopped. A half whose \
-     upload did not finish has a part-written slot and will not boot, so leave the keyboard \
-     plugged in rather than power-cycling it. `zapp nrf status` says what the bootloader can \
-     still see.";
-
-/// Ignition's STATUS, and what answers on the TRRS bus.
-pub fn status() -> Result<()> {
-    let mut ignition = Ignition::new(open()?);
-    let status = ignition
-        .status()
-        .context("Could not read ignition's status")?;
-    print_status(&status);
-
-    println!();
-    println!("TRRS I2C scan");
-    match ignition.i2c_scan() {
-        Ok(scan) => {
-            for line in scan_lines(&scan) {
-                println!("  {line}");
-            }
-        }
-        Err(err) => println!("  could not scan: {err}"),
-    }
-
-    if let Some(note) = session_error(&status) {
-        println!();
-        println!("{}", wrap(&note));
-    }
-    Ok(())
-}
-
-/// Closes a session someone else left open, and lets go of the left's MD pin.
-pub fn end() -> Result<()> {
-    let mut ignition = Ignition::new(open()?);
-    let before = ignition
-        .status()
-        .context("Could not read ignition's status")?;
-
-    // MD first. END releases it too, but a bootloader that answers the first
-    // request and not the second should at least have let go of the pin that
-    // keeps the left half out of its own firmware.
-    if let Err(err) = ignition.release_md() {
-        log::debug!("could not release the MD pin: {err}");
-    }
-    ignition.end().context("Could not end ignition's session")?;
-
-    match before.state {
-        SessionState::Idle => println!("No session was open; the MD pin is released either way."),
-        state => println!("Ended a session that was {}.", session_as(state)),
-    }
-    print_status(
-        &ignition
-            .status()
-            .context("Could not read ignition's status")?,
-    );
-    println!();
-    println!(
-        "{}",
-        wrap(
-            "Neither half was reset, so a half that was already in MCUboot is still there. \
-             Power-cycle the keyboard to boot both halves, or run \
-             `zapp nrf flash <bundle.zsab>` to write them."
-        )
-    );
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -198,14 +192,12 @@ fn run<L: IgnitionLink + 'static>(
     bundle: &Bundle,
     force: bool,
     timeout: Duration,
+    settle: Duration,
 ) -> Result<()> {
-    let mut steps = Steps { total: 3, done: 0 };
+    let mut steps = Steps { total: 5, done: 0 };
 
     steps.announce("Opening a session on both halves");
-    ignition
-        .begin(Halves::BOTH)
-        .context("Could not open a session on the bootloader")?;
-    let status = wait_active(ignition)?;
+    let status = open_session(ignition, WAIT_FOR_RIGHT)?;
     log::debug!(
         "session active: TRRS {} kHz, {} bytes per message, pipe v{}, left {}, right {}",
         status.i2c_khz,
@@ -220,14 +212,324 @@ fn run<L: IgnitionLink + 'static>(
     // being alive — but because the right is the half that can fail to come
     // back at all, and finding that out before the left has been rewritten
     // leaves a keyboard with one working half rather than none.
+    let mut carried = Vec::new();
+    let mut swapping = false;
     for half in [Half::Right, Half::Left] {
         steps.announce(&format!("{} half", titled(half)));
-        write_half(shared, ignition, half, bundle, &status, force, timeout)?;
+        let (version, staged) = write_half(shared, ignition, half, bundle, &status, force, timeout)?;
+        swapping |= staged == Staged::Image;
+        carried.push(Carried {
+            half,
+            version,
+            hash: None,
+        });
     }
+
+    // Before `flash` resets the STM32: once it is back in QMK there is no
+    // reliable way into ignition again, so this is the last chance to look.
+    //
+    // Nothing staged means nothing to swap, so the halves are only booting and
+    // the wait is the reboot rather than an install.
+    steps.announce("Reading both halves back after they restarted");
+    verify(
+        shared,
+        ignition,
+        bundle,
+        &mut carried,
+        timeout,
+        if swapping {
+            settle
+        } else {
+            settle.min(REBOOT_ONLY)
+        },
+        WAIT_FOR_RIGHT,
+    )?;
+
+    steps.announce("Checking both halves came out on the bundle's version");
+    agreed(bundle, &carried)
+}
+
+// ---------------------------------------------------------------------------
+// Reading the halves back after they restarted
+// ---------------------------------------------------------------------------
+
+/// Re-reads what each half's slot 0 carries until both agree with the bundle.
+///
+/// The read-back inside `write_half` happens with the half still sitting in the
+/// recovery that wrote it, and the image still in the spare slot. This one runs
+/// after MCUboot swapped and the half restarted, so slot 0 carrying the
+/// bundle's hash proves the swap completed and `confirmed` proves the
+/// application booted far enough to keep it.
+///
+/// Both answers come from the halves' own bootloaders. Nothing here asks an
+/// application anything, which is what makes it the check the run passes or
+/// fails on.
+///
+/// A half that is still swapping answers nothing, or answers with the image it
+/// had, so a pass that fails is retried until `settle` runs out and the last
+/// failure is what the run ends on.
+///
+/// Records each half's hash and version on `carried`, for the whole-keyboard
+/// check.
+fn verify<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    bundle: &Bundle,
+    carried: &mut [Carried],
+    timeout: Duration,
+    settle: Duration,
+    limit: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let deadline = started + settle;
+    // Named with its length: this is the longest wait in the run and an
+    // unqualified spinner reads as a hang.
+    let spinner = (!settle.is_zero()).then(|| new_spinner(&installing(Duration::ZERO, settle)));
+
+    loop {
+        let failure = match read_back(shared, ignition, bundle, carried, timeout, limit) {
+            Ok(()) => {
+                if let Some(spinner) = &spinner {
+                    spinner.finish_and_clear();
+                }
+                return Ok(());
+            }
+            Err(failure) => failure,
+        };
+
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            if let Some(spinner) = &spinner {
+                spinner.finish_and_clear();
+            }
+            return Err(failure);
+        }
+
+        log::debug!(
+            "not installed yet with {} s left: {failure:#}",
+            left.as_secs()
+        );
+        boot_halves(ignition);
+        std::thread::sleep(SETTLE_POLL.min(left));
+        if let Some(spinner) = &spinner {
+            spinner.set_message(installing(started.elapsed(), settle));
+        }
+    }
+}
+
+/// The spinner's line while the halves are installing.
+fn installing(gone: Duration, settle: Duration) -> String {
+    format!(
+        "Installing the update on both halves ({} s of up to {} s)",
+        gone.as_secs(),
+        settle.as_secs()
+    )
+}
+
+/// Lets both halves get on with the install a read-back interrupted.
+///
+/// Ignition's entry sequence holds the left half's MD pin low and blips its
+/// reset, so the left comes up in recovery, where nothing swaps, and stays
+/// there until the pin is let go and it is reset again. The right has no MD
+/// pin: the same sequence hard-resets it, so it is already on its way.
+///
+/// Best effort. Reaching here means a pass already failed, and a request that
+/// fails on top of that says nothing the next pass will not say better.
+fn boot_halves<L: IgnitionLink>(ignition: &mut Ignition<L>) {
+    if let Err(err) = ignition.release_md() {
+        log::debug!("could not release the left half's MD pin between read-backs: {err}");
+    }
+    if let Err(err) = ignition.reset_target(Half::Left) {
+        log::debug!("could not restart the left half between read-backs: {err}");
+    }
+}
+
+/// One pass: a session, a slot listing from each half, and the reset that puts
+/// each of them back on its own firmware.
+fn read_back<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    bundle: &Bundle,
+    carried: &mut [Carried],
+    timeout: Duration,
+    limit: Duration,
+) -> Result<()> {
+    let status = match open_session(ignition, limit) {
+        Ok(status) => status,
+        Err(err) => {
+            log::debug!("could not re-open a session to read the halves back: {err:#}");
+            // Staging is not installing. Each half swaps on its next restart
+            // and reverts unless its application confirms, so a check that was
+            // not made cannot be reported as an update that took.
+            if right_absent(ignition) {
+                return Err(err).context(unverified());
+            }
+            return Err(err);
+        }
+    };
+
+    for entry in carried.iter_mut() {
+        let half = entry.half;
+        ignition
+            .select(half)
+            .with_context(|| format!("Could not point the bridge at the {half} half"))?;
+        let mut client = connect(shared, half, status.payload_budget(), timeout);
+
+        let wanted = bundle
+            .hash(half)
+            .with_context(|| format!("The bundle's {half} image carries no hash to check it by"))?;
+        let slots = client
+            .image_state()
+            .with_context(|| format!("Could not read the {half} half's image state back"))?;
+        report_slot(&slots);
+        landed(&slots, &wanted, half, Checked::Restarted)?;
+        if let Some(slot) = primary(&slots) {
+            entry.hash = Some(slot.hash.clone());
+            entry.version = slot.version.clone();
+        }
+        log::debug!("{half}: swapped to {} and confirmed it", short(&wanted));
+
+        // Out of the bootloaders again, the same way `write_half` does it.
+        match half {
+            Half::Left => {
+                ignition
+                    .release_md()
+                    .context("Could not release the left half's MD pin")?;
+                ignition
+                    .reset_target(half)
+                    .context("Could not restart the left half")?;
+            }
+            Half::Right => {
+                client
+                    .reset()
+                    .context("Could not restart the right half out of MCUboot")?;
+                ignition
+                    .select(Half::Left)
+                    .context("Could not point the bridge away from the right half")?;
+            }
+        }
+    }
+
+    log::debug!("both halves read back carrying the bundle's images");
     Ok(())
 }
 
+/// What a read-back nobody could make says. Both images are staged and armed,
+/// which is not the same as installed: an image whose application does not
+/// confirm is reverted, and nothing here saw whether that happened.
+fn unverified() -> String {
+    "both images were staged but could not be checked afterwards, because the right half \
+     did not answer when the bootloaders were re-entered. Each half installs its image on \
+     the next restart and undoes it unless its firmware confirms, so this update may not \
+     have taken. Run the same command again"
+        .to_string()
+}
+
+/// Whether the bootloader's last fault was the right half not answering.
+fn right_absent<L: IgnitionLink>(ignition: &mut Ignition<L>) -> bool {
+    match ignition.status() {
+        Ok(status) => right_missing(status.error),
+        Err(err) => {
+            log::debug!("could not read ignition's status after the failed re-open: {err}");
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Getting a session open
+// ---------------------------------------------------------------------------
+
+/// Opens a session, giving a right half that is not there time to appear.
+///
+/// The one attempt this used to make gave the operator about five seconds, and
+/// the rescue for a right half that did not answer is to power-cycle it while
+/// the bootloader is polling — which nobody can time to a window that has
+/// already closed. Asking again for half a minute is the same procedure with
+/// enough room in it to work.
+fn open_session<L: IgnitionLink>(ignition: &mut Ignition<L>, limit: Duration) -> Result<Status> {
+    keep_asking(limit, || {
+        // No END between attempts: `begin` already closes a session it finds
+        // in the way, and ending one here would throw away the fault the last
+        // attempt recorded — which is what the failure is explained from.
+        if let Err(err) = ignition.begin(Halves::BOTH) {
+            return Err(NotOpened::fatal(
+                anyhow::Error::new(err).context("Could not open a session on the bootloader"),
+            ));
+        }
+        wait_active(ignition)
+    })
+}
+
+/// A session that would not open, and whether waiting could change that.
+struct NotOpened {
+    error: anyhow::Error,
+    /// Set for the faults a right half that is not answering produces. Those
+    /// are the only ones worth asking again for: the right half is the one
+    /// thing in this path someone can power-cycle while the run waits.
+    right_missing: bool,
+}
+
+impl NotOpened {
+    fn fatal(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            right_missing: false,
+        }
+    }
+}
+
+/// The faults a right half that is not answering produces.
+///
+/// Codes 0x0002 to 0x0005: no mailbox, no cable, no matrix expander, and a
+/// bus that stopped answering. The same situation from four angles — nothing
+/// on the TRRS bus, or nothing at the far end of it — and one answer to all
+/// of them: unplug the cable, plug it back in, and let the next attempt find
+/// it.
+fn right_missing(error: u16) -> bool {
+    matches!(error, 0x0002..=0x0005)
+}
+
+/// The retry itself, with the board's side of it passed in.
+///
+/// Separated from the link so it can be driven without one: what is worth
+/// testing here is when it gives up and when it stops, not how a session is
+/// opened.
+fn keep_asking<F>(limit: Duration, mut attempt: F) -> Result<Status>
+where
+    F: FnMut() -> std::result::Result<Status, NotOpened>,
+{
+    let started = Instant::now();
+    let mut spinner: Option<ProgressBar> = None;
+    loop {
+        let outcome = attempt();
+        let done = match &outcome {
+            Ok(_) => true,
+            Err(not_opened) => !not_opened.right_missing || started.elapsed() >= limit,
+        };
+        if done {
+            if let Some(spinner) = spinner {
+                spinner.finish_and_clear();
+            }
+            return outcome.map_err(|not_opened| not_opened.error);
+        }
+        // One line for the whole wait, however many attempts it takes.
+        if spinner.is_none() {
+            spinner = Some(new_spinner(
+                "Waiting for the right half — unplug the cable between the halves \
+                 and plug it back in",
+            ));
+        }
+        std::thread::sleep(BETWEEN_ATTEMPTS);
+    }
+}
+
 /// One half: what it is carrying, what it needs, and the reset that boots it.
+///
+/// Answers with the version of the slot carrying the bundle's image once it is
+/// done, written or not, which is what the whole-keyboard check at the end
+/// compares. That slot is the spare one when the half was written, because
+/// MCUboot has not swapped yet.
 fn write_half<L: IgnitionLink + 'static>(
     shared: &Shared<L>,
     ignition: &mut Ignition<Shared<L>>,
@@ -236,7 +538,7 @@ fn write_half<L: IgnitionLink + 'static>(
     status: &Status,
     force: bool,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<(String, Staged)> {
     ignition
         .select(half)
         .with_context(|| format!("Could not point the bridge at the {half} half"))?;
@@ -263,9 +565,12 @@ fn write_half<L: IgnitionLink + 'static>(
         .with_context(|| format!("Could not read the {half} half's image state"))?;
     report_slot(&before);
 
-    if installed(&before, &wanted) && !force {
+    let mut staged = Staged::Nothing;
+    let carried = if installed(&before, &wanted) && !force {
         log::debug!("{half}: already carrying this image, not written again");
+        before
     } else {
+        staged = Staged::Image;
         // Refuse to go backwards. A bundle built from a stale directory writes
         // an old half onto a keyboard whose other half has moved on, and two
         // halves on different builds is a keyboard that hangs the moment they
@@ -288,20 +593,28 @@ fn write_half<L: IgnitionLink + 'static>(
         let image = bundle.image(half);
         upload(&mut client, half, image)?;
 
-        // Read back rather than trust the upload's own success. A recovery
-        // upload writes the primary slot directly, so what the board reports
-        // afterwards is the image it will boot, and it is the only evidence
-        // that it is the image that was sent.
+        // Read back rather than trust the upload's own success. The bytes went
+        // into the spare slot, so that is where they have to show up. Checked
+        // before the mark, so a bad upload is reported as the hash mismatch it
+        // is rather than as a mark that could not find its image.
         let after = client
             .image_state()
             .with_context(|| format!("Could not read the {half} half's image state back"))?;
-        landed(&after, &wanted, half)?;
+        landed(&after, &wanted, half, Checked::Written)?;
+
+        // For test, not confirmed: the application confirms itself at boot,
+        // which is what the read-back checks and what leaves MCUboot a way
+        // back.
+        client
+            .mark(&wanted, false)
+            .with_context(|| format!("Could not mark the {half} half's new image for test"))?;
         log::debug!(
-            "{half}: {} bytes written, slot 0 now carries {}",
+            "{half}: {} bytes written, spare slot now carries {}",
             image.len(),
             short(&wanted)
         );
-    }
+        after
+    };
 
     // Both halves are restarted whether or not they were written: ignition's
     // BEGIN put them in their bootloaders, and END does not take them out.
@@ -339,7 +652,17 @@ fn write_half<L: IgnitionLink + 'static>(
         }
     }
     log::debug!("{half}: restarting");
-    Ok(())
+    Ok((version_carrying(&carried, &wanted), staged))
+}
+
+/// Whether a half has an image waiting in its spare slot to swap in.
+///
+/// Only a half that was written has a swap to sit through, and the swap is the
+/// whole reason the read-back waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staged {
+    Image,
+    Nothing,
 }
 
 /// Polls STATUS until the entry sequence is done.
@@ -348,36 +671,50 @@ fn write_half<L: IgnitionLink + 'static>(
 /// returns and its main loop runs the multi-second right-entry sequence, so the
 /// host watches the state move rather than guessing at how long to wait. Each
 /// poll is a USB control transfer, which is its own pacing.
-fn wait_active<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Result<Status> {
+fn wait_active<L: IgnitionLink>(
+    ignition: &mut Ignition<L>,
+) -> std::result::Result<Status, NotOpened> {
     let started = Instant::now();
     loop {
-        let status = ignition
-            .status()
-            .context("Could not read ignition's status")?;
+        let status = match ignition.status() {
+            Ok(status) => status,
+            Err(err) => {
+                return Err(NotOpened::fatal(
+                    anyhow::Error::new(err).context("Could not read ignition's status"),
+                ));
+            }
+        };
         match status.state {
             SessionState::Active => return Ok(status),
             SessionState::Fault => {
                 let reason = session_error(&status)
                     .unwrap_or_else(|| "the bootloader gave no reason".to_string());
-                bail!("The bootloader could not open a session: {reason}");
+                return Err(NotOpened {
+                    right_missing: right_missing(status.error),
+                    error: anyhow!("The bootloader could not open a session: {reason}"),
+                });
             }
-            SessionState::Idle => bail!(
-                "The bootloader says no session is open, having just been asked to open one. \
-                 It is running a build that does not carry the wired update path."
-            ),
+            SessionState::Idle => {
+                return Err(NotOpened::fatal(anyhow!(
+                    "The bootloader says no session is open, having just been asked to open \
+                     one. It is running a build that does not carry the wired update path."
+                )));
+            }
             SessionState::Pending => {}
-            SessionState::Unrecognised(code) => bail!(
-                "The bootloader reports session state {code}, which this build does not know. \
-                 It and this zapp are not from the same release."
-            ),
+            SessionState::Unrecognised(code) => {
+                return Err(NotOpened::fatal(anyhow!(
+                    "The bootloader reports session state {code}, which this build does not \
+                     know. It and this zapp are not from the same release."
+                )));
+            }
         }
         if started.elapsed() >= BEGIN_TIMEOUT {
-            bail!(
+            return Err(NotOpened::fatal(anyhow!(
                 "The bootloader was still opening the session {} s after it was asked to. \
                  Its own entry sequence gives up well inside that, so it is stuck rather \
                  than slow.",
                 BEGIN_TIMEOUT.as_secs()
-            );
+            )));
         }
     }
 }
@@ -427,7 +764,7 @@ fn erase_storage(client: &mut SmpClient) -> Result<()> {
     }
 }
 
-/// Sends one half's image, with a bar on it.
+/// Sends one half's image into its spare slot, with a bar on it.
 fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
     let bar = ProgressBar::new(image.len() as u64);
     bar.set_style(
@@ -440,7 +777,7 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
             .progress_chars("█▓░"),
     );
     let label = titled(half);
-    let result = client.upload(0, image, &|progress| match progress {
+    let result = client.upload(SPARE_IMAGE, image, &|progress| match progress {
         FlashProgress::Writing { bytes_written, .. } => {
             bar.set_position(bytes_written as u64);
             bar.set_message(label);
@@ -456,25 +793,27 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
 // What the board is carrying
 // ---------------------------------------------------------------------------
 
-/// The slot a recovery upload writes.
-///
-/// MCUboot's serial recovery writes the primary slot directly rather than
-/// staging into the spare, so slot 0 is both what an upload here changes and
-/// the only slot worth comparing anything against. A device that leaves the
-/// number out is describing its one slot, which `img::parse_state` already
-/// reads as zero.
+/// The slot the half is running: what it carries now, and what a swap puts
+/// there. A device that leaves the number out is describing its one slot,
+/// which `img::parse_state` already reads as zero.
 fn primary(slots: &[ImageSlot]) -> Option<&ImageSlot> {
     slots.iter().find(|slot| slot.slot == 0)
 }
 
-/// Whether the primary slot already holds this exact image.
-/// `major.minor.patch` out of an MCUboot version, ignoring any `+build`.
+/// The spare slot: where an upload lands, until MCUboot swaps it in.
+fn secondary(slots: &[ImageSlot]) -> Option<&ImageSlot> {
+    slots.iter().find(|slot| slot.slot == 1)
+}
+
+/// `major.minor.patch` out of a version, ignoring any `-suffix` or `+build`.
 ///
-/// Anything unparseable returns None, which is read as "cannot tell" and lets
-/// the write through: refusing on a version string nobody can read would be a
-/// worse failure than the one this guards against.
+/// A board reports what MCUboot formatted out of the image header; a bundle
+/// reports whatever it was packed with, which is where the `-suffix` comes
+/// from. Anything unparseable returns None, which is read as "cannot tell" and
+/// lets the write through: refusing on a version string nobody can read would
+/// be a worse failure than the one this guards against.
 fn ordering_of(version: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = version.split('+').next()?.split('.');
+    let mut parts = version.split(['-', '+']).next()?.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().unwrap_or("0").parse().ok()?;
@@ -508,45 +847,319 @@ fn installed(slots: &[ImageSlot], wanted: &[u8]) -> bool {
     primary(slots).is_some_and(|slot| slot.hash == wanted)
 }
 
-/// Fails unless the image that was written is the image the board now reports.
-fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
-    let Some(slot) = primary(slots) else {
+/// When a slot is being compared against the bundle, and which slot that is.
+#[derive(Clone, Copy)]
+enum Checked {
+    /// Straight after the upload, with the half still in recovery and the
+    /// image sitting in the spare slot.
+    Written,
+    /// On a fresh session, after MCUboot swapped and the half restarted.
+    Restarted,
+}
+
+impl Checked {
+    /// The slot this looks at.
+    fn slot(self, slots: &[ImageSlot]) -> Option<&ImageSlot> {
+        match self {
+            Checked::Written => secondary(slots),
+            Checked::Restarted => primary(slots),
+        }
+    }
+
+    /// What that slot is called, in a sentence.
+    fn named_slot(self) -> &'static str {
+        match self {
+            Checked::Written => "spare slot",
+            Checked::Restarted => "primary slot",
+        }
+    }
+
+    /// The lead-in a failure is worded from.
+    fn lead(self, half: Half) -> String {
+        match self {
+            Checked::Written => format!("The {half} half took the whole image and then reported"),
+            Checked::Restarted => format!("After restarting, the {half} half reports"),
+        }
+    }
+
+    /// What a wrong hash means at this point.
+    fn wrong(self) -> &'static str {
+        match self {
+            Checked::Written => "The upload did not land where it was meant to.",
+            Checked::Restarted => {
+                "What is in flash is not what the bundle carries: the swap did not complete."
+            }
+        }
+    }
+}
+
+/// Fails unless the slot the board reports is the image the bundle carries.
+///
+/// After the restart it also has to be confirmed: MCUboot reports an
+/// unconfirmed primary slot as `active` without `confirmed` — the `REVERT`
+/// case in `boot/boot_serial/src/boot_serial.c` — which means the old image
+/// comes back on the next boot.
+fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half, checked: Checked) -> Result<()> {
+    let lead = checked.lead(half);
+    let named_slot = checked.named_slot();
+    let Some(slot) = checked.slot(slots) else {
         bail!(
-            "The {half} half took the whole image and then reported no primary slot at all, \
-             so there is nothing to check it against. Nothing on that half can be trusted \
-             until it is read again."
+            "{lead} no {named_slot} at all, so there is nothing to check it against. Nothing \
+             on that half can be trusted until it is read again."
         );
     };
-    if slot.hash == wanted {
-        return Ok(());
-    }
     if slot.hash.is_empty() {
         bail!(
-            "The {half} half took the whole image and then reported an empty hash for its \
-             primary slot, which is what a slot MCUboot could not verify looks like. The \
-             image on it is not bootable.",
+            "{lead} an empty hash for its {named_slot}, which is what a slot MCUboot could \
+             not verify looks like. The image on it is not bootable.",
         );
     }
-    bail!(
-        "The {half} half took the whole image and then reported {} in its primary slot, not \
-         the {} that was sent. The upload did not land where it was meant to.",
-        short(&slot.hash),
-        short(wanted)
-    )
+    if slot.hash != wanted {
+        bail!(
+            "{lead} {} in its {named_slot}, not the {} that was sent. {}",
+            short(&slot.hash),
+            short(wanted),
+            checked.wrong()
+        );
+    }
+    if matches!(checked, Checked::Restarted) && !slot.confirmed {
+        bail!(
+            "{lead} the bundle's image, but has not confirmed it. That means the half never \
+             finished booting its new firmware, so MCUboot puts the old image back on the \
+             next restart and this update is undone. Unplug the keyboard, plug it back in, \
+             and run the same command again."
+        );
+    }
+    Ok(())
+}
+
+/// The version of the slot carrying `wanted`.
+fn version_carrying(slots: &[ImageSlot], wanted: &[u8]) -> String {
+    slots
+        .iter()
+        .find(|slot| slot.hash == wanted)
+        .map(|slot| slot.version.clone())
+        .unwrap_or_default()
+}
+
+/// The version the bundle names.
+///
+/// Its header string is what the release calls itself and is what a person
+/// recognises, but it is free text the packer supplies; when it is not a
+/// version this can read, the images' own MCUboot headers answer instead.
+fn wanted_version(bundle: &Bundle) -> String {
+    if ordering_of(&bundle.header.build_version).is_some() {
+        return bundle.header.build_version.clone();
+    }
+    image::inspect(bundle.image(Half::Left))
+        .map(|info| info.version)
+        .unwrap_or_default()
+}
+
+/// Both halves are up; they are just not carrying the same thing.
+///
+/// Its own type so the failure epilogue can tell it apart from every other
+/// way this can end, all of which leave a half sitting in a bootloader.
+#[derive(Debug)]
+struct Mismatched(String);
+
+impl std::fmt::Display for Mismatched {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Mismatched {}
+
+/// What one half came out of the run carrying.
+struct Carried {
+    half: Half,
+    /// What its primary slot reported while it was being written.
+    version: String,
+    /// Its primary slot's hash, re-read after the restart. `None` when the
+    /// read-back could not be made.
+    hash: Option<Vec<u8>>,
+}
+
+/// Fails unless both halves and the bundle name one build.
+///
+/// Each half's read-back proves that half took the image it was sent, and
+/// nothing so far has put the two answers next to each other. A run that
+/// wrote one half and left the other on what it had is a keyboard on two
+/// builds, whose halves cannot talk over the wire between them, and it is not
+/// a success however well each half went on its own.
+///
+/// Both the version strings and the hashes read back after the restart, so a
+/// pair that disagrees is caught by identity rather than only by what it calls
+/// itself.
+fn agreed(bundle: &Bundle, carried: &[Carried]) -> Result<()> {
+    let wanted = wanted_version(bundle);
+    let reading = ordering_of(&wanted);
+
+    let mut found: Vec<String> = Vec::new();
+    for entry in carried {
+        let half = entry.half;
+        let wrong_hash = match (&entry.hash, bundle.hash(half)) {
+            (Some(hash), Some(bundled)) => *hash != bundled,
+            _ => false,
+        };
+        if wrong_hash {
+            found.push(format!(
+                "the {half} half is carrying {}",
+                short(entry.hash.as_deref().unwrap_or_default())
+            ));
+        } else if reading.is_none() || ordering_of(&entry.version) != reading {
+            found.push(format!("the {half} half is on {}", named(&entry.version)));
+        }
+    }
+    if found.is_empty() {
+        log::debug!("both halves are on {}", named(&wanted));
+        return Ok(());
+    }
+
+    found.push(format!("the bundle is {}", named(&wanted)));
+    Err(Mismatched(format!(
+        "The keyboard did not come out of this on one build: {}. Both halves have to be on \
+         the same build or they cannot talk over the wire between them. Run the same command \
+         again; if it says the same thing, the bundle is not the one you meant.",
+        found.join(", ")
+    ))
+    .into())
 }
 
 fn report_slot(slots: &[ImageSlot]) {
-    match primary(slots) {
-        Some(slot) if slot.hash.is_empty() => {
-            log::debug!("slot 0 is empty or unverifiable")
-        }
-        Some(slot) => log::debug!(
-            "slot 0 carries {} ({})",
-            short(&slot.hash),
-            named(&slot.version)
-        ),
-        None => log::debug!("it reports no primary slot"),
+    if slots.is_empty() {
+        log::debug!("it reports no slots at all");
+        return;
     }
+    for slot in slots {
+        if slot.hash.is_empty() {
+            log::debug!("slot {} is empty or unverifiable", slot.slot);
+            continue;
+        }
+        log::debug!(
+            "slot {} carries {} ({}) [{}]",
+            slot.slot,
+            short(&slot.hash),
+            named(&slot.version),
+            slot.flags().join(" ")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirming the keyboard came back
+// ---------------------------------------------------------------------------
+
+/// How long to give the keyboard to come back typing.
+///
+/// It has to enumerate, its halves have to link up, and only then has either
+/// of them anything to say about itself. Generous on purpose: the cost of a
+/// window that is too short is telling someone an update that worked did not.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(15);
+
+/// The pause between looks, while the keyboard is still on its way back.
+const CONFIRM_GAP: Duration = Duration::from_millis(500);
+
+/// Whether the keyboard came back on its own firmware, with both halves in it.
+///
+/// Everything before this read a half's slot while that half sat in MCUboot,
+/// which proves the image landed and nothing about either half booting it.
+/// This is the first thing in the run that talks to the running firmware, and
+/// it asks for both halves at once: the right half's answer crosses the wire
+/// between the halves, so getting both is both applications up and the two of
+/// them talking to each other.
+fn came_back(limit: Duration) -> bool {
+    let spinner = new_spinner("Waiting for the keyboard to restart");
+    let back = keep_looking(
+        limit,
+        CONFIRM_GAP,
+        Instant::now,
+        std::thread::sleep,
+        both_halves_report,
+    );
+    spinner.finish_and_clear();
+    back
+}
+
+/// Polls `look` until it answers, or until the window closes.
+///
+/// The clock and the pause are passed in so the window can be tested without
+/// waiting one out: what is worth testing here is that it keeps asking for the
+/// whole window and stops the moment it gets an answer.
+fn keep_looking(
+    limit: Duration,
+    gap: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(Duration),
+    mut look: impl FnMut() -> bool,
+) -> bool {
+    let deadline = now() + limit;
+    loop {
+        if look() {
+            return true;
+        }
+        if now() >= deadline {
+            return false;
+        }
+        pause(gap);
+    }
+}
+
+/// One look: is there a keyboard on USB, and does it answer for both halves?
+fn both_halves_report() -> bool {
+    let attached = match device::list_devices() {
+        Ok(attached) => attached,
+        Err(err) => {
+            log::debug!("could not look at what is plugged in: {err}");
+            return false;
+        }
+    };
+
+    // A board still in a bootloader is not it: the whole point is that the
+    // STM32 left one.
+    let found = attached
+        .iter()
+        .find(|device| device.bootloader.is_none() && device.keyboard == Some(Keyboard::Voyager2));
+    let Some(keyboard) = found else {
+        log::debug!("no keyboard on USB yet");
+        return false;
+    };
+
+    let Some(telemetry) = crate::usb_telemetry(keyboard) else {
+        log::debug!("the keyboard is back but has not answered yet");
+        return false;
+    };
+    both_reported(&telemetry)
+}
+
+/// Whether both halves are in what the board answered.
+fn both_reported(telemetry: &Telemetry) -> bool {
+    let quiet: Vec<&str> = [("left", telemetry.left), ("right", telemetry.right)]
+        .into_iter()
+        .filter(|(_, reading)| !reported(*reading))
+        .map(|(half, _)| half)
+        .collect();
+    if quiet.is_empty() {
+        log::debug!(
+            "both halves answered: left {:?}, right {:?}",
+            telemetry.left,
+            telemetry.right
+        );
+        return true;
+    }
+    log::debug!("nothing from the {} half yet", quiet.join(" or the "));
+    false
+}
+
+/// Whether one half said anything about itself.
+///
+/// A level is the ordinary answer, and the flags are the second one: they are
+/// set only where the reading behind them is real, so a half whose fuel gauge
+/// has not converged yet still counts as having answered. Which is the point —
+/// this is asking whether the half is there, not what its battery is doing.
+fn reported(reading: BatteryReading) -> bool {
+    reading.level.is_some() || reading.charging.is_some() || reading.usb.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -559,11 +1172,8 @@ fn report_slot(slots: &[ImageSlot]) {
 /// the bootloader itself recorded, the bus recovery count and the bytes it had
 /// to drop, and all three are current at the moment the failure is being
 /// explained rather than at the last time anything happened to look.
-fn advice<L: IgnitionLink>(ignition: &mut Ignition<L>, err: &anyhow::Error) -> Vec<String> {
+fn advice<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Vec<String> {
     let mut notes = Vec::new();
-    if let Some(note) = event_advice(err) {
-        notes.push(wrap(&note));
-    }
     match ignition.status() {
         Ok(status) => {
             if let Some(note) = session_error(&status) {
@@ -585,56 +1195,29 @@ fn advice<L: IgnitionLink>(ignition: &mut Ignition<L>, err: &anyhow::Error) -> V
 /// `None` for a session that recorded none, and for a code from a firmware
 /// newer than this build — the raw number is more honest than a guess.
 fn session_error(status: &Status) -> Option<String> {
-    let bus = bus_phrase(status);
-    Some(match status.error {
-        0x0000 => return None,
-        0x0001 => "The left half never answered over the UART between it and the STM32. It is \
-             the one link in this path with no diagnostic of its own, so this is either a \
-             left half that is not in MCUboot or one whose serial recovery is not built in."
-            .to_string(),
-        0x0002 => format!(
-            "The right half never brought up its MCUboot mailbox on the TRRS bus ({bus}). \
-             The STM32 asks it to reboot into recovery over that same bus, so either the \
-             ask did not reach it or it did not come back — check the TRRS cable and that \
-             the right half has charge in it."
-        ),
-        0x0003 => format!(
-            "The TRRS cable came out, or never made contact ({bus}). Nothing reaches the \
-             right half without it. Reseat both ends."
-        ),
-        0x0004 => format!(
-            "The right half's matrix expander did not acknowledge on the TRRS bus ({bus}). \
-             That chip answers whenever the bus is wired and powered, so this is the cable \
-             or the right half's supply rather than anything to do with the update."
-        ),
-        0x0005 => format!(
-            "The right half stopped answering on the TRRS bus ({bus}) — check the cable. \
-             The bus is shared with the matrix and the LEDs, so a marginal connection \
-             shows up here first."
-        ),
-        0x0006 => "The bootloader is bridging to a serial port that is not open. Nothing on \
-             this machine has the CDC interface claimed, which on Linux usually means the \
-             udev rule for it is not installed."
-            .to_string(),
-        0x0007 => "A line came back from a half longer than the bootloader's buffer, so it \
-             was dropped. The two ends disagree about the line codec, which means the \
-             bootloader and this zapp are not from the same release."
-            .to_string(),
-        0x0008 => "Frames were sent before a half was chosen. That is this zapp getting the \
-             order wrong rather than anything about the keyboard."
-            .to_string(),
-        0x0009 => format!(
-            "The bridge gave up waiting for a half to answer ({bus}). Whichever half was \
-             selected went quiet part-way through an exchange."
-        ),
-        0x00FF => "The bootloader hit an internal error. There is nothing to act on from \
-             here: unplug the keyboard, plug it back in, and try once more."
-            .to_string(),
-        other => format!(
-            "The bootloader reported error {other:#06x}, which this build does not have a \
-             sentence for. It is running a newer firmware than this zapp knows."
-        ),
-    })
+    if status.error == 0x0000 {
+        return None;
+    }
+    log::debug!(
+        "session error {:#06x}, bus {}",
+        status.error,
+        bus_phrase(status)
+    );
+    Some(
+        match status.error {
+            // Everything the right half is reached through is on the one
+            // cable, so every way it can go quiet has the same answer.
+            0x0002..=0x0005 | 0x0009 => "Make sure the TRRS cable is properly seated.",
+            0x0001 => "The left half did not respond.",
+            0x0006 => "This computer could not open the keyboard. On Linux, check the udev \
+                 rule is installed.",
+            0x0007 => "The keyboard's bootloader and this version of zapp do not match.",
+            0x0008 => "Something went wrong inside zapp.",
+            0x00FF => "Unplug the keyboard, plug it back in, and try again.",
+            _ => "The keyboard's bootloader is newer than this version of zapp.",
+        }
+        .to_string(),
+    )
 }
 
 /// A note about a bus that coped but had to work at it.
@@ -642,15 +1225,16 @@ fn session_error(status: &Status) -> Option<String> {
 /// Only when the session recorded no error of its own: a run that failed
 /// somewhere else while the bus was recovering repeatedly is worth pointing at
 /// the bus anyway.
+///
+/// No counts. Reaching here means the far half was in its bootloader and the
+/// transfer was moving, so the cable is the story and the numbers behind that
+/// conclusion are ours, not the reader's.
 fn bus_health(status: &Status) -> Option<String> {
     if status.recover_count == 0 && status.rx_drops == 0 {
         return None;
     }
-    Some(format!(
-        "The bootloader recorded no fault, but the TRRS bus did not have an easy time of it \
-         ({}). That is the first thing to look at: reseat the cable and try again.",
-        bus_phrase(status)
-    ))
+    log::debug!("bus health at the failure: {}", bus_phrase(status));
+    Some("Make sure the TRRS cable is properly seated.".to_string())
 }
 
 /// "3 bus recoveries at 50 kHz, 7 bytes dropped".
@@ -665,52 +1249,6 @@ fn bus_phrase(status: &Status) -> String {
         parts.push(format!("{} bytes dropped on the way back", status.rx_drops));
     }
     parts.join(", ")
-}
-
-/// The bridge's own diagnostic, when one is what failed the transfer.
-///
-/// A fatal `EVENT` comes back through `SmpClient` as a transport error carrying
-/// the event's own words, which is the only thing left of it by the time it
-/// reaches here — so the codes are matched by the sentence each one prints.
-/// `None` for every other failure, including an event code from a newer
-/// firmware, which prints its own number and needs nothing added.
-fn event_advice(err: &anyhow::Error) -> Option<String> {
-    use zapp_wired::pipe::EventCode::*;
-
-    let text = format!("{err:#}");
-    let reported = |code: zapp_wired::pipe::EventCode| text.contains(&code.to_string());
-
-    if reported(MailboxGone) {
-        return Some(
-            "The right half's MCUboot mailbox stopped answering part-way through. That half \
-             restarted, or the TRRS bus dropped out from under it — either way what was \
-             written to it is incomplete."
-                .to_string(),
-        );
-    }
-    if reported(TargetNotSelected) {
-        return Some(
-            "The bootloader was sent frames with no half selected, which is this zapp \
-             getting the order wrong rather than anything about the keyboard."
-                .to_string(),
-        );
-    }
-    if reported(RxOverflow) || reported(UartOverrun) {
-        return Some(
-            "The bootloader's receive buffer overflowed, so bytes coming back from a half \
-             were lost. The two ends disagree about how much may be in flight, which means \
-             the bootloader and this zapp are not from the same release."
-                .to_string(),
-        );
-    }
-    if reported(I2cTimeout) || reported(I2cNack) {
-        return Some(
-            "The right half stopped acknowledging on the TRRS bus. Reseat the cable at both \
-             ends and try again."
-                .to_string(),
-        );
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -734,75 +1272,6 @@ fn announce(bundle: &Bundle, _path: &Path, _len: usize) {
         }
     }
     log::debug!("radio key fingerprint {:08x}", bundle.header.key_fingerprint);
-}
-
-fn print_status(status: &Status) {
-    println!("Ignition · session {}", session_as(status.state));
-    println!("  target  {}", target_as(status.target));
-    println!("  left    {}", running(status.left_state));
-    println!("  right   {}", running(status.right_state));
-    println!(
-        "  TRRS    {} kHz · {} recover{} · {} bytes dropped",
-        status.i2c_khz,
-        status.recover_count,
-        if status.recover_count == 1 { "y" } else { "ies" },
-        status.rx_drops
-    );
-    println!(
-        "  pipe    v{} · {} bytes per message",
-        status.proto_version, status.max_payload
-    );
-    println!(
-        "  error   {}",
-        match status.error {
-            0 => "none".to_string(),
-            code => format!("{code:#06x}"),
-        }
-    );
-}
-
-/// One line per address ignition probed.
-fn scan_lines(scan: &[u8]) -> Vec<String> {
-    SCANNED
-        .iter()
-        .enumerate()
-        .map(|(at, (address, what))| {
-            let result = scan.get(at).copied().unwrap_or(0xFF);
-            format!("{address:#04x}  {what:<40}  {}", answered(result))
-        })
-        .collect()
-}
-
-/// What one probe byte means. Zero is an ACK; the rest are ignition's own
-/// negative error codes in a signed byte.
-fn answered(result: u8) -> &'static str {
-    match result as i8 {
-        0 => "answered",
-        -1 => "no answer (NACK)",
-        -2 => "bus error",
-        -3 => "timed out",
-        _ => "a result this build does not know",
-    }
-}
-
-fn session_as(state: SessionState) -> String {
-    match state {
-        SessionState::Idle => "idle".to_string(),
-        SessionState::Active => "active".to_string(),
-        SessionState::Fault => "faulted".to_string(),
-        SessionState::Pending => "opening".to_string(),
-        SessionState::Unrecognised(code) => format!("a state this zapp does not know ({code})"),
-    }
-}
-
-fn target_as(target: zapp_wired::pipe::Target) -> &'static str {
-    use zapp_wired::pipe::Target;
-    match target {
-        Target::Selected => "none selected",
-        Target::Left => "the left half",
-        Target::Right => "the right half",
-        Target::Stm32 => "the STM32",
-    }
 }
 
 fn running(state: TargetState) -> &'static str {
@@ -891,9 +1360,7 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
         Err(err) => return Err(err).context("Could not open the ZSA bootloader"),
     }
 
-    let spinner = new_spinner(
-        "Waiting for the bootloader — press the reset button on the left half of the keyboard",
-    );
+    let spinner = new_spinner("Press your keyboard's reset button");
     let deadline = Instant::now() + limit;
 
     loop {
@@ -909,14 +1376,9 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
             Err(WiredError::NoBootloader) => {
                 spinner.finish_and_clear();
                 bail!(
-                    "No ZSA bootloader appeared in {} seconds.\n\n{}",
-                    limit.as_secs(),
-                    wrap(
-                        "Pressing the reset button on the left half is what puts the STM32 into \
-                         ignition, and ignition is what this whole path goes through. A keyboard \
-                         running its own firmware does not serve any of it. `zapp devices` lists \
-                         what is plugged in."
-                    )
+                    "no bootloader appeared in {} seconds. Press the reset button on the left \
+                     half; `zapp devices` lists what is plugged in",
+                    limit.as_secs()
                 )
             }
             Err(err) => {
@@ -986,6 +1448,7 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zapp_smp::fake::FakeSlot;
     use zapp_smp::{client, img};
     use zapp_wired::ignition;
     use zapp_wired::loopback::{LoopbackDevice, LoopbackLink};
@@ -994,6 +1457,47 @@ mod tests {
     /// The hash the in-memory device reports for its one slot, whatever has
     /// been written to it.
     const DEVICE_HASH: [u8; 32] = [0x11; 32];
+
+    /// The hash a bundle that is not already installed is named by.
+    const BUNDLE_HASH: [u8; 32] = [0xab; 32];
+
+    /// One image listing: the half is running `primary` with nothing pending.
+    fn settled(primary: &[u8], spare: &[u8]) -> Vec<FakeSlot> {
+        vec![
+            FakeSlot::new(0, primary).active().confirmed(),
+            FakeSlot::new(1, spare),
+        ]
+    }
+
+    /// The same, with the spare slot marked for test.
+    fn staged(primary: &[u8], spare: &[u8]) -> Vec<FakeSlot> {
+        vec![
+            FakeSlot::new(0, primary).confirmed(),
+            FakeSlot::new(1, spare).pending(),
+        ]
+    }
+
+    /// `BOOT_SWAP_TYPE_REVERT`: the new image is running and unconfirmed, so
+    /// the next boot puts the old one back.
+    fn reverting(primary: &[u8], spare: &[u8]) -> Vec<FakeSlot> {
+        vec![
+            FakeSlot::new(0, primary).active(),
+            FakeSlot::new(1, spare).confirmed(),
+        ]
+    }
+
+    /// The listings a run that writes both halves reads, in order: before and
+    /// after each half's upload, then one per half on the read-back pass.
+    fn a_whole_run(after_restart: Vec<FakeSlot>) -> Vec<Vec<FakeSlot>> {
+        vec![
+            settled(&DEVICE_HASH, &[]),
+            staged(&DEVICE_HASH, &BUNDLE_HASH),
+            settled(&DEVICE_HASH, &[]),
+            staged(&DEVICE_HASH, &BUNDLE_HASH),
+            after_restart.clone(),
+            after_restart,
+        ]
+    }
 
     /// A signed image whose trailer names it by `hash`.
     ///
@@ -1032,7 +1536,16 @@ mod tests {
     }
 
     /// A whole .zsab, laid out the way `tools/zsa_bundle.py` writes one.
+    ///
+    /// Named for the version the fake board reports, so the whole-keyboard
+    /// check at the end of a run has nothing to object to. A test that wants
+    /// it to object asks for another with `bundled_v`.
     fn bundled(left: &[u8], right: &[u8]) -> Vec<u8> {
+        bundled_v(left, right, "9.9.9")
+    }
+
+    /// The same, calling itself something else.
+    fn bundled_v(left: &[u8], right: &[u8], build_version: &str) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"ZSAB");
         out.extend_from_slice(&1u16.to_le_bytes());
@@ -1043,7 +1556,7 @@ mod tests {
         out.extend_from_slice(&(right.len() as u32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // key fingerprint
         let mut version = [0u8; 32];
-        version[.."0.1.9-wired".len()].copy_from_slice(b"0.1.9-wired");
+        version[..build_version.len()].copy_from_slice(build_version.as_bytes());
         out.extend_from_slice(&version);
         out.extend_from_slice(left);
         out.extend_from_slice(right);
@@ -1064,8 +1577,18 @@ mod tests {
         blob: &[u8],
         force: bool,
     ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+        flash_loopback_setup(blob, force, |_| {})
+    }
+
+    /// The same, with the fake keyboard set up first.
+    fn flash_loopback_setup(
+        blob: &[u8],
+        force: bool,
+        setup: impl FnOnce(&LoopbackDevice),
+    ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
         let bundle = bundle::parse(blob).expect("a bundle");
         let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        setup(&device);
         let shared = Shared::new(link);
         let mut ignition = Ignition::new(shared.clone());
 
@@ -1075,6 +1598,8 @@ mod tests {
             &bundle,
             force,
             Duration::from_millis(50),
+            // No settle: the in-memory halves have nothing to swap or reboot.
+            Duration::ZERO,
         );
         // END the way `flash` does, so the recorded sequence is the whole one.
         if result.is_ok() {
@@ -1104,24 +1629,98 @@ mod tests {
         assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
         // And the storage erase belongs to an upload, not to a skipped half.
         assert_eq!(count(&device, (BASIC_GROUP, BASIC_CMD_ERASE_STORAGE)), 0);
-        // It still read both halves before deciding.
-        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 2);
+        // Two reads per half: once before deciding, once after the restart.
+        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 4);
     }
 
     #[test]
     fn an_image_the_board_does_not_report_after_the_upload_fails_the_run() {
         // The post-upload read is the whole point: the upload itself succeeds
         // here — every byte is acknowledged — and the run still has to fail,
-        // because the slot does not come back carrying what was sent.
+        // because the spare slot does not come back carrying what was sent.
         let blob = bundled(&signed(0x11, &[0xa1; 32]), &signed(0x22, &[0xb2; 32]));
-        let (result, _control, device) = flash_loopback(&blob);
+        let (result, _control, device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = vec![settled(&DEVICE_HASH, &[0x99; 32])])
+        });
 
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("took the whole image"), "{err}");
         assert!(err.contains("not the"), "{err}");
-        // It got as far as writing: one upload, and the read back after it.
+        // It got as far as writing: one upload, then the read that caught it.
+        // The mark never runs, because nothing worth arming is there.
         assert!(count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0, "{err}");
         assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 2);
+        assert!(device.marks().is_empty(), "a bad upload was armed anyway");
+    }
+
+    #[test]
+    fn the_post_upload_check_reads_the_spare_slot_and_not_the_one_being_run() {
+        // Slot 0 is already the bundle's image here and slot 1 is not, which
+        // only fails if the check looks where the upload actually went.
+        let blob = bundled(&signed(0x11, &[0xa1; 32]), &signed(0x22, &[0xb2; 32]));
+        let (result, _control, _device) = flash_loopback_setup(&blob, true, |device| {
+            device.tweak(|fake| fake.listings = vec![settled(&[0xb2; 32], &[0x99; 32])])
+        });
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("in its spare slot"), "{err}");
+        assert!(err.contains("did not land"), "{err}");
+    }
+
+    #[test]
+    fn a_written_half_stages_into_image_two_and_marks_it_for_test_never_confirmed() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let (result, _control, device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
+        });
+        result.expect("both halves swapped and confirmed");
+
+        // Image 2 is slot1_partition under direct image upload. Image 0 or 1
+        // would be the slot the half is running.
+        assert_eq!(device.uploads(), vec![SPARE_IMAGE, SPARE_IMAGE]);
+        // Marked for test, not confirmed: confirming from here would throw the
+        // way back away before the half has run the image once.
+        assert_eq!(
+            device.marks(),
+            vec![
+                (BUNDLE_HASH.to_vec(), false),
+                (BUNDLE_HASH.to_vec(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_swap_that_completed_and_was_confirmed_passes_the_read_back() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let (result, control, device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = a_whole_run(settled(&BUNDLE_HASH, &DEVICE_HASH)))
+        });
+        result.expect("both halves swapped and confirmed");
+
+        assert!(count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0);
+        // Two sessions: the one that wrote, and the one that read back after
+        // both halves swapped.
+        assert_eq!(
+            control
+                .iter()
+                .filter(|(request, _)| *request == ignition::REQ_BEGIN)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_swap_the_halves_never_confirmed_fails_and_says_the_update_is_undone() {
+        // The bundle's image is in slot 0 and running, so every hash matches.
+        // Only the missing confirm says MCUboot is about to put it back.
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let (result, _control, _device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| fake.listings = a_whole_run(reverting(&BUNDLE_HASH, &DEVICE_HASH)))
+        });
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("has not confirmed it"), "{err}");
+        assert!(err.contains("this update is undone"), "{err}");
     }
 
     #[test]
@@ -1158,12 +1757,12 @@ mod tests {
             .collect();
         // 2 is right, then 1 twice: the bridge is pointed away from the right
         // as soon as it has been told to reboot, and then at the left again as
-        // the left's own turn begins.
-        assert_eq!(selects, vec![2, 1, 1]);
+        // the left's own turn begins. The read-back pass repeats the pattern.
+        assert_eq!(selects, vec![2, 1, 1, 2, 1, 1]);
     }
 
     #[test]
-    fn the_whole_session_is_one_begin_and_one_end_with_both_resets_inside_it() {
+    fn the_write_pass_and_the_read_back_pass_are_one_session_each_and_one_end() {
         let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
         let (result, control, _device) = flash_loopback(&blob);
         result.unwrap();
@@ -1174,22 +1773,25 @@ mod tests {
             .into_iter()
             .filter(|(request, _)| *request != ignition::REQ_STATUS)
             .collect();
-        assert_eq!(
-            sequence,
-            vec![
-                (ignition::REQ_BEGIN, Halves::BOTH.bits()),
-                (ignition::REQ_SELECT, 2),
-                // Twice: once to stop the bridge polling the right half while
-                // it reboots, then again as the left's own turn begins. The
-                // second is redundant and costs one control transfer, which is
-                // cheaper than the bus recovery the first one avoids.
-                (ignition::REQ_SELECT, 1),
-                (ignition::REQ_SELECT, 1),
-                (ignition::REQ_RELEASE_MD, 0),
-                (ignition::REQ_RESET_TARGET, 1),
-                (ignition::REQ_END, 0),
-            ]
-        );
+        let pass = vec![
+            // No END between the passes: BEGIN closes a session it finds in
+            // the way, and ending one here would throw away the fault a
+            // failure is explained from.
+            (ignition::REQ_BEGIN, Halves::BOTH.bits()),
+            (ignition::REQ_SELECT, 2),
+            // Twice: once to stop the bridge polling the right half while
+            // it reboots, then again as the left's own turn begins. The
+            // second is redundant and costs one control transfer, which is
+            // cheaper than the bus recovery the first one avoids.
+            (ignition::REQ_SELECT, 1),
+            (ignition::REQ_SELECT, 1),
+            (ignition::REQ_RELEASE_MD, 0),
+            (ignition::REQ_RESET_TARGET, 1),
+        ];
+        let mut expected = pass.clone();
+        expected.extend(pass);
+        expected.push((ignition::REQ_END, 0));
+        assert_eq!(sequence, expected);
         // Only the left is reset through ignition. The right has no reset line
         // the STM32 can reach, so it leaves recovery by its own SMP reset —
         // asserted in a_right_half_is_restarted_by_its_own_smp_reset.
@@ -1209,9 +1811,11 @@ mod tests {
             control.contains(&(ignition::REQ_RESET_TARGET, 1)),
             "the left half was not reset: {control:?}"
         );
+        // Once for the write pass and once for the read-back pass, both of
+        // which put the halves back in their bootloaders.
         assert_eq!(
             count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
-            1,
+            2,
             "the right half was not reset out of MCUboot"
         );
     }
@@ -1272,8 +1876,8 @@ mod tests {
         );
         assert_eq!(
             count(&device, (client::OS_GROUP, client::OS_CMD_RESET)),
-            1,
-            "expected exactly one SMP reset, for the right half"
+            2,
+            "expected one SMP reset for the right half in each pass"
         );
     }
 
@@ -1292,13 +1896,14 @@ mod tests {
             .position(|sent| *sent == (ignition::REQ_RESET_TARGET, 1))
             .expect("the left half's reset");
         assert!(md < reset, "{control:?}");
-        // And it is not sent for the right half, which has no MD pin held.
+        // And it is not sent for the right half, which has no MD pin held: one
+        // release per pass, both of them the left's.
         assert_eq!(
             control
                 .iter()
                 .filter(|sent| **sent == (ignition::REQ_RELEASE_MD, 0))
                 .count(),
-            1
+            2
         );
     }
 
@@ -1320,6 +1925,135 @@ mod tests {
         assert!(begin < polled, "{control:?}");
     }
 
+    // ---- Reading the halves back ---------------------------------------
+
+    #[test]
+    fn both_halves_are_read_again_after_they_restart_and_a_match_passes() {
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let (result, control, device) = flash_loopback(&blob);
+        result.expect("both halves still carry the bundle after their restart");
+
+        // Two state reads per half: the one the write pass makes, and the one
+        // that happens on a session opened after both halves restarted.
+        assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 4);
+        assert_eq!(
+            control
+                .iter()
+                .filter(|(request, _)| *request == ignition::REQ_BEGIN)
+                .count(),
+            2,
+            "the halves were not put back in their bootloaders to be read: {control:?}"
+        );
+    }
+
+    #[test]
+    fn a_half_that_stops_carrying_the_bundles_image_after_it_restarts_fails_the_run() {
+        // Two reads land in the write pass and the third is the right half's
+        // read-back, by which point the board reports something else. Nothing
+        // before it went wrong, which is the whole reason to look again.
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let (result, _control, _device) = flash_loopback_setup(&blob, false, |device| {
+            device.tweak(|fake| {
+                fake.slot_hashes = vec![DEVICE_HASH.to_vec(), DEVICE_HASH.to_vec(), vec![0x99; 32]]
+            })
+        });
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("After restarting"), "{err}");
+        assert!(err.contains("not what the bundle carries"), "{err}");
+        assert!(!err.contains("took the whole image"), "{err}");
+    }
+
+    /// A link whose STATUS always reports one recorded fault.
+    struct Faulting(u16);
+
+    impl IgnitionLink for Faulting {
+        fn control_out(
+            &mut self,
+            _request: u8,
+            _value: u16,
+        ) -> std::result::Result<(), WiredError> {
+            Ok(())
+        }
+
+        fn control_in(
+            &mut self,
+            _request: u8,
+            _value: u16,
+            length: usize,
+        ) -> std::result::Result<Vec<u8>, WiredError> {
+            let mut bytes = vec![0u8; ignition::STATUS_LEN];
+            bytes[0] = ignition::STATUS_VERSION;
+            bytes[1] = 2; // fault
+            bytes[5..7].copy_from_slice(&self.0.to_le_bytes());
+            bytes.truncate(length);
+            Ok(bytes)
+        }
+
+        fn bulk_out(&mut self, _message: &[u8]) -> std::result::Result<(), WiredError> {
+            Ok(())
+        }
+
+        fn bulk_in(&mut self, _timeout: Duration) -> std::result::Result<Vec<u8>, WiredError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_session_the_right_half_would_not_answer_is_the_one_read_back_worth_excusing() {
+        // The right's bootloader entry is the flaky step and the write pass
+        // already proved both halves' bytes, so this is the one way the
+        // read-back is allowed to end inconclusively.
+        for error in [0x0002, 0x0003, 0x0004, 0x0005] {
+            assert!(
+                right_absent(&mut Ignition::new(Faulting(error))),
+                "{error:#06x}"
+            );
+        }
+        // Everything else is a failure, including a session with no fault at
+        // all — which is not a reason the read-back could not be made.
+        for error in [0x0000, 0x0001, 0x0006, 0x0007, 0x0008, 0x00FF] {
+            assert!(
+                !right_absent(&mut Ignition::new(Faulting(error))),
+                "{error:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_back_the_right_half_will_not_answer_fails_the_run() {
+        // Staging is not installing: the write pass proved the bytes reached
+        // the spare slot, and an image that swaps in and is never confirmed is
+        // reverted. A check that could not be made is not a success.
+        let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
+        let bundle = bundle::parse(&blob).unwrap();
+        let shared = Shared::new(Faulting(0x0002));
+        let mut ignition = Ignition::new(shared.clone());
+        let mut carried = [
+            on_version(Half::Right, "9.9.9"),
+            on_version(Half::Left, "9.9.9"),
+        ];
+
+        let err = verify(
+            &shared,
+            &mut ignition,
+            &bundle,
+            &mut carried,
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect_err("a read-back that could not be made is not a success");
+
+        // And it says which half went quiet and what is still at stake, rather
+        // than surfacing the session fault on its own.
+        let said = format!("{err}");
+        assert!(said.contains("right half did not answer"), "{said}");
+        assert!(said.contains("may not have taken"), "{said}");
+        // Nothing was read, so nothing is claimed about either half.
+        assert!(carried.iter().all(|entry| entry.hash.is_none()));
+    }
+
     // ---- The decisions, on their own -----------------------------------
 
     fn slot(number: u32, hash: &[u8]) -> ImageSlot {
@@ -1331,12 +2065,20 @@ mod tests {
         }
     }
 
+    /// The same, confirmed: a primary slot with no swap outstanding.
+    fn kept(number: u32, hash: &[u8]) -> ImageSlot {
+        ImageSlot {
+            confirmed: true,
+            ..slot(number, hash)
+        }
+    }
+
     #[test]
-    fn the_slot_a_recovery_upload_writes_is_the_one_that_is_compared() {
+    fn the_slot_the_half_is_running_is_what_decides_it_is_already_installed() {
         let wanted = [0xa1; 32];
         assert!(installed(&[slot(0, &wanted)], &wanted));
-        // The same image sitting in the spare slot is not installed: recovery
-        // writes the primary, so slot 1 is not what an upload would change.
+        // The same image staged in the spare slot has not been swapped in yet,
+        // so the half is not carrying it.
         assert!(!installed(&[slot(1, &wanted)], &wanted));
         assert!(!installed(&[slot(0, &[0x99; 32])], &wanted));
         assert!(!installed(&[], &wanted));
@@ -1355,25 +2097,85 @@ mod tests {
     }
 
     #[test]
-    fn an_image_that_landed_is_accepted_and_anything_else_is_not() {
+    fn an_image_that_landed_in_the_spare_slot_is_accepted_and_anything_else_is_not() {
         let wanted = [0xa1; 32];
-        assert!(landed(&[slot(0, &wanted)], &wanted, Half::Left).is_ok());
+        // Slot 1, because the upload stages rather than overwrites: the same
+        // image in slot 0 is the *old* half still running, not the new one.
+        assert!(landed(
+            &[kept(0, &[0x99; 32]), slot(1, &wanted)],
+            &wanted,
+            Half::Left,
+            Checked::Written
+        )
+        .is_ok());
+        assert!(landed(&[kept(0, &wanted)], &wanted, Half::Left, Checked::Written).is_err());
 
-        let wrong = landed(&[slot(0, &[0x99; 32])], &wanted, Half::Right)
-            .unwrap_err()
-            .to_string();
+        let wrong = landed(
+            &[kept(0, &[0x11; 32]), slot(1, &[0x99; 32])],
+            &wanted,
+            Half::Right,
+            Checked::Written,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(wrong.contains("right"), "{wrong}");
         assert!(wrong.contains("did not land"), "{wrong}");
 
         // A slot MCUboot could not verify reports no hash at all, which is a
         // different thing to say than "it carries the wrong image".
-        let empty = landed(&[slot(0, &[])], &wanted, Half::Left)
+        let empty = landed(&[slot(1, &[])], &wanted, Half::Left, Checked::Written)
             .unwrap_err()
             .to_string();
         assert!(empty.contains("not bootable"), "{empty}");
 
-        let missing = landed(&[], &wanted, Half::Left).unwrap_err().to_string();
-        assert!(missing.contains("no primary slot"), "{missing}");
+        let missing = landed(&[], &wanted, Half::Left, Checked::Written)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("no spare slot"), "{missing}");
+    }
+
+    #[test]
+    fn a_read_back_after_the_restart_says_so_rather_than_blaming_the_upload() {
+        // The same comparison, at a point where the upload is long finished:
+        // an upload that did not land is the wrong thing to tell someone whose
+        // half has already restarted.
+        let wanted = [0xa1; 32];
+        assert!(landed(&[kept(0, &wanted)], &wanted, Half::Left, Checked::Restarted).is_ok());
+
+        let wrong = landed(
+            &[kept(0, &[0x99; 32])],
+            &wanted,
+            Half::Right,
+            Checked::Restarted,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong.contains("After restarting"), "{wrong}");
+        assert!(wrong.contains("not what the bundle carries"), "{wrong}");
+        assert!(!wrong.contains("took the whole image"), "{wrong}");
+    }
+
+    #[test]
+    fn a_swap_that_completed_but_was_not_confirmed_is_a_failure_that_says_it_reverts() {
+        // MCUboot's BOOT_SWAP_TYPE_REVERT: the new image is in slot 0 and
+        // running, but nothing confirmed it, so the next boot puts the old one
+        // back. The hash alone would call this a success.
+        let wanted = [0xa1; 32];
+        let reverting = [
+            ImageSlot {
+                active: true,
+                ..slot(0, &wanted)
+            },
+            kept(1, &[0x99; 32]),
+        ];
+
+        let err = landed(&reverting, &wanted, Half::Left, Checked::Restarted)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has not confirmed it"), "{err}");
+        assert!(err.contains("this update is undone"), "{err}");
+        // Not a hash complaint: the right image is in the right place.
+        assert!(!err.contains("not the"), "{err}");
     }
 
     // ---- What a failure says -------------------------------------------
@@ -1392,47 +2194,47 @@ mod tests {
     }
 
     #[test]
-    fn an_i2c_fault_reads_like_a_cable_and_not_like_a_timeout() {
-        let note = session_error(&faulted(0x0005, 3, 0)).unwrap();
-        assert!(note.contains("stopped answering on the TRRS bus"), "{note}");
-        assert!(note.contains("3 bus recoveries at 50 kHz"), "{note}");
-        assert!(note.contains("check the cable"), "{note}");
-        assert!(!note.contains("timeout"), "{note}");
+    fn every_way_the_right_half_goes_quiet_gives_the_same_answer() {
+        // Cable, mailbox, expander, bus: one cable carries all of it, so one
+        // sentence covers all of it. The codes and counts go to the log.
+        for code in [0x0002, 0x0003, 0x0004, 0x0005, 0x0009] {
+            let note = session_error(&faulted(code, 3, 0)).unwrap();
+            assert_eq!(note, "Make sure the TRRS cable is properly seated.");
+        }
     }
 
     #[test]
-    fn every_error_the_bootloader_can_record_has_its_own_sentence() {
-        let notes: Vec<String> = (1..=9)
-            .chain(std::iter::once(0xFF))
-            .map(|code| session_error(&faulted(code, 0, 0)).expect("a sentence"))
-            .collect();
-        for note in &notes {
-            assert!(note.len() > 40, "{note}");
-            assert!(!note.contains("0x00"), "a raw code in prose: {note}");
+    fn every_error_the_bootloader_can_record_says_something_plain() {
+        for code in (1..=9).chain(std::iter::once(0xFF)) {
+            let note = session_error(&faulted(code, 0, 0)).expect("a sentence");
+            // Nothing a person cannot act on: no raw codes, no counters, no
+            // parts of the machine they have never heard of.
+            assert!(!note.contains("0x"), "a raw code in prose: {note}");
+            assert!(!note.to_lowercase().contains("mcuboot"), "{note}");
+            assert!(!note.to_lowercase().contains("mailbox"), "{note}");
+            assert!(!note.contains("bus recover"), "{note}");
         }
-        // And they are ten different sentences, not one repeated.
-        let mut unique = notes.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), notes.len());
     }
 
     #[test]
     fn a_session_with_nothing_wrong_says_nothing() {
         assert_eq!(session_error(&faulted(0, 0, 0)), None);
-        // And a code from a newer firmware is named by its number rather than
-        // dressed up as an error this build understands.
+        // A code from a firmware newer than this build still gets a sentence
+        // someone can act on rather than the number itself.
         let newer = session_error(&faulted(0x0042, 0, 0)).unwrap();
-        assert!(newer.contains("0x0042"), "{newer}");
-        assert!(newer.contains("does not have a sentence"), "{newer}");
+        assert!(!newer.contains("0x0042"), "{newer}");
+        assert!(newer.contains("newer than this version"), "{newer}");
     }
 
     #[test]
     fn a_bus_that_coped_but_had_to_work_at_it_is_still_worth_a_line() {
         assert_eq!(bus_health(&faulted(0, 0, 0)), None);
         let note = bus_health(&faulted(0, 2, 9)).unwrap();
-        assert!(note.contains("2 bus recoveries at 50 kHz"), "{note}");
-        assert!(note.contains("9 bytes dropped"), "{note}");
+        // The counts belong in the debug log, not in front of someone whose
+        // cable has come loose: reaching here means the far half was in its
+        // bootloader and bytes were moving, so seating the cable is the whole
+        // of the advice.
+        assert_eq!(note, "Make sure the TRRS cable is properly seated.");
     }
 
     #[test]
@@ -1441,51 +2243,311 @@ mod tests {
         assert!(bus_phrase(&faulted(0, 0, 0)).contains("0 bus recoveries"));
     }
 
-    #[test]
-    fn a_bridge_event_that_failed_a_transfer_is_explained_in_its_own_terms() {
-        let failed = |code: pipe::EventCode| {
-            anyhow::Error::from(SmpError::Transport(zapp_smp::TransportError::Io(
-                WiredError::Event(pipe::Event { code, detail: 0x45 }).to_string(),
-            )))
-            .context("The right half's upload failed")
-        };
+    // ---- Waiting for the right half ------------------------------------
 
-        let gone = event_advice(&failed(pipe::EventCode::MailboxGone)).unwrap();
-        assert!(gone.contains("stopped answering part-way"), "{gone}");
-
-        let bus = event_advice(&failed(pipe::EventCode::I2cTimeout)).unwrap();
-        assert!(bus.contains("Reseat the cable"), "{bus}");
-
-        let overflow = event_advice(&failed(pipe::EventCode::RxOverflow)).unwrap();
-        assert!(overflow.contains("receive buffer overflowed"), "{overflow}");
-
-        // A code from a newer firmware prints its own number and gets nothing
-        // invented on top of it, and neither does an ordinary failure.
-        assert!(event_advice(&failed(pipe::EventCode::Unknown(0x7f))).is_none());
-        assert!(event_advice(&anyhow::anyhow!("the upload timed out")).is_none());
-    }
-
-    // ---- The diagnostic scan -------------------------------------------
-
-    #[test]
-    fn the_scan_names_every_address_and_what_it_answered() {
-        // ACK, NACK, bus error, timeout, ACK — one of each ignition can report.
-        let scan = [0x00, 0xFF, 0xFE, 0xFD, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let lines = scan_lines(&scan);
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].starts_with("0x20"), "{}", lines[0]);
-        assert!(lines[0].ends_with("answered"), "{}", lines[0]);
-        assert!(lines[1].contains("MCUboot mailbox"), "{}", lines[1]);
-        assert!(lines[1].ends_with("no answer (NACK)"), "{}", lines[1]);
-        assert!(lines[2].ends_with("bus error"), "{}", lines[2]);
-        assert!(lines[3].ends_with("timed out"), "{}", lines[3]);
+    /// An attempt that fails `misses` times with the given fault before the
+    /// session opens, and counts how many times it was asked.
+    fn attempts_until(misses: usize, error: u16) -> (Result<Status>, usize) {
+        let mut asked = 0;
+        let result = keep_asking(Duration::from_secs(30), || {
+            asked += 1;
+            if asked > misses {
+                return Ok(faulted(0, 0, 0));
+            }
+            let status = faulted(error, 0, 0);
+            Err(NotOpened {
+                right_missing: right_missing(status.error),
+                error: anyhow!("{}", session_error(&status).unwrap()),
+            })
+        });
+        (result, asked)
     }
 
     #[test]
-    fn a_scan_that_came_back_short_is_not_read_past_its_end() {
-        let lines = scan_lines(&[0x00]);
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].ends_with("answered"), "{}", lines[0]);
-        assert!(lines[4].ends_with("no answer (NACK)"), "{}", lines[4]);
+    fn a_right_half_that_is_not_there_yet_is_asked_for_again() {
+        // The one attempt this used to make gave the operator about five
+        // seconds; on the bench the power-cycle landed on the third or
+        // fourth. Anything that gives up on the first is the old bug back.
+        let (result, asked) = attempts_until(3, 0x0002);
+        result.expect("the fourth attempt found it");
+        assert_eq!(asked, 4);
+    }
+
+    #[test]
+    fn every_fault_a_missing_right_half_makes_is_waited_out() {
+        for error in [0x0002, 0x0003, 0x0004, 0x0005] {
+            let (result, asked) = attempts_until(2, error);
+            assert!(result.is_ok(), "{error:#06x} was not retried");
+            assert_eq!(asked, 3, "{error:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_fault_the_right_half_has_nothing_to_do_with_fails_on_the_first_ask() {
+        // The left half not answering over its UART, and an internal error:
+        // waiting through either is thirty seconds of nothing happening.
+        for error in [0x0001, 0x0006, 0x0007, 0x0008, 0x00FF] {
+            let (result, asked) = attempts_until(1, error);
+            assert!(result.is_err(), "{error:#06x} was waited out");
+            assert_eq!(asked, 1, "{error:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_right_half_that_never_comes_back_gives_up_with_the_bootloaders_reason() {
+        let mut asked = 0;
+        let result = keep_asking(Duration::ZERO, || {
+            asked += 1;
+            Err(NotOpened {
+                right_missing: true,
+                error: anyhow!("{}", session_error(&faulted(0x0002, 0, 0)).unwrap()),
+            })
+        });
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("TRRS cable"), "{err}");
+        assert_eq!(asked, 1, "it kept asking past its own limit");
+    }
+
+    // ---- One version across the keyboard -------------------------------
+
+    #[test]
+    fn a_keyboard_whose_halves_disagree_is_not_a_success() {
+        // Both halves already carry the bundle's images, so neither is
+        // written and the run gets all the way to the end — and still has to
+        // fail, because what they are carrying is not what the bundle names.
+        let blob = bundled_v(
+            &signed(0x11, &DEVICE_HASH),
+            &signed(0x22, &DEVICE_HASH),
+            "0.1.9",
+        );
+        let (result, _control, _device) = flash_loopback(&blob);
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("did not come out of this on one build"),
+            "{err}"
+        );
+        assert!(err.contains("the left half is on 9.9.9"), "{err}");
+        assert!(err.contains("the right half is on 9.9.9"), "{err}");
+        assert!(err.contains("the bundle is 0.1.9"), "{err}");
+    }
+
+    #[test]
+    fn a_version_mismatch_is_told_apart_from_a_half_left_in_its_bootloader() {
+        // Which is what the failure epilogue keys off: by the time the
+        // versions are compared both halves have been restarted.
+        let mismatch: anyhow::Error = Mismatched("the halves disagree".into()).into();
+        assert!(mismatch.chain().any(|cause| cause.is::<Mismatched>()));
+        let other = anyhow::anyhow!("the upload timed out");
+        assert!(!other.chain().any(|cause| cause.is::<Mismatched>()));
+    }
+
+    /// One half's answer at the end of a run, with no hash read back.
+    fn on_version(half: Half, version: &str) -> Carried {
+        Carried {
+            half,
+            version: version.to_string(),
+            hash: None,
+        }
+    }
+
+    /// The same, with a hash the read-back found.
+    fn carrying(half: Half, version: &str, hash: &[u8]) -> Carried {
+        Carried {
+            half,
+            version: version.to_string(),
+            hash: Some(hash.to_vec()),
+        }
+    }
+
+    #[test]
+    fn one_version_across_both_halves_and_the_bundle_passes() {
+        let bundle = bundle::parse(&bundled(
+            &signed(0x11, &DEVICE_HASH),
+            &signed(0x22, &DEVICE_HASH),
+        ))
+        .unwrap();
+        let same = [
+            on_version(Half::Left, "9.9.9"),
+            on_version(Half::Right, "9.9.9"),
+        ];
+        assert!(agreed(&bundle, &same).is_ok());
+
+        // A build number on one side and not the other is the same version.
+        let padded = [
+            on_version(Half::Left, "9.9.9"),
+            on_version(Half::Right, "9.9.9+0"),
+        ];
+        assert!(agreed(&bundle, &padded).is_ok());
+
+        // A half that reported no version at all cannot be checked, and an
+        // unchecked half is not a success either.
+        let missing = [on_version(Half::Left, "9.9.9"), on_version(Half::Right, "")];
+        let err = agreed(&bundle, &missing).unwrap_err().to_string();
+        assert!(err.contains("(no version)"), "{err}");
+    }
+
+    #[test]
+    fn a_half_whose_read_back_hash_is_not_the_bundles_is_reported_by_identity() {
+        // Both halves call themselves the bundle's version and one of them is
+        // carrying something else, which a version string cannot show.
+        let bundle = bundle::parse(&bundled(
+            &signed(0x11, &DEVICE_HASH),
+            &signed(0x22, &DEVICE_HASH),
+        ))
+        .unwrap();
+        let split = [
+            carrying(Half::Left, "9.9.9", &DEVICE_HASH),
+            carrying(Half::Right, "9.9.9", &[0x99; 32]),
+        ];
+
+        let err = agreed(&bundle, &split).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("did not come out of this on one build"),
+            "{text}"
+        );
+        assert!(text.contains("the right half is carrying"), "{text}");
+        assert!(!text.contains("the left half"), "{text}");
+        assert!(text.contains("cannot talk over the wire"), "{text}");
+        // And it is still the type the failure epilogue tells apart.
+        assert!(err.chain().any(|cause| cause.is::<Mismatched>()));
+    }
+
+    #[test]
+    fn both_halves_carrying_the_bundles_own_hashes_passes() {
+        let bundle = bundle::parse(&bundled(
+            &signed(0x11, &DEVICE_HASH),
+            &signed(0x22, &DEVICE_HASH),
+        ))
+        .unwrap();
+        let good = [
+            carrying(Half::Left, "9.9.9", &bundle.hash(Half::Left).unwrap()),
+            carrying(Half::Right, "9.9.9", &bundle.hash(Half::Right).unwrap()),
+        ];
+        assert!(agreed(&bundle, &good).is_ok());
+    }
+
+    // ---- Confirming the keyboard came back -----------------------------
+
+    /// Runs the window against a keyboard that answers on the `answers_on`th
+    /// look, on a clock the pause moves itself. Answers with whether it was
+    /// found, how many looks it took, and how much of the window went by.
+    fn looking(limit: Duration, answers_on: usize) -> (bool, usize, Duration) {
+        let base = Instant::now();
+        let gone = std::cell::Cell::new(Duration::ZERO);
+        let mut looks = 0;
+        let back = keep_looking(
+            limit,
+            CONFIRM_GAP,
+            || base + gone.get(),
+            |gap| gone.set(gone.get() + gap),
+            || {
+                looks += 1;
+                looks >= answers_on
+            },
+        );
+        (back, looks, gone.get())
+    }
+
+    #[test]
+    fn a_keyboard_that_is_already_back_is_not_waited_for() {
+        let (back, looks, gone) = looking(CONFIRM_WINDOW, 1);
+        assert!(back);
+        assert_eq!(looks, 1);
+        assert_eq!(gone, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_keyboard_that_takes_a_moment_is_still_a_success() {
+        // Both halves need a few seconds after the reset before either has
+        // anything to say, so a first look that finds nothing is the ordinary
+        // case, not a failure.
+        let (back, looks, _) = looking(CONFIRM_WINDOW, 6);
+        assert!(back);
+        assert_eq!(looks, 6);
+    }
+
+    #[test]
+    fn a_keyboard_that_never_comes_back_is_asked_for_the_whole_window() {
+        let (back, looks, gone) = looking(CONFIRM_WINDOW, usize::MAX);
+        assert!(!back);
+        assert!(gone >= CONFIRM_WINDOW, "it gave up early, after {gone:?}");
+        assert_eq!(looks, 31); // one at zero, then one every half second
+    }
+
+    /// One half's reading: a level, and whether the board said its flags mean
+    /// anything.
+    fn heard(level: Option<u8>, flags: bool) -> BatteryReading {
+        BatteryReading {
+            level,
+            charging: flags.then_some(false),
+            usb: flags.then_some(true),
+            source: None,
+        }
+    }
+
+    fn answering(left: BatteryReading, right: BatteryReading) -> Telemetry {
+        Telemetry {
+            left,
+            right,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_half_answering_is_not_the_keyboard_being_back() {
+        // The left's reading is the left nRF's application talking to the
+        // STM32; the right's crossed the wire between the halves. Either one
+        // alone leaves the other half unaccounted for.
+        assert!(!both_reported(&answering(
+            heard(Some(84), true),
+            heard(None, false)
+        )));
+        assert!(!both_reported(&answering(
+            heard(None, false),
+            heard(Some(81), true)
+        )));
+        assert!(!both_reported(&answering(
+            heard(None, false),
+            heard(None, false)
+        )));
+        assert!(both_reported(&answering(
+            heard(Some(84), true),
+            heard(Some(81), true)
+        )));
+    }
+
+    #[test]
+    fn a_half_whose_gauge_has_not_converged_still_answered() {
+        // The right half's flags come from state its nRF holds locally, so
+        // they are there whenever the read across the halves worked — which is
+        // the thing being confirmed. A fresh boot with no level yet is a half
+        // that is up, and 0% is a real level, not a missing one.
+        assert!(both_reported(&answering(
+            heard(Some(0), true),
+            heard(None, true)
+        )));
+    }
+
+    #[test]
+    fn a_bundle_named_after_its_release_is_still_read_as_a_version() {
+        // `0.1.9-wired` is what a real bundle is packed as, and it names the
+        // same build as the `0.1.9` a board reports.
+        assert_eq!(ordering_of("0.1.9-wired"), Some((0, 1, 9)));
+        assert_eq!(ordering_of("0.1.9"), Some((0, 1, 9)));
+        assert_eq!(ordering_of("0.1.9+42"), Some((0, 1, 9)));
+        assert_eq!(ordering_of(""), None);
+
+        // And a bundle whose name is not a version falls back to what its
+        // own images say they are.
+        let blob = bundled_v(
+            &signed_v(0x11, &DEVICE_HASH, (2, 3, 4)),
+            &signed_v(0x22, &DEVICE_HASH, (2, 3, 4)),
+            "nightly",
+        );
+        let bundle = bundle::parse(&blob).unwrap();
+        assert_eq!(ordering_of(&wanted_version(&bundle)), Some((2, 3, 4)));
     }
 }

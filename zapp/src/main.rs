@@ -44,7 +44,11 @@ enum Commands {
             cable if it is sitting in its bootloader, Bluetooth otherwise. \
             Keyboard firmware goes over the cable, and this waits for the \
             bootloader to appear rather than expecting it to be there already \
-            — press the reset button on the left half when asked.",
+            — press the reset button on the left half when asked.\n\n\
+            A bundle carries both halves and they are always written together, \
+            the right one first. Over the cable, a right half that does not \
+            answer is waited for: unplug the cable between the halves and plug \
+            it back in while it asks.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
@@ -142,62 +146,6 @@ enum Commands {
         #[command(subcommand)]
         command: DfuCommands,
     },
-    /// Update both nRF halves over the cable, through the bootloader
-    #[command(
-        long_about = "Update both nRF halves over the cable.\n\n\
-            The same nRF firmware `zapp smp bundle` writes over Bluetooth, \
-            written over USB instead. The STM32's ignition bootloader drives \
-            both halves into MCUboot itself — the left over the UART between \
-            them, the right over the TRRS I2C bus — and bridges MCUboot's \
-            serial recovery to this machine over one vendor interface. There \
-            is no radio in the path, so nothing depends on the halves being \
-            paired, on the left's application being alive, or on how much \
-            charge is in either pack.\n\n\
-            The keyboard has to be in its bootloader: press the reset button \
-            on the left half. Nothing here works against a keyboard running \
-            its own firmware.",
-        after_long_help = "Examples:\n  \
-            zapp nrf flash voyager2_0.1.9.zsab\n  \
-            zapp nrf status\n  \
-            zapp nrf end"
-    )]
-    Nrf {
-        #[command(subcommand)]
-        command: NrfCommands,
-    },
-}
-
-#[derive(Subcommand)]
-enum NrfCommands {
-    /// Write both halves from one .zsab bundle
-    #[command(
-        long_about = "Write both halves from one .zsab bundle.\n\n\
-            A bundle names both halves and they are always written together. \
-            There is deliberately no way to pick one: a keyboard whose halves \
-            are on different builds is a keyboard whose halves cannot talk to \
-            each other, and per-half flashing is how boards end up there.\n\n\
-            The right half goes first, then the left. A half already carrying \
-            the bundle's image is left alone rather than written again, and \
-            every upload is read back and checked before the half is \
-            restarted.",
-        after_long_help = "Examples:\n  \
-            zapp nrf flash voyager2_0.1.9.zsab"
-    )]
-    Flash {
-        /// Path to a .zsab firmware bundle
-        bundle: PathBuf,
-        /// Write a half even if it already carries the image, or the bundle is
-        /// older than what is installed
-        #[arg(long)]
-        force: bool,
-        /// Seconds to wait for each reply from a half
-        #[arg(long, default_value_t = 15)]
-        timeout: u64,
-    },
-    /// Say what the bootloader thinks is going on, and what is on the I2C bus
-    Status,
-    /// End a session that was left open and put the hardware back
-    End,
 }
 
 #[derive(Subcommand)]
@@ -455,19 +403,6 @@ fn main() -> Result<()> {
             }
             result
         }
-        // Nothing is added to a failure here: the wired path reads the
-        // bootloader's own status back and prints what it says, which is more
-        // than an error chain has, and it does it while the board is still
-        // plugged in and answering.
-        Commands::Nrf { command } => match command {
-            NrfCommands::Flash {
-                bundle,
-                force,
-                timeout,
-            } => nrf_wired::flash(&bundle, force, Duration::from_secs(timeout)),
-            NrfCommands::Status => nrf_wired::status(),
-            NrfCommands::End => nrf_wired::end(),
-        },
     }
 }
 
@@ -775,16 +710,18 @@ fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
 
 /// A bundle, over whichever way the keyboard is reachable.
 ///
-/// The same firmware goes over either, so which one is not a decision worth
-/// making twice: a board sitting in its bootloader is plugged in and wants the
-/// cable, and a board that is not is on Bluetooth. Being wrong is cheap —
-/// both paths say what they could not find.
+/// The cable wins whenever the keyboard is on it, whether it is already in its
+/// bootloader or still running its own firmware — the wired path waits for the
+/// bootloader and asks for the reset press. Bluetooth is for a keyboard that
+/// is not plugged in at all, not for one that is plugged in and simply has not
+/// been put in its bootloader yet: that one is a cable update the user is part
+/// way through, and sending it over the radio instead would be a surprise.
 fn flash_bundle(path: &Path, force: bool) -> Result<()> {
-    if nrf_wired::bootloader_present() {
-        return nrf_wired::flash(path, force, Duration::from_secs(15));
+    if nrf_wired::bootloader_present() || device::find_keyboard().is_ok() {
+        return nrf_wired::flash(path, force);
     }
 
-    println!("No bootloader on USB — going over Bluetooth.");
+    println!("No keyboard on USB — going over Bluetooth.");
     let result = zsab::update(path, force, &LinkArgs::default());
     if result.is_err() {
         println!();

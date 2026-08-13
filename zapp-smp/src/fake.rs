@@ -11,7 +11,7 @@ use std::time::Duration;
 use ciborium::value::Value;
 
 use crate::client::{OS_CMD_MCUMGR_PARAMS, OS_CMD_RESET, OS_GROUP};
-use crate::proto::{self, Header, Reassembler, HEADER_LEN};
+use crate::proto::{self, Header, Op, Reassembler, HEADER_LEN};
 use crate::transport::SmpTransport;
 use crate::{cbor, img, session};
 
@@ -26,6 +26,68 @@ pub enum Accept {
     Silent,
     /// Never moves, whatever it is sent.
     Stuck,
+}
+
+/// One state write: the hash it named, and whether it confirmed.
+pub type Mark = (Vec<u8>, bool);
+
+/// One slot of one image, as the fake lists it.
+///
+/// The flags are the ones MCUboot's serial recovery derives from the swap
+/// status, so a listing here can stand for any of `NONE`, `TEST` or `REVERT`.
+#[derive(Debug, Clone, Default)]
+pub struct FakeSlot {
+    pub slot: u32,
+    pub hash: Vec<u8>,
+    pub version: String,
+    pub active: bool,
+    pub confirmed: bool,
+    pub pending: bool,
+}
+
+impl FakeSlot {
+    /// A slot carrying `hash`, at the version the fake reports everywhere.
+    pub fn new(slot: u32, hash: &[u8]) -> Self {
+        Self {
+            slot,
+            hash: hash.to_vec(),
+            version: "9.9.9".into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn active(mut self) -> Self {
+        self.active = true;
+        self
+    }
+
+    pub fn confirmed(mut self) -> Self {
+        self.confirmed = true;
+        self
+    }
+
+    pub fn pending(mut self) -> Self {
+        self.pending = true;
+        self
+    }
+
+    fn encode(&self) -> Value {
+        let mut entries = vec![
+            ("slot", cbor::uint(self.slot)),
+            ("version", Value::Text(self.version.clone())),
+            ("hash", cbor::bytes(&self.hash)),
+        ];
+        for (set, name) in [
+            (self.active, "active"),
+            (self.confirmed, "confirmed"),
+            (self.pending, "pending"),
+        ] {
+            if set {
+                entries.push((name, Value::Bool(true)));
+            }
+        }
+        cbor::map(entries)
+    }
 }
 
 /// A Zephyr device that only exists in memory.
@@ -63,10 +125,25 @@ pub struct FakeDevice {
     pub next_step: u32,
     /// False for a build with the guard compiled out.
     pub guard: bool,
+    /// What slot 0 reports, read by read: each state read takes the next
+    /// entry, and the last one is repeated once the list runs out. A board
+    /// that reports something else after a restart is one entry more.
+    ///
+    /// Ignored once `listings` is set.
+    pub slot_hashes: Vec<Vec<u8>>,
+    /// Whole multi-slot listings, read by read, the same way. Empty is the
+    /// one-slot listing `slot_hashes` describes. A state *write* answers with
+    /// the head of the list without taking it, the way `bs_set` replies with
+    /// the listing it has just changed.
+    pub listings: Vec<Vec<FakeSlot>>,
     /// The largest request that ever reached it whole.
     pub largest: Arc<Mutex<usize>>,
     pub requests: Arc<Mutex<Vec<(u16, u8)>>>,
     pub resets: Arc<Mutex<u32>>,
+    /// The `image` number each upload announced, in order.
+    pub uploads: Arc<Mutex<Vec<u32>>>,
+    /// Every state write, as `(hash, confirm)`.
+    pub marks: Arc<Mutex<Vec<Mark>>>,
 }
 
 impl FakeDevice {
@@ -87,9 +164,13 @@ impl FakeDevice {
             next_session_id: 1,
             next_step: 1,
             guard: true,
+            slot_hashes: vec![vec![0x11; 32]],
+            listings: Vec::new(),
             largest: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             resets: Arc::new(Mutex::new(0)),
+            uploads: Arc::new(Mutex::new(Vec::new())),
+            marks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -144,15 +225,10 @@ impl FakeDevice {
                 self.answer(header, cbor::map(vec![("rc", cbor::uint(0))]));
             }
             (img::GROUP, img::CMD_STATE) => {
-                let state = cbor::map(vec![(
-                    "images",
-                    Value::Array(vec![cbor::map(vec![
-                        ("slot", cbor::uint(0)),
-                        ("version", Value::Text("9.9.9".into())),
-                        ("hash", cbor::bytes(&[0x11; 32])),
-                        ("active", Value::Bool(true)),
-                    ])]),
-                )]);
+                if header.op == Op::Write {
+                    self.record_mark(body);
+                }
+                let state = self.list_images(header.op == Op::Read);
                 self.answer(header, state);
             }
             (img::GROUP, img::CMD_UPLOAD) => self.upload(header, body),
@@ -164,6 +240,43 @@ impl FakeDevice {
             (session::GROUP, session::CMD_CLOSE) => self.session_close(header, body),
             _ => self.answer(header, cbor::map(vec![("rc", cbor::uint(8))])),
         }
+    }
+
+    /// One image listing. `advance` takes the next scripted entry.
+    fn list_images(&mut self, advance: bool) -> Value {
+        let slots: Vec<FakeSlot> = if self.listings.is_empty() {
+            let hash = self.slot_hashes.first().cloned().unwrap_or_default();
+            if advance && self.slot_hashes.len() > 1 {
+                self.slot_hashes.remove(0);
+            }
+            // What MCUboot reports with no swap outstanding.
+            vec![FakeSlot::new(0, &hash).active().confirmed()]
+        } else {
+            let listing = self.listings.first().cloned().unwrap_or_default();
+            if advance && self.listings.len() > 1 {
+                self.listings.remove(0);
+            }
+            listing
+        };
+        cbor::map(vec![(
+            "images",
+            Value::Array(slots.iter().map(FakeSlot::encode).collect()),
+        )])
+    }
+
+    /// Records a state write, the hash and the confirm flag it carried.
+    fn record_mark(&mut self, body: &[u8]) {
+        let Ok(request) = cbor::decode(body) else {
+            return;
+        };
+        let hash = cbor::field(&request, "hash")
+            .and_then(cbor::as_bytes)
+            .unwrap_or_default()
+            .to_vec();
+        let confirm = cbor::field(&request, "confirm")
+            .and_then(cbor::as_bool)
+            .unwrap_or(false);
+        self.marks.lock().unwrap().push((hash, confirm));
     }
 
     /// What the firmware answers every group 67 command with.
@@ -250,6 +363,10 @@ impl FakeDevice {
             self.declared_sha = cbor::field(&request, "sha")
                 .and_then(cbor::as_bytes)
                 .map(<[u8]>::to_vec);
+            let image = cbor::field(&request, "image")
+                .and_then(cbor::as_u32)
+                .unwrap_or(0);
+            self.uploads.lock().unwrap().push(image);
         }
         assert_eq!(off as usize, self.image.len(), "the device was sent a gap");
 

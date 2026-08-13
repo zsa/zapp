@@ -109,6 +109,8 @@ struct Progress {
     right_pending: bool,
     /// Both halves are back on their new images and only the confirm is left.
     settled: bool,
+    /// The two halves came out of this on different builds.
+    mismatched: bool,
     /// What the packs read at the last look, and whether the keyboard was on
     /// the charger. Kept here so a refusal that turns out to be about the
     /// battery can quote real numbers rather than the threshold alone; both
@@ -153,6 +155,16 @@ impl Progress {
                  If the keyboard refused because the update session expired, nothing is\n\
                  lost: re-run `{rerun}` and it picks up from what is already installed.\
                  {order}"
+            );
+        }
+
+        if self.mismatched {
+            return format!(
+                "The two halves are not on the same build. In that state they cannot talk to\n\
+                 each other, so the keyboard is half working: the halves may not see each\n\
+                 other at all, and the right may not type or light up.\n\n\
+                 Re-run `{rerun}` to put both halves on the same build. `zapp smp images`\n\
+                 and `zapp smp images --half right` show what each one is carrying."
             );
         }
 
@@ -376,6 +388,13 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // this gap does not deadlock the pair. The right's confirm lands here
     // instead, once the left is back on the matching build and the link is up.
     let mut confirmed = [(Half::Right, false), (Half::Left, false)];
+    // What each half is actually carrying, for the cross-half check at the end.
+    // Seeded from the reads at the top and replaced for every half that came
+    // back from a restart.
+    let mut running = [
+        (Half::Left, active_hash(&left_slots)),
+        (Half::Right, active_hash(&right_slots)),
+    ];
     if restarting {
         steps.announce("Waiting for the halves to come back");
         for half in [Half::Left, Half::Right] {
@@ -383,9 +402,12 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
                 continue;
             }
             let hash = bundle.hash(half).unwrap_or_default();
-            let back = wait_for_boot(link, half, &hash)?;
+            let (back, active) = wait_for_boot(link, half, &hash)?;
             if let Some(slot) = confirmed.iter_mut().find(|(which, _)| *which == half) {
                 slot.1 = back;
+            }
+            if let Some(slot) = running.iter_mut().find(|(which, _)| *which == half) {
+                slot.1 = active;
             }
         }
     }
@@ -410,6 +432,16 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
                 .any(|(which, done)| *which == half && *done);
             await_confirm(link, half, &hash, already)?;
         }
+    }
+
+    // ---- Both halves, side by side ---------------------------------------
+    //
+    // Each half has only been checked against the bundle on its own. A run that
+    // finished one and left the other on what it had is two builds on one
+    // keyboard, and the halves cannot talk to each other in that state.
+    if let Err(err) = both_on_the_bundle(bundle, &running) {
+        progress.mismatched = true;
+        return Err(err);
     }
 
     // ---- Let the session go ---------------------------------------------
@@ -731,11 +763,52 @@ fn restart(steps: &mut Steps, client: &mut SmpClient, half: Half, hash: &[u8]) -
     Ok(())
 }
 
+/// The hash of whatever a half reports it is running.
+fn active_hash(slots: &[ImageSlot]) -> Vec<u8> {
+    slots
+        .iter()
+        .find(|slot| slot.active)
+        .map(|slot| slot.hash.clone())
+        .unwrap_or_default()
+}
+
+/// Fails unless both halves are running the bundle's image for them.
+///
+/// Wording matches the wired path in [`crate::nrf_wired`], which makes the same
+/// check from the hashes it reads back over the cable.
+fn both_on_the_bundle(bundle: &Bundle, running: &[(Half, Vec<u8>)]) -> Result<()> {
+    let wrong: Vec<String> = running
+        .iter()
+        .filter(|(half, hash)| bundle.hash(*half).is_some_and(|wanted| wanted != *hash))
+        .map(|(half, hash)| {
+            format!(
+                "the {half} half is carrying {}",
+                match hash.is_empty() {
+                    true => "nothing it would name".to_string(),
+                    false => short(hash),
+                }
+            )
+        })
+        .collect();
+    if wrong.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "The keyboard did not come out of this on one build: {}, and the bundle is {}. Both \
+         halves have to be on the same build or they cannot talk to each other — in that \
+         state the keyboard is half working. Run the same command again to put both halves \
+         on the bundle's build.",
+        wrong.join(", "),
+        named(&bundle.header.build_version)
+    )
+}
+
 /// Waits for a half to come back, and checks it came back on the right image.
 ///
 /// Answers whether it had already confirmed itself by the time it was reached,
-/// which a fast link sometimes manages.
-fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Result<bool> {
+/// which a fast link sometimes manages, and the hash it came back running.
+fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Result<(bool, Vec<u8>)> {
     println!("  {}: giving it a moment to restart", half);
     thread::sleep(REBOOT_SETTLE);
 
@@ -779,7 +852,7 @@ fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Result<bool> {
             short(&active.hash),
             named(&active.version)
         );
-        return Ok(active.confirmed);
+        return Ok((active.confirmed, active.hash.clone()));
     }
 }
 
@@ -1497,6 +1570,84 @@ mod tests {
         }
         assert!(guard_note(&refused(zsa_err::GROUP, 99)).is_none());
         assert!(guard_note(&anyhow::anyhow!("something else")).is_none());
+    }
+
+    #[test]
+    fn both_halves_carrying_the_bundles_images_is_not_worth_a_word() {
+        let bundle = bundle::parse(&bundled()).unwrap();
+        let running = [
+            (Half::Left, bundle.hash(Half::Left).unwrap()),
+            (Half::Right, bundle.hash(Half::Right).unwrap()),
+        ];
+        assert!(both_on_the_bundle(&bundle, &running).is_ok());
+    }
+
+    #[test]
+    fn a_keyboard_left_with_its_halves_on_different_builds_is_reported() {
+        // What a half-finished update leaves behind: one half took the
+        // bundle's image and the other is still on what it had. Each half was
+        // checked against the bundle on its own and neither check saw this.
+        let bundle = bundle::parse(&bundled()).unwrap();
+        let running = [
+            (Half::Left, bundle.hash(Half::Left).unwrap()),
+            (Half::Right, vec![0x99; 64]),
+        ];
+
+        let err = both_on_the_bundle(&bundle, &running).unwrap_err().to_string();
+        let err = flat(&err);
+        assert!(err.contains("did not come out of this on one build"), "{err}");
+        assert!(err.contains("the right half is carrying"), "{err}");
+        assert!(!err.contains("the left half"), "{err}");
+        assert!(err.contains("cannot talk to each other"), "{err}");
+        assert!(err.contains("Run the same command again"), "{err}");
+    }
+
+    #[test]
+    fn a_half_that_reports_nothing_running_is_named_rather_than_given_a_hash() {
+        let bundle = bundle::parse(&bundled()).unwrap();
+        let running = [
+            (Half::Left, Vec::new()),
+            (Half::Right, bundle.hash(Half::Right).unwrap()),
+        ];
+        let err = flat(&both_on_the_bundle(&bundle, &running).unwrap_err().to_string());
+        assert!(err.contains("the left half is carrying nothing"), "{err}");
+    }
+
+    #[test]
+    fn a_keyboard_on_two_builds_gets_advice_about_the_two_builds() {
+        // Not the confirm advice: both halves may well be running the images
+        // they were given, and the problem is that they are different ones.
+        let advice = advice_of(Progress {
+            written: true,
+            right_restarted: true,
+            left_restarted: true,
+            settled: true,
+            mismatched: true,
+            ..Progress::default()
+        });
+        assert!(advice.contains("not on the same build"), "{advice}");
+        assert!(advice.contains("cannot talk to"), "{advice}");
+        assert!(advice.contains("zapp smp bundle fw.zsab"), "{advice}");
+        assert!(!advice.contains("has not confirmed"), "{advice}");
+    }
+
+    #[test]
+    fn the_hash_a_half_is_running_is_the_active_slots() {
+        let slots = vec![
+            ImageSlot {
+                slot: 1,
+                hash: vec![0x01; 4],
+                ..ImageSlot::default()
+            },
+            ImageSlot {
+                slot: 0,
+                hash: vec![0x02; 4],
+                active: true,
+                ..ImageSlot::default()
+            },
+        ];
+        assert_eq!(active_hash(&slots), vec![0x02; 4]);
+        assert!(active_hash(&[]).is_empty());
     }
 
     #[test]
