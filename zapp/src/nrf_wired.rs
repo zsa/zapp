@@ -50,8 +50,7 @@ use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::flash::FlashProgress;
 use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
-use zapp_smp::proto::{self, Op};
-use zapp_smp::{cbor, image, Half, ImageSlot, SmpClient, SmpError};
+use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError};
 use zapp_wired::ignition::{usb::UsbLink, Halves, SessionState, TargetState};
 use zapp_wired::{
     Ignition, IgnitionLink, LeftTransport, Retrying, RightTransport, Status, WiredError,
@@ -108,13 +107,6 @@ const SETTLE_POLL: Duration = Duration::from_secs(5);
 /// `slot0_partition` and 2 to `slot1_partition`
 /// (`bootloader/mcuboot/boot/zephyr/flash_map_extended.c:129`).
 const SPARE_IMAGE: u32 = 2;
-
-/// The zephyr basic group, and the command that erases the settings partition.
-const BASIC_GROUP: u16 = 63;
-const BASIC_CMD_ERASE_STORAGE: u8 = 0;
-
-/// `MGMT_ERR_ENOTSUP`: a build that does not carry the command at all.
-const MGMT_ERR_ENOTSUP: i64 = 8;
 
 // ---------------------------------------------------------------------------
 // The command
@@ -635,12 +627,6 @@ fn write_half<L: IgnitionLink + 'static>(
         {
             bail!("{older}");
         }
-        // The right half only. Its settings partition holds the pairing state
-        // the two halves share, and a right that comes back on a new build
-        // reading an old one is the failure this avoids.
-        if half == Half::Right {
-            erase_storage(&mut client)?;
-        }
 
         let image = bundle.image(half);
         upload(&mut client, half, image)?;
@@ -816,33 +802,6 @@ fn connect<L: IgnitionLink + 'static>(
         Half::Right => Box::new(RightTransport::with_payload_budget(ignition, payload_budget)),
     };
     SmpClient::new(transport).with_timeout(timeout)
-}
-
-/// Clears the right half's settings partition.
-///
-/// A build without the command is a warning rather than a failure: it is the
-/// bootloader saying it has never heard of the question, which is not the same
-/// as refusing to answer it.
-fn erase_storage(client: &mut SmpClient) -> Result<()> {
-    let empty = cbor::encode(&cbor::map(vec![]));
-    let reply = client
-        .transact(Op::Write, BASIC_GROUP, BASIC_CMD_ERASE_STORAGE, &empty)
-        .context("Could not erase the right half's settings partition")?;
-
-    match cbor::decode(&reply).and_then(|value| proto::check_rc(&value, BASIC_GROUP)) {
-        Ok(()) => {
-            log::debug!("erased the settings partition");
-            Ok(())
-        }
-        Err(SmpError::Remote {
-            rc: MGMT_ERR_ENOTSUP,
-            ..
-        }) => {
-            log::debug!("this MCUboot has no storage-erase command; leaving the settings alone");
-            Ok(())
-        }
-        Err(err) => Err(err).context("Could not erase the right half's settings partition"),
-    }
 }
 
 /// Sends one half's image into its spare slot, with a bar on it.
@@ -1617,6 +1576,10 @@ mod tests {
     use zapp_wired::loopback::{LoopbackDevice, LoopbackLink};
     use zapp_wired::pipe;
 
+    /// The zephyr basic group, which carries the storage-erase command this
+    /// flash deliberately does not send.
+    const ZEPHYR_BASIC_GROUP: u16 = 63;
+
     /// The hash the in-memory device reports for its one slot, whatever has
     /// been written to it.
     const DEVICE_HASH: [u8; 32] = [0x11; 32];
@@ -1805,8 +1768,6 @@ mod tests {
             Outcome::UpToDate
         );
         assert_eq!(count(&device, (img::GROUP, img::CMD_UPLOAD)), 0);
-        // And the storage erase belongs to an upload, not to a skipped half.
-        assert_eq!(count(&device, (BASIC_GROUP, BASIC_CMD_ERASE_STORAGE)), 0);
         // One read per half, which is the read that decided it.
         assert_eq!(count(&device, (img::GROUP, img::CMD_STATE)), 2);
     }
@@ -2038,24 +1999,21 @@ mod tests {
     }
 
     #[test]
-    fn the_right_halfs_storage_is_erased_before_its_image_and_the_lefts_is_not() {
+    fn an_update_never_erases_the_right_halfs_settings() {
+        // The right's settings partition holds `esb/config`, the inter-half
+        // pairing key, provisioned once and read at every boot. An update
+        // writes the image slot and nothing else.
         let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &[0xb2; 32]));
-        // The right is written and the left is already installed, so exactly
-        // one erase can happen and it has to be the right's.
         let (result, _control, device) = flash_loopback(&blob);
         assert!(result.is_err(), "the loopback cannot report a landed hash");
 
         let requests = device.requests();
-        let erase = requests
-            .iter()
-            .position(|sent| *sent == (BASIC_GROUP, BASIC_CMD_ERASE_STORAGE))
-            .expect("the right half's storage erase");
-        let upload = requests
-            .iter()
-            .position(|sent| *sent == (img::GROUP, img::CMD_UPLOAD))
-            .expect("the right half's upload");
-        assert!(erase < upload, "{requests:?}");
-        assert_eq!(count(&device, (BASIC_GROUP, BASIC_CMD_ERASE_STORAGE)), 1);
+        assert!(
+            requests
+                .iter()
+                .all(|(group, _)| *group != ZEPHYR_BASIC_GROUP),
+            "{requests:?}"
+        );
     }
 
     #[test]
