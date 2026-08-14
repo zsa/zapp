@@ -122,7 +122,7 @@ struct Progress {
 impl Progress {
     /// What the keyboard is, and what to do about it.
     fn advice(&self, path: &Path) -> String {
-        let rerun = format!("zapp smp bundle {}", path.display());
+        let rerun = format!("zapp flash {}", path.display());
 
         if !self.written {
             if self.declared {
@@ -163,8 +163,8 @@ impl Progress {
                 "The two halves are not on the same build. In that state they cannot talk to\n\
                  each other, so the keyboard is half working: the halves may not see each\n\
                  other at all, and the right may not type or light up.\n\n\
-                 Re-run `{rerun}` to put both halves on the same build. `zapp smp images`\n\
-                 and `zapp smp images --half right` show what each one is carrying."
+                 Re-run `{rerun}` to put both halves on the same build. It reads back\n\
+                 what each half is carrying before it writes anything, and prints it."
             );
         }
 
@@ -173,9 +173,8 @@ impl Progress {
                 "Both halves are running the new firmware, but at least one has not confirmed\n\
                  it, so that half puts its old firmware back on the next restart.\n\n\
                  Leave the keyboard connected for a minute and re-run `{rerun}` — a half\n\
-                 already running its image is confirmed rather than uploaded again.\n\
-                 `zapp smp images` and `zapp smp images --half right` show which one is\n\
-                 still pending."
+                 already running its image is confirmed rather than uploaded again, and\n\
+                 the run says which half was still pending."
             );
         }
 
@@ -1010,7 +1009,8 @@ fn levels_line(battery: Battery, charging: bool) -> String {
     )
 }
 
-/// The firmware's own reason for saying no, in plain sentences.
+/// The firmware's own reason for saying no, in plain sentences, with the
+/// measured levels spliced in when the reason is a battery.
 ///
 /// The board answers a refusal with a ZSA code (see
 /// `zapp_ble::smp::zsa_err`), and the one line the error chain gives it is a
@@ -1018,38 +1018,6 @@ fn levels_line(battery: Battery, charging: bool) -> String {
 /// this build knows — including a code from a firmware newer than this zapp,
 /// which is left to the raw group and number in the error itself rather than
 /// dressed up as something it might not be.
-pub fn refusal_advice(err: &anyhow::Error) -> Option<String> {
-    Some(wrap(refusal(err)?.advice))
-}
-
-/// The paragraph a single subcommand needs when the declared-update guard is
-/// what turned it down.
-///
-/// `zapp smp upload`, `test`, `confirm` and `reset` write firmware on nobody's
-/// authority but their own, which is exactly what shipping firmware refuses over
-/// Bluetooth. They are kept because they are the debugging surface and they work
-/// against a build with the guard compiled out, so the answer is to say which
-/// rule was hit and where the supported path is — never to retry, since the
-/// guard refuses the same request every time by design.
-///
-/// `None` for every other refusal, including a code newer than this build.
-pub fn guard_note(err: &anyhow::Error) -> Option<String> {
-    if !refusal(err)?.cause.is_guard() {
-        return None;
-    }
-    Some(wrap(
-        "Over Bluetooth this keyboard only accepts a declared update. `zapp smp bundle \
-         <file.zsab>` is the supported path: it states both halves' images up front, \
-         writes them in the order the keyboard insists on, and waits for each half to \
-         come back. The bare `upload`, `test`, `confirm` and `reset` subcommands declare \
-         nothing, so shipping firmware refuses them; they are the debugging surface and \
-         they only work against a development build with the guard compiled out \
-         (CONFIG_ZSA_UPDATE_GUARD=n). `zapp smp session` shows what the board currently \
-         has open. Nothing was written and nothing was retried.",
-    ))
-}
-
-/// The same, with the measured levels spliced in when the reason is a battery.
 fn refusal_note(err: &anyhow::Error, battery: Battery, charging: bool) -> Option<String> {
     let refusal = refusal(err)?;
     let advice = wrap(refusal.advice);
@@ -1291,7 +1259,7 @@ mod tests {
             ..Progress::default()
         });
         assert!(advice.contains("still running the firmware they were"), "{advice}");
-        assert!(advice.contains("zapp smp bundle fw.zsab"), "{advice}");
+        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
     }
 
     #[test]
@@ -1378,7 +1346,7 @@ mod tests {
             ..Progress::default()
         });
         assert!(advice.contains("not confirmed"), "{advice}");
-        assert!(advice.contains("zapp smp images"), "{advice}");
+        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
     }
 
     #[test]
@@ -1390,7 +1358,7 @@ mod tests {
         });
         assert!(advice.contains("nothing was written"), "{advice}");
         assert!(advice.contains("dropped on"), "{advice}");
-        assert!(advice.contains("zapp smp bundle fw.zsab"), "{advice}");
+        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
     }
 
     #[test]
@@ -1544,35 +1512,6 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_sends_a_single_subcommand_to_the_bundle_and_never_to_a_retry() {
-        // 11, 12 and 13 are what a bare `upload`, `test` or `confirm` gets from
-        // shipping firmware; each has to name the supported path and say the
-        // single-step commands need a build with the guard out.
-        for code in 11..=17 {
-            let note = guard_note(&refused(zsa_err::GROUP, code))
-                .unwrap_or_else(|| panic!("no note for code {code}"));
-            let note = flat(&note);
-            assert!(note.contains("zapp smp bundle <file.zsab>"), "code {code}");
-            assert!(note.contains("CONFIG_ZSA_UPDATE_GUARD=n"), "code {code}");
-            assert!(note.contains("nothing was retried"), "code {code}");
-        }
-    }
-
-    #[test]
-    fn a_refusal_that_is_not_the_guard_gets_no_note_about_it() {
-        // A flat battery or a stalled radio link is not something a bundle run
-        // fixes, and saying so would send the user the wrong way.
-        for code in 1..=10 {
-            assert!(
-                guard_note(&refused(zsa_err::GROUP, code)).is_none(),
-                "code {code}"
-            );
-        }
-        assert!(guard_note(&refused(zsa_err::GROUP, 99)).is_none());
-        assert!(guard_note(&anyhow::anyhow!("something else")).is_none());
-    }
-
-    #[test]
     fn both_halves_carrying_the_bundles_images_is_not_worth_a_word() {
         let bundle = bundle::parse(&bundled()).unwrap();
         let running = [
@@ -1627,7 +1566,7 @@ mod tests {
         });
         assert!(advice.contains("not on the same build"), "{advice}");
         assert!(advice.contains("cannot talk to"), "{advice}");
-        assert!(advice.contains("zapp smp bundle fw.zsab"), "{advice}");
+        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
         assert!(!advice.contains("has not confirmed"), "{advice}");
     }
 
@@ -1690,20 +1629,25 @@ mod tests {
 
     #[test]
     fn a_refusal_this_build_knows_gets_a_plain_paragraph() {
-        let advice = refusal_advice(&refused(zsa_err::GROUP, 1)).unwrap();
+        let advice = refusal_note(&refused(zsa_err::GROUP, 1), Battery::default(), false).unwrap();
         assert!(flat(&advice).contains("battery is too low"), "{advice}");
         assert!(flat(&advice).contains("Charge the keyboard"), "{advice}");
         // Wrapped prose, not one long line, and no raw code in the text.
+        // Counted in characters, which is what `wrap` folds on.
         assert!(advice.lines().count() > 1, "{advice}");
-        assert!(advice.lines().all(|line| line.len() <= 76), "{advice}");
+        assert!(
+            advice.lines().all(|line| line.chars().count() <= 76),
+            "{advice}"
+        );
         assert!(!advice.contains("rc "), "{advice}");
     }
 
     #[test]
     fn the_three_refusals_a_user_acts_on_differently_read_differently() {
-        let battery = refusal_advice(&refused(zsa_err::GROUP, 2)).unwrap();
-        let busy = refusal_advice(&refused(zsa_err::GROUP, 6)).unwrap();
-        let link = refusal_advice(&refused(zsa_err::GROUP, 9)).unwrap();
+        let note = |code| refusal_note(&refused(zsa_err::GROUP, code), Battery::default(), false);
+        let battery = note(2).unwrap();
+        let busy = note(6).unwrap();
+        let link = note(9).unwrap();
         assert!(flat(&battery).contains("Charge"), "{battery}");
         assert!(flat(&busy).contains("already talking"), "{busy}");
         assert!(flat(&link).contains("never got to the right half"), "{link}");
@@ -1715,9 +1659,10 @@ mod tests {
     fn a_code_from_a_newer_firmware_gets_no_paragraph_at_all() {
         // The error itself still prints "(group 66, rc 99)", which is honest.
         // Inventing a paragraph for it would not be.
-        assert!(refusal_advice(&refused(zsa_err::GROUP, 99)).is_none());
-        assert!(refusal_advice(&refused(1, 9)).is_none());
-        assert!(refusal_advice(&anyhow::anyhow!("something else")).is_none());
+        let note = |err: anyhow::Error| refusal_note(&err, Battery::default(), false);
+        assert!(note(refused(zsa_err::GROUP, 99)).is_none());
+        assert!(note(refused(1, 9)).is_none());
+        assert!(note(anyhow::anyhow!("something else")).is_none());
     }
 
     #[test]

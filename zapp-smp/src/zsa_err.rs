@@ -33,8 +33,7 @@ pub enum Cause {
     SwapHeld(Side),
     /// Something else is already updating this keyboard. The session's own
     /// one-at-a-time refusal is [`Cause::Session`] rather than this, because the
-    /// rule it names is the session rule and a bare subcommand that hits it
-    /// needs to be pointed at `zapp smp bundle`.
+    /// rule it names is the session rule.
     Busy,
     /// The halves cannot reach each other well enough to carry the update.
     Link,
@@ -51,9 +50,9 @@ pub enum Cause {
 impl Cause {
     /// Whether this is the declared-update guard talking.
     ///
-    /// A bare subcommand that hits one of these has to explain the rule and
-    /// point at `zapp smp bundle`, rather than retry: the guard refuses the same
-    /// request every time by design.
+    /// Worth telling apart because the guard refuses the same request every
+    /// time by design: a host that hits one has to explain the rule rather than
+    /// retry.
     pub fn is_guard(self) -> bool {
         matches!(self, Self::Session | Self::Order)
     }
@@ -167,7 +166,7 @@ const REGISTRY: &[Refusal] = &[
                  installed. Over Bluetooth it only accepts a declared update: a host says \
                  up front which image each half is getting, and every write after that is \
                  checked against what was said. That is what lets it insist the right half \
-                 is finished before the left is touched. Run `zapp smp bundle <file.zsab>`, \
+                 is finished before the left is touched. Run `zapp flash <file.zsab>`, \
                  which declares the update and then writes it. Nothing was written and \
                  nothing was retried.",
     },
@@ -177,7 +176,7 @@ const REGISTRY: &[Refusal] = &[
         short: "that image is not part of the update that was declared",
         advice: "An update session is open, but this is not one of the two images it \
                  declared. Either it is the wrong file, or it is the right file aimed at \
-                 the wrong half. Run `zapp smp bundle <file.zsab>` with the bundle you mean \
+                 the wrong half. Run `zapp flash <file.zsab>` with the bundle you mean \
                  to install: it declares both halves' images and writes each to the half it \
                  belongs to. Nothing was written.",
     },
@@ -191,7 +190,7 @@ const REGISTRY: &[Refusal] = &[
                  reached only through the left, and only while both halves are speaking the \
                  same protocol, so a left updated first would cut off the only route to the \
                  half still waiting. The order is not advice. Check the right half is \
-                 switched on, charged and near the left, then run `zapp smp bundle \
+                 switched on, charged and near the left, then run `zapp flash \
                  <file.zsab>`, which does both halves in the right order.",
     },
     Refusal {
@@ -294,13 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn the_codes_a_bare_subcommand_hits_send_the_user_to_the_bundle() {
-        // 11, 12 and 13 are what `zapp smp upload`, `test` and `confirm` get
-        // back from shipping firmware, so each has to name the supported path.
+    fn the_codes_an_undeclared_write_hits_send_the_user_to_the_bundle() {
+        // 11, 12 and 13 are what an undeclared write gets back from shipping
+        // firmware, so each has to name the supported path.
         for code in [11, 12, 13] {
             let advice = lookup(GROUP, code).unwrap().advice;
             assert!(
-                advice.contains("zapp smp bundle <file.zsab>"),
+                advice.contains("zapp flash <file.zsab>"),
                 "code {code} does not point anywhere: {advice}"
             );
         }

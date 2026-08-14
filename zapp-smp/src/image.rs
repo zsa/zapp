@@ -66,10 +66,10 @@ pub fn inspect(data: &[u8]) -> Option<ImageInfo> {
 ///
 /// Not `sha256`, which is over the file as it lies: that digest is what an
 /// upload announces so a device can resume one, and it is not what any slot is
-/// called. The hash `zapp smp images` prints is a TLV in the image's trailer,
-/// put there by the signing tool and copied out of flash by mcumgr, so reading
-/// it here is the only way to ask "is this image already on the board?"
-/// without reading the flash back.
+/// called. The hash a slot is named by is a TLV in the image's trailer, put
+/// there by the signing tool and copied out of flash by mcumgr, so reading it
+/// here is the only way to ask "is this image already on the board?" without
+/// reading the flash back.
 ///
 /// `None` for anything that is not a signed image, or one whose trailer carries
 /// no hash — either way, nothing to compare, so a caller should upload.

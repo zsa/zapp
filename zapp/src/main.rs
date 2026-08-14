@@ -12,8 +12,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::dfu::{self, DfuClient, DfuError, Wait};
-use zapp_ble::smp::session::{Next, Status};
-use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
+use zapp_ble::smp::{self, Half, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
@@ -52,6 +51,8 @@ enum Commands {
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
+            zapp flash voyager2_0.1.9.zsab --force\n  \
+            zapp flash voyager2_0.1.9.zsab --device \"Voyager\"\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
@@ -63,6 +64,11 @@ enum Commands {
         /// a keyboard image is always written.
         #[arg(long)]
         force: bool,
+        /// Which board, by advertised name or by the handle `zapp devices`
+        /// shows. Only means anything over Bluetooth, where more than one
+        /// bonded board can answer; over the cable there is only ever one.
+        #[arg(long, short = 'd')]
+        device: Option<String>,
     },
     /// Check Oryx for updates on your layout and flash if available
     #[command(
@@ -85,49 +91,14 @@ enum Commands {
         #[arg(long)]
         scan: bool,
     },
-    /// Drive an mcumgr (SMP) firmware update over Bluetooth
-    #[command(
-        long_about = "Drive an mcumgr (SMP) firmware update over Bluetooth.\n\n\
-            Talks the standard Zephyr SMP service, the one nRF Connect Device \
-            Manager speaks, to the wireless half of a Voyager 2. The board must \
-            already be bonded to this machine: pairing is the desktop's job. \n\
-            A firmware update is three steps — upload the image, mark it for \
-            test, reset — and each is a subcommand here so a failure is visible \
-            where it happens.\n\n\
-            --half right sends the same commands to the right half instead, \
-            through a second service on the left that relays whole frames over \
-            the halves' radio link. Update the right half first: it is only \
-            reachable while both halves still speak the same protocol.\n\n\
-            `zapp smp bundle` does all of that in one go, both halves, from a \
-            .zsab release bundle. It is also the only thing here that declares \
-            an update, and shipping firmware accepts nothing else over \
-            Bluetooth: the single-step subcommands below are refused unless the \
-            board was built with the guard compiled out. They are kept because \
-            they are the debugging surface, and `zapp smp session` says what \
-            the board has open.",
-        after_long_help = "Examples:\n  \
-            zapp smp bundle voyager2_0.1.8.zsab\n  \
-            zapp smp images\n  \
-            zapp smp upload app.signed.bin\n  \
-            zapp smp images --half right\n  \
-            zapp smp upload right.signed.bin --half right\n  \
-            zapp smp test 3a5f9c...\n  \
-            zapp smp confirm 3a5f9c...\n  \
-            zapp smp reset\n  \
-            zapp smp session"
-    )]
-    Smp {
-        #[command(subcommand)]
-        command: SmpCommands,
-    },
     /// Flash the keyboard's own (QMK) firmware over Bluetooth
     #[command(
         long_about = "Flash the keyboard's own firmware over Bluetooth.\n\n\
-            A Voyager 2 has two chips. `zapp smp` updates the wireless one; \
-            this updates the other — the STM32 that runs QMK, scans the matrix \
-            and drives the LEDs. The image goes over ZSA's own update service \
-            on the left half, which relays it to the STM32 over the wire \
-            between them and into the ignition bootloader.\n\n\
+            A Voyager 2 has two chips. `zapp flash <file.zsab>` updates the \
+            wireless one; this updates the other — the STM32 that runs QMK, \
+            scans the matrix and drives the LEDs. The image goes over ZSA's \
+            own update service on the left half, which relays it to the STM32 \
+            over the wire between them and into the ignition bootloader.\n\n\
             The board must already be bonded to this machine: pairing is the \
             desktop's job. The firmware is a plain .bin — what `qmk compile` \
             leaves in .build, or what Oryx hands you.\n\n\
@@ -185,126 +156,24 @@ struct DfuArgs {
     wait: u64,
 }
 
-#[derive(Subcommand)]
-enum SmpCommands {
-    /// Update both halves from one .zsab bundle
-    #[command(
-        long_about = "Update both halves from one .zsab bundle.\n\n\
-            A .zsab carries both nRF images and the build they came from, and \
-            this drives the whole update from it: read what is installed, \
-            write the right half, write the left, restart both and wait for \
-            each to come back and confirm itself. A half already running its \
-            image is skipped rather than written again.\n\n\
-            The right half goes first, always. It is reachable only through \
-            the left, and only while both halves still speak the same \
-            protocol, so a left updated first would cut off the only route to \
-            the half still waiting for its image.\n\n\
-            The keyboard cannot be typed on while this runs and both halves go \
-            dark. It takes a couple of minutes. Nothing is confirmed until it \
-            has proved itself, so a keyboard left half-way through gets its old \
-            firmware back on the next power cycle.",
-        after_long_help = "Examples:\n  \
-            zapp smp bundle voyager2_0.1.8.zsab\n  \
-            zapp smp bundle voyager2_0.1.8.zsab --force\n  \
-            zapp smp bundle voyager2_0.1.8.zsab --device \"Voyager\""
-    )]
-    Bundle {
-        /// Path to a .zsab firmware bundle
-        bundle: PathBuf,
-        /// Write both halves even where the image is already installed
-        #[arg(long)]
-        force: bool,
-        #[command(flatten)]
-        args: LinkArgs,
-    },
-    /// List the images the board is carrying, slot by slot
-    Images(SmpArgs),
-    /// Upload an MCUboot-signed image into the board's spare slot
-    #[command(after_long_help = "The image is only written, not booted: mark it \
-        with `zapp smp test <hash>` and reset to try it, or `zapp smp confirm \
-        <hash>` to keep it. `zapp smp images` shows the hash afterwards.")]
-    Upload {
-        /// Path to an MCUboot-signed .bin
-        firmware: PathBuf,
-        /// Which image, on a board carrying more than one
-        #[arg(long, default_value_t = 0)]
-        image: u32,
-        #[command(flatten)]
-        args: SmpArgs,
-    },
-    /// Mark an image to be tried on the next boot, by hash
-    Test {
-        /// The image hash, as `zapp smp images` prints it
-        hash: String,
-        #[command(flatten)]
-        args: SmpArgs,
-    },
-    /// Confirm an image permanently, by hash
-    Confirm {
-        /// The image hash, as `zapp smp images` prints it
-        hash: String,
-        #[command(flatten)]
-        args: SmpArgs,
-    },
-    /// Reboot the board
-    Reset(SmpArgs),
-    /// Show the update session the keyboard has open, and end it
-    #[command(
-        long_about = "Show the update session the keyboard has open.\n\n\
-            Over Bluetooth a Voyager 2 only accepts a declared update: a host \
-            says which image each half is getting before it writes anything, \
-            and every write is checked against that. This reads that \
-            declaration back — what is declared, which half is next, how long \
-            the session has left, and whether this board is enforcing any of \
-            it at all.\n\n\
-            Only the left half serves this; the right runs no session of its \
-            own. --close ends the session, which is worth doing when something \
-            stopped half way and left one open.",
-        after_long_help = "Examples:\n  \
-            zapp smp session\n  \
-            zapp smp session --close"
-    )]
-    Session {
-        /// End the session rather than only reporting it
-        #[arg(long)]
-        close: bool,
-        #[command(flatten)]
-        link: LinkArgs,
-    },
-}
-
-#[derive(clap::Args)]
-struct SmpArgs {
-    /// Which half to talk to: the left's own SMP service, or the right's
-    /// through the left's relay
-    #[arg(long, default_value = "left")]
-    half: Half,
-    #[command(flatten)]
-    link: LinkArgs,
-}
-
 /// Everything about reaching a board that does not say which half.
 ///
-/// Split out so the bundle flow, which talks to both halves in turn and picks
-/// the order itself, takes the same options as a single command.
-#[derive(clap::Args)]
+/// The bundle flow talks to both halves in turn and picks the order itself, so
+/// the half is never an argument. Only `device` comes off the command line;
+/// the rest are the tuning the Bluetooth client needs and are left at their
+/// defaults.
 pub struct LinkArgs {
     /// Which board, by advertised name or by the handle `zapp devices` shows
-    #[arg(long, short = 'd')]
     device: Option<String>,
     /// Bytes of payload per Bluetooth write, the ATT MTU less its 3-byte
-    /// header. Defaults to what the platform reports.
-    #[arg(long)]
+    /// header. `None` takes what the platform reports.
     mtu: Option<usize>,
-    /// Bluetooth writes to spend on one request. Defaults to 5.
-    #[arg(long)]
+    /// Bluetooth writes to spend on one request. `None` takes 5.
     writes: Option<usize>,
-    /// Largest request to send, fragmented across writes. Overrides --writes.
-    /// Defaults to the buffer the board reports, capped by --writes.
-    #[arg(long)]
+    /// Largest request to send, fragmented across writes. Overrides `writes`.
+    /// `None` takes the buffer the board reports, capped by `writes`.
     chunk: Option<usize>,
     /// Seconds to wait for each reply
-    #[arg(long, default_value_t = DEFAULT_LINK_TIMEOUT)]
     timeout: u64,
 }
 
@@ -312,13 +181,8 @@ pub struct LinkArgs {
 const DEFAULT_LINK_TIMEOUT: u64 = 15;
 
 impl Default for LinkArgs {
-    /// The same link a bare command line produces.
-    ///
-    /// Written out rather than derived: clap fills `timeout` in from its
-    /// attribute, and a derived `Default` does not — it gives zero, and every
-    /// request then times out before it has been sent. Anything reached other
-    /// than from the command line, like a bundle routed here because the
-    /// keyboard is on Bluetooth, comes through this.
+    /// Written out rather than derived: a derived `Default` gives `timeout`
+    /// zero, and every request then times out before it has been sent.
     fn default() -> Self {
         Self {
             device: None,
@@ -338,53 +202,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Flash { firmware, force } => {
+        Commands::Flash {
+            firmware,
+            force,
+            device,
+        } => {
             if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
             } else {
-                cmd_flash_file(&PathBuf::from(firmware), force)
+                cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
             }
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
-        Commands::Smp { command } => {
-            // The bundle flow prints its own fuller version, with the measured
-            // levels in it, so it is left to do that.
-            let bundle_flow = matches!(command, SmpCommands::Bundle { .. });
-            let result = match command {
-                SmpCommands::Bundle {
-                    bundle,
-                    force,
-                    args,
-                } => zsab::update(&bundle, force, &args),
-                SmpCommands::Images(args) => cmd_smp_images(&args),
-                SmpCommands::Upload {
-                    firmware,
-                    image,
-                    args,
-                } => cmd_smp_upload(&firmware, image, &args),
-                SmpCommands::Test { hash, args } => cmd_smp_mark(&hash, false, &args),
-                SmpCommands::Confirm { hash, args } => cmd_smp_mark(&hash, true, &args),
-                SmpCommands::Reset(args) => cmd_smp_reset(&args),
-                SmpCommands::Session { close, link } => cmd_smp_session(close, &link),
-            };
-            // A keyboard that said no said why, and the reason is worth more
-            // than the one line the error chain gives it. The guard's own
-            // refusals get a second paragraph: a bare subcommand that hits one
-            // has to be told where the supported path is, because retrying it
-            // will be refused in exactly the same way.
-            if let (false, Err(err)) = (bundle_flow, &result)
-                && let Some(advice) = zsab::refusal_advice(err)
-            {
-                println!();
-                println!("{advice}");
-                if let Some(note) = zsab::guard_note(err) {
-                    println!();
-                    println!("{note}");
-                }
-            }
-            result
-        }
         Commands::Dfu { command } => {
             let result = match command {
                 DfuCommands::Flash { firmware, args } => cmd_dfu_flash(&firmware, &args),
@@ -686,14 +516,14 @@ fn describe_usb(device: &UsbDevice) -> String {
     }
 }
 
-fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
+fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<()> {
     // A bundle carries both halves' wireless firmware and goes over the cable
     // through the bootloader; everything else is a keyboard image for the
     // STM32. Told apart by what the file says it is rather than by its name,
     // so a renamed bundle still does the right thing instead of failing deep
     // inside the DFU loader.
     if is_bundle(path) {
-        return flash_bundle(path, force);
+        return flash_bundle(path, force, device);
     }
 
     if force {
@@ -701,6 +531,11 @@ fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
         // flag is not doing anything here and silently accepting it would
         // suggest otherwise.
         println!("--force only applies to .zsab bundles; a keyboard image is always written.");
+    }
+    if device.is_some() {
+        // Same: a keyboard image goes over USB, where there is nothing to pick
+        // between.
+        println!("--device only applies to .zsab bundles going over Bluetooth.");
     }
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
@@ -716,13 +551,20 @@ fn cmd_flash_file(path: &PathBuf, force: bool) -> Result<()> {
 /// is not plugged in at all, not for one that is plugged in and simply has not
 /// been put in its bootloader yet: that one is a cable update the user is part
 /// way through, and sending it over the radio instead would be a surprise.
-fn flash_bundle(path: &Path, force: bool) -> Result<()> {
+///
+/// `named` picks between bonded boards over Bluetooth. The cable ignores it:
+/// there is only ever one keyboard plugged in.
+fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
     if nrf_wired::bootloader_present() || device::find_keyboard().is_ok() {
         return nrf_wired::flash(path, force);
     }
 
     println!("No keyboard on USB — going over Bluetooth.");
-    let result = zsab::update(path, force, &LinkArgs::default());
+    let link = LinkArgs {
+        device: named.map(str::to_string),
+        ..LinkArgs::default()
+    };
+    let result = zsab::update(path, force, &link);
     if result.is_err() {
         println!();
         println!(
@@ -927,216 +769,6 @@ pub fn smp_connect(args: &LinkArgs, half: Half) -> Result<SmpClient> {
         client.request_limit()
     );
     Ok(client)
-}
-
-fn cmd_smp_images(args: &SmpArgs) -> Result<()> {
-    let mut client = smp_connect(&args.link, args.half)?;
-    let slots = client.image_state().context("Could not read the image state")?;
-    print_image_state(&slots);
-    Ok(())
-}
-
-fn print_image_state(slots: &[ImageSlot]) {
-    if slots.is_empty() {
-        println!("The board reports no images.");
-        return;
-    }
-    for slot in slots {
-        let image = slot.image.map(|n| format!("image {n} ")).unwrap_or_default();
-        let version = if slot.version.is_empty() {
-            "(no version)"
-        } else {
-            &slot.version
-        };
-        println!("{image}slot {} · {version}", slot.slot);
-        println!("  hash  {}", smp::image::hex(&slot.hash));
-        println!("  flags {}", flags_of(slot));
-    }
-}
-
-fn flags_of(slot: &ImageSlot) -> String {
-    match slot.flags().join(" ") {
-        flags if flags.is_empty() => "none".to_string(),
-        flags => flags,
-    }
-}
-
-fn cmd_smp_upload(path: &Path, image: u32, args: &SmpArgs) -> Result<()> {
-    // Not `firmware::load_firmware`: that reads a DFU suffix or Intel HEX
-    // records, and an MCUboot image is a flat binary with neither. Its own
-    // header is what says whether this is the right kind of file.
-    let data = std::fs::read(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    if data.is_empty() {
-        bail!("{} is empty", path.display());
-    }
-
-    match smp::image::inspect(&data) {
-        Some(info) => println!(
-            "Image loaded: v{} ({} bytes, {} of image)",
-            info.version,
-            data.len(),
-            info.image_size
-        ),
-        // Not fatal: the board checks the header itself and will refuse it. A
-        // warning here says which file to look at, which the board cannot.
-        None => println!(
-            "Warning: {} has no MCUboot header — uploading it anyway, but the board will likely refuse it",
-            path.display()
-        ),
-    }
-    println!("SHA-256: {}", smp::image::hex(&smp::image::sha256(&data)));
-
-    let mut client = smp_connect(&args.link, args.half)?;
-    let pb = ProgressBar::new(data.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
-
-    client
-        .upload(image, &data, &|progress| match progress {
-            FlashProgress::Writing { bytes_written, .. } => {
-                pb.set_position(bytes_written as u64);
-                pb.set_message("Uploading...");
-            }
-            FlashProgress::Complete => pb.finish_with_message("Done!"),
-            _ => {}
-        })
-        .context("Upload failed")?;
-
-    println!();
-    println!("Uploaded. Mark it and reset to boot it:");
-    println!("  zapp smp test <hash>   (reverts unless confirmed after boot)");
-    println!("  zapp smp confirm <hash>");
-    print_image_state(&client.image_state().context("Could not read the image state")?);
-    Ok(())
-}
-
-fn cmd_smp_mark(hash: &str, confirm: bool, args: &SmpArgs) -> Result<()> {
-    let hash = smp::image::unhex(hash)
-        .with_context(|| format!("{hash:?} is not a hash; expected hex, as `zapp smp images` prints it"))?;
-
-    let mut client = smp_connect(&args.link, args.half)?;
-    let slots = client
-        .mark(&hash, confirm)
-        .with_context(|| match confirm {
-            true => "Could not confirm that image".to_string(),
-            false => "Could not mark that image for test".to_string(),
-        })?;
-
-    println!(
-        "Marked {} as {}.",
-        smp::image::hex(&hash),
-        if confirm { "confirmed" } else { "pending test" }
-    );
-    print_image_state(&slots);
-    Ok(())
-}
-
-/// Reads back the update the keyboard has been told about, and optionally ends
-/// it.
-///
-/// Only the left half serves this — the right runs no session of its own, only
-/// the claim the left repeats to it — so this takes no `--half`. It is the one
-/// place to look after a refusal: a host that was turned down needs to see what
-/// the board thinks is open before it can tell an expired session from a
-/// half-finished one from another program holding the lock.
-fn cmd_smp_session(close: bool, link: &LinkArgs) -> Result<()> {
-    let mut client = smp_connect(link, Half::Left)?;
-    let status = client
-        .session_status()
-        .context("Could not read the update session")?;
-    print_session(&status);
-
-    if !close {
-        return Ok(());
-    }
-    if !status.open {
-        println!();
-        println!("Nothing to close.");
-        return Ok(());
-    }
-
-    // By id, so this ends the session that was just read rather than whatever
-    // happens to be open by the time the write lands.
-    let closed = client
-        .session_close(Some(status.id))
-        .context("Could not close the update session")?;
-    println!();
-    if closed.open {
-        println!("The board still reports session {} open.", closed.id);
-    } else {
-        println!("Session {} closed.", status.id);
-    }
-    Ok(())
-}
-
-fn print_session(status: &Status) {
-    if status.open {
-        println!(
-            "Session {} · {} · {} s left",
-            status.id,
-            if status.version.is_empty() {
-                "(no version)"
-            } else {
-                &status.version
-            },
-            status.ttl_ms / 1000
-        );
-    } else {
-        println!("No update session is open.");
-    }
-
-    println!("  next   {}", next_of(status.next));
-    println!("  left   {}", half_of(true, status.left_done));
-    println!("  right  {}", half_of(status.right_seen, status.right_done));
-    if !status.left_hash.is_empty() {
-        println!(
-            "  the left is running {}",
-            smp::image::hex(&status.left_hash)
-        );
-    }
-    if let Some(tag) = &status.right_tag {
-        println!("  the right reports {}", smp::image::hex(tag));
-    }
-    println!(
-        "  guard  {}",
-        match status.guard {
-            true => "on: this board accepts only a declared update over Bluetooth",
-            false => "off: a development build, so the single-step subcommands work",
-        }
-    );
-}
-
-fn next_of(next: Next) -> String {
-    match next {
-        Next::None => "nothing is declared".to_string(),
-        Next::Right => "the right half".to_string(),
-        Next::Left => "the left half".to_string(),
-        Next::Complete => "nothing: both halves carry what was declared".to_string(),
-        Next::Unknown(code) => format!("a step this zapp does not know ({code})"),
-    }
-}
-
-/// One half's line. A half nobody can read is not a half that is unfinished,
-/// and the two must not print the same: the first is a keyboard to go and look
-/// at, the second is one to wait for.
-fn half_of(seen: bool, done: bool) -> &'static str {
-    match (seen, done) {
-        (false, _) => "not reporting: switched off, out of range, or older firmware",
-        (true, false) => "not carrying its declared image, or has not confirmed it",
-        (true, true) => "carrying its declared image, confirmed",
-    }
-}
-
-fn cmd_smp_reset(args: &SmpArgs) -> Result<()> {
-    let mut client = smp_connect(&args.link, args.half)?;
-    client.reset().context("Reset failed")?;
-    println!("Resetting.");
-    Ok(())
 }
 
 /// Connects to the update service on the board these arguments name.

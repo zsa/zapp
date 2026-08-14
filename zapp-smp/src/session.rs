@@ -182,8 +182,8 @@ pub struct Status {
     pub right_tag: Option<Vec<u8>>,
     /// Milliseconds until the session expires, 0 when none is open.
     pub ttl_ms: u32,
-    /// False on a build with the guard compiled out, where the bare subcommands
-    /// still work and nothing is being enforced.
+    /// False on a build with the guard compiled out, where an undeclared write
+    /// still lands and nothing is being enforced.
     pub guard: bool,
 }
 
@@ -230,7 +230,7 @@ pub fn close_request(id: Option<u32>) -> Vec<u8> {
 /// that leaves one out is better reported with that field unset than not
 /// reported at all. `guard` is the exception and defaults to true, because
 /// assuming a board is enforcing is the reading that cannot mislead anyone into
-/// thinking a bare subcommand will work.
+/// thinking an undeclared write will land.
 pub fn parse_status(payload: &[u8]) -> Result<Status, SmpError> {
     let value = cbor::decode(payload)?;
     // Group 66, not 67: the firmware answers these commands out of ZSA's one
@@ -493,7 +493,7 @@ mod tests {
         let off = cbor::encode(&cbor::map(vec![("guard", Value::Bool(false))]));
         assert!(!parse_status(&off).unwrap().guard);
         // Absent: assume the guard is on, since that is the reading that cannot
-        // tell anyone a bare subcommand will work when it will not.
+        // tell anyone an undeclared write will land when it will not.
         let quiet = cbor::encode(&cbor::map(vec![("open", Value::Bool(false))]));
         assert!(parse_status(&quiet).unwrap().guard);
     }
