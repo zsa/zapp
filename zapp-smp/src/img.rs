@@ -48,8 +48,24 @@ impl ImageSlot {
 }
 
 /// The slots in an image-state response.
+///
+/// A listing that will not decode is mended first and only then given up on:
+/// MCUboot writes this one into a fixed buffer and can run out of it. See
+/// [`mended`].
 pub fn parse_state(payload: &[u8]) -> Result<Vec<ImageSlot>, SmpError> {
-    let value = cbor::decode(payload)?;
+    let value = match cbor::decode(payload) {
+        Ok(value) => value,
+        Err(err) => match mended(payload) {
+            Some(whole) => {
+                log::debug!(
+                    "the board's listing was cut short at {} bytes; read what is there",
+                    payload.len()
+                );
+                cbor::decode(&whole)?
+            }
+            None => return Err(err),
+        },
+    };
     proto::check_rc(&value, GROUP)?;
 
     let images = cbor::field(&value, "images")
@@ -89,6 +105,77 @@ fn slot(entry: &Value) -> ImageSlot {
         active: flag("active"),
         permanent: flag("permanent"),
     }
+}
+
+/// Every key `bs_list` can put in a slot's map.
+///
+/// Longest first, so the search below cannot match a short key that is also the
+/// tail of a longer one.
+const LISTING_KEYS: [&str; 9] = [
+    "confirmed",
+    "permanent",
+    "bootable",
+    "version",
+    "pending",
+    "active",
+    "image",
+    "slot",
+    "hash",
+];
+
+/// The same listing with a key nothing followed removed, if that is what is
+/// wrong with it.
+///
+/// MCUboot encodes this response into `bs_obuf`, which is one fixed
+/// `BOOT_SERIAL_MAX_MESSAGE_SIZE` — 244 bytes on a build with SHA-512 hashes
+/// and one image. Two slots that both hold a valid image do not always fit: a
+/// slot costs about 115 bytes, and the flags MCUboot adds while a swap is
+/// armed (`pending`, `permanent`) are what tips it over. When it runs out,
+/// zcbor's writes start failing but the `*_end_encode` calls still put their
+/// breaks in — `ZCBOR_STOP_ON_ERROR` is off in these builds — so the response
+/// ends with a key whose value never got written, then the breaks. Which is
+/// exactly a CBOR map with an odd number of items in it, and no decoder will
+/// take it.
+///
+/// The repair is to drop that key. Every value zcbor writes is written whole or
+/// not at all, so a response can only ever be cut between a key and its value,
+/// and the key can only be one of the nine `bs_list` uses. What comes back is
+/// the listing minus one field — in practice the last slot's `version`, which
+/// [`slot`] already reads as absent.
+///
+/// `None` when the damage is anything else, and then the decoder's own
+/// complaint is the honest answer.
+fn mended(payload: &[u8]) -> Option<Vec<u8>> {
+    const BREAK: u8 = 0xff;
+    let breaks = payload
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == BREAK)
+        .count();
+    if breaks == 0 {
+        return None;
+    }
+    let body = payload.len() - breaks;
+    let key = LISTING_KEYS
+        .iter()
+        .find(|key| dangling(&payload[..body], key))?;
+
+    // One header byte, then the key's own bytes.
+    let cut = body - key.len() - 1;
+    let mut whole = payload[..cut].to_vec();
+    whole.resize(cut + breaks, BREAK);
+    Some(whole)
+}
+
+/// Whether `body` ends with `key` written as a CBOR text string.
+///
+/// The header of a text string shorter than 24 bytes is one byte, and every
+/// key here is, so this is the whole encoding of one.
+fn dangling(body: &[u8], key: &str) -> bool {
+    let header = 0x60 | key.len() as u8;
+    body.len() > key.len()
+        && body[body.len() - key.len() - 1] == header
+        && &body[body.len() - key.len()..] == key.as_bytes()
 }
 
 /// Marks an image, by hash: for test when `confirm` is false, permanently when
@@ -194,6 +281,101 @@ mod tests {
     use super::*;
 
     const SHA: [u8; 32] = [0x5a; 32];
+
+    /// The 243 bytes a Voyager 2's right half actually sent, read off the
+    /// board with `zapp-wired`'s `read_right` example.
+    ///
+    /// Its spare slot was armed for a permanent swap, which is what makes the
+    /// listing too long: `pending` and `permanent` on slot 1 and the two
+    /// SHA-512 hashes put it over MCUboot's 244-byte response buffer, and it
+    /// stops after the second slot's `version` key.
+    const CUT_SHORT: &[u8] = &[
+        0xbf, 0x66, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x73, 0x9f, 0xbf, 0x68, 0x62, 0x6f, 0x6f, 0x74,
+        0x61, 0x62, 0x6c, 0x65, 0xf5, 0x69, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x65, 0x64,
+        0xf5, 0x64, 0x73, 0x6c, 0x6f, 0x74, 0x00, 0x64, 0x68, 0x61, 0x73, 0x68, 0x58, 0x40, 0x1d,
+        0xe5, 0xef, 0x7c, 0x18, 0xb3, 0x48, 0x11, 0x03, 0x53, 0xd1, 0xf0, 0x98, 0x79, 0xa5, 0x4e,
+        0xd5, 0xfc, 0xd6, 0xe0, 0x15, 0x47, 0xd9, 0xd3, 0x56, 0x25, 0xed, 0x5a, 0x08, 0x05, 0xb5,
+        0xe6, 0x46, 0x0d, 0x16, 0x61, 0xdc, 0x98, 0x6e, 0x5f, 0x20, 0x67, 0x23, 0x53, 0x81, 0xbb,
+        0x59, 0xcc, 0x2e, 0xbd, 0xb4, 0xc2, 0x1e, 0xc2, 0x5b, 0x25, 0xeb, 0x09, 0x14, 0xcc, 0x66,
+        0x39, 0x63, 0x00, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x66, 0x30, 0x2e, 0x31,
+        0x2e, 0x31, 0x31, 0xff, 0xbf, 0x68, 0x62, 0x6f, 0x6f, 0x74, 0x61, 0x62, 0x6c, 0x65, 0xf5,
+        0x67, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0xf5, 0x69, 0x70, 0x65, 0x72, 0x6d, 0x61,
+        0x6e, 0x65, 0x6e, 0x74, 0xf5, 0x64, 0x73, 0x6c, 0x6f, 0x74, 0x01, 0x64, 0x68, 0x61, 0x73,
+        0x68, 0x58, 0x40, 0xe0, 0x87, 0x4c, 0xb0, 0x37, 0x63, 0x3e, 0x92, 0x9b, 0x8c, 0x47, 0x4c,
+        0x8a, 0x3a, 0xa5, 0x1e, 0xdb, 0x93, 0xea, 0x01, 0x51, 0x55, 0xa5, 0xf4, 0x64, 0xe3, 0xdd,
+        0x33, 0x00, 0x79, 0xeb, 0x88, 0x3c, 0x47, 0x6b, 0xf1, 0x9d, 0x6d, 0x81, 0x6c, 0x9c, 0xfe,
+        0xa7, 0xf6, 0x70, 0x1c, 0x68, 0x9d, 0x4a, 0x84, 0xc2, 0xbe, 0xc7, 0x12, 0x96, 0x04, 0x8f,
+        0x90, 0xb9, 0x64, 0x3e, 0x13, 0x79, 0x26, 0x67, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+        0xff, 0xff, 0xff,
+    ];
+
+    #[test]
+    fn a_listing_the_board_ran_out_of_room_for_is_still_read() {
+        // Without the repair this is the run-stopping "invalid type: break,
+        // expected non-break" — and everything the listing does carry, which
+        // is everything that matters, goes in the bin with it.
+        assert!(
+            cbor::decode(CUT_SHORT).is_err(),
+            "the fixture is not cut short"
+        );
+
+        let slots = parse_state(CUT_SHORT).expect("a listing that is merely short");
+        assert_eq!(slots.len(), 2);
+
+        assert_eq!(slots[0].slot, 0);
+        assert_eq!(slots[0].version, "0.1.11");
+        assert_eq!(slots[0].hash.len(), 64);
+        assert_eq!(&slots[0].hash[..4], &[0x1d, 0xe5, 0xef, 0x7c]);
+        assert!(slots[0].confirmed && slots[0].bootable && !slots[0].active);
+
+        // The half of the story the swap is in: the spare slot is armed, and
+        // armed permanently, which is what the wired path writes.
+        assert_eq!(slots[1].slot, 1);
+        assert_eq!(&slots[1].hash[..4], &[0xe0, 0x87, 0x4c, 0xb0]);
+        assert!(slots[1].pending && slots[1].permanent);
+        // And the one field that was cut off reads as absent rather than
+        // wrong, which `slot` already allowed for.
+        assert_eq!(slots[1].version, "");
+    }
+
+    #[test]
+    fn a_listing_that_is_whole_is_never_touched() {
+        let whole = cbor::encode(&cbor::map(vec![(
+            "images",
+            Value::Array(vec![cbor::map(vec![
+                ("slot", cbor::uint(0)),
+                ("version", Value::Text("1.2.3".into())),
+            ])]),
+        )]));
+        assert!(mended(&whole).is_none(), "a good listing was rewritten");
+        assert_eq!(parse_state(&whole).unwrap()[0].version, "1.2.3");
+    }
+
+    #[test]
+    fn damage_that_is_not_a_dangling_key_is_reported_rather_than_guessed_at() {
+        // Nothing to mend: no breaks at all.
+        assert!(mended(&[0xbf, 0x64, 0x73, 0x6c, 0x6f, 0x74]).is_none());
+        // Breaks, but what precedes them is not one of the keys the listing
+        // uses — a hash cut mid-way, say, which zcbor cannot actually produce
+        // but which must not be silently turned into something else.
+        assert!(mended(&[0xbf, 0x58, 0x40, 0x01, 0x02, 0xff]).is_none());
+        // And the caller still gets the decoder's own words for it.
+        let err = parse_state(&[0xbf, 0x58, 0x40, 0x01, 0x02, 0xff]).unwrap_err();
+        assert!(matches!(err, SmpError::Cbor(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_key_that_is_the_tail_of_a_longer_one_is_not_mistaken_for_it() {
+        // "image" is a suffix of nothing here, but "pending"/"permanent" and
+        // "confirmed"/"bootable" share tails in other listings; the search
+        // goes longest first so the whole key is always the one removed.
+        let mut payload = vec![0xbf];
+        payload.extend_from_slice(&[0x69]); // text(9)
+        payload.extend_from_slice(b"permanent");
+        payload.push(0xff);
+        let whole = mended(&payload).expect("a dangling permanent");
+        assert_eq!(whole, vec![0xbf, 0xff]);
+    }
 
     fn decoded(payload: &[u8]) -> Value {
         cbor::decode(payload).unwrap()

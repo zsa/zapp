@@ -131,6 +131,9 @@ pub struct FakeDevice {
     ///
     /// Ignored once `listings` is set.
     pub slot_hashes: Vec<Vec<u8>>,
+    /// Answered instead of any listing at all, byte for byte. `None` is the
+    /// ordinary board; `Some` is one whose reply did not fit its buffer.
+    pub listing_bytes: Option<Vec<u8>>,
     /// Whole multi-slot listings, read by read, the same way. Empty is the
     /// one-slot listing `slot_hashes` describes. A state *write* answers with
     /// the head of the list without taking it, the way `bs_set` replies with
@@ -165,6 +168,7 @@ impl FakeDevice {
             next_step: 1,
             guard: true,
             slot_hashes: vec![vec![0x11; 32]],
+            listing_bytes: None,
             listings: Vec::new(),
             largest: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -176,8 +180,16 @@ impl FakeDevice {
 
     fn answer(&mut self, header: Header, payload: Value) {
         let body = cbor::encode(&payload);
+        self.answer_raw(header, &body);
+    }
+
+    /// The same, with the body handed over as it is.
+    ///
+    /// For the one thing a well-formed answer cannot stand in for: a board
+    /// whose reply ran out of buffer half-way and is not valid CBOR at all.
+    fn answer_raw(&mut self, header: Header, body: &[u8]) {
         let packet =
-            proto::frame(header.op.response(), header.group, header.command, header.seq, &body)
+            proto::frame(header.op.response(), header.group, header.command, header.seq, body)
                 .unwrap();
         for fragment in packet.chunks(self.mtu) {
             self.outgoing.push_back(fragment.to_vec());
@@ -227,6 +239,12 @@ impl FakeDevice {
             (img::GROUP, img::CMD_STATE) => {
                 if header.op == Op::Write {
                     self.record_mark(body);
+                }
+                // A board that ran out of response buffer answers with what it
+                // managed to write, which is not CBOR any decoder will take.
+                if let Some(cut_short) = self.listing_bytes.clone() {
+                    self.answer_raw(header, &cut_short);
+                    return;
                 }
                 let state = self.list_images(header.op == Op::Read);
                 self.answer(header, state);

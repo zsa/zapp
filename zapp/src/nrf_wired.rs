@@ -189,12 +189,18 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                 log::debug!("could not end the session after the failure: {err}");
             }
 
-            // One line. The chain underneath it names bridges, mailboxes and
-            // event codes, which is what this looks like from the inside and
-            // no help at all to someone holding a keyboard — it goes to the
-            // debug log, where it is still there when it is wanted.
+            // One line, plus whatever the thing that actually failed said.
+            // The middle of the chain names bridges, mailboxes and event
+            // codes, which is what this looks like from the inside and no help
+            // to someone holding a keyboard — that stays in the debug log. The
+            // far end of it is different: it is the board's own words, and
+            // leaving them out once cost a whole bench session spent guessing
+            // at a failure the board had already named.
             log::debug!("failure detail: {err:#}");
-            let mut line = format!("Error: {err}.");
+            let mut line = match root_cause(&err) {
+                Some(cause) => format!("Error: {err} ({cause})."),
+                None => format!("Error: {err}."),
+            };
             for note in notes {
                 line.push(' ');
                 line.push_str(&note);
@@ -654,9 +660,7 @@ fn write_half<L: IgnitionLink + 'static>(
         // MCUboot would revert the image this run just wrote before anything
         // could look at it. Marking it kept is what makes the read-back
         // possible; see the note at the top of this file.
-        client
-            .mark(&wanted, true)
-            .with_context(|| format!("Could not mark the {half} half's new image to be kept"))?;
+        arm(&mut client, half, &wanted)?;
         log::debug!(
             "{half}: {} bytes written, spare slot now carries {}",
             image.len(),
@@ -702,6 +706,34 @@ fn write_half<L: IgnitionLink + 'static>(
     }
     log::debug!("{half}: restarting");
     Ok((version_carrying(&carried, &wanted), staged))
+}
+
+/// Marks the spare slot to be kept, and puts up with a reply it cannot read.
+///
+/// The reply to a mark is a whole slot listing, which MCUboot encodes into one
+/// fixed buffer — and arming the swap is what makes that listing too long for
+/// it, because the `pending` and `permanent` flags it adds are the last straw
+/// on a build with SHA-512 hashes and two slots that both hold an image. So the
+/// most ordinary mark on this path answers with a listing that stops mid-way.
+///
+/// Reading that as a failed mark is wrong, and provably so: MCUboot's `bs_set`
+/// answers a refusal with `{"rc": n}` — ten bytes, which always fit and always
+/// decode — and only reaches the listing once the trailer is written. A reply
+/// that will not decode is therefore a mark that went through. The listing is
+/// re-read on the next pass anyway, so nothing is lost by dropping this one.
+fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
+    match client.mark(wanted, true) {
+        Ok(_) => Ok(()),
+        Err(SmpError::Cbor(detail)) => {
+            log::debug!(
+                "{half}: the mark went through and its listing did not fit the board's \
+                 buffer ({detail})"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("Could not mark the {half} half's new image to be kept")),
+    }
 }
 
 /// Whether a half has an image waiting in its spare slot to swap in.
@@ -1285,6 +1317,17 @@ fn reported(reading: BatteryReading) -> bool {
 // Saying what went wrong
 // ---------------------------------------------------------------------------
 
+/// The far end of a failure's chain, when it says something the top does not.
+///
+/// `anyhow`'s alternate form prints every link, which on this path is mostly
+/// plumbing. The last link is the exception: nothing wrapped it, so it is the
+/// error as the board or the bus reported it, and it is the one thing a person
+/// cannot work out from the sentence above it.
+fn root_cause(err: &anyhow::Error) -> Option<String> {
+    let root = err.chain().last()?.to_string();
+    (root != err.to_string()).then_some(root)
+}
+
 /// Everything worth printing under a failure.
 ///
 /// The board is asked again rather than remembered: STATUS carries the reason
@@ -1852,6 +1895,75 @@ mod tests {
             device.marks(),
             vec![(BUNDLE_HASH.to_vec(), true), (BUNDLE_HASH.to_vec(), true)]
         );
+    }
+
+    /// A listing cut off after a key, the way MCUboot's runs out of buffer.
+    ///
+    /// The shape rather than the bytes: `zapp_smp::img` pins the real 243-byte
+    /// capture from the board. What matters here is only that the reply does
+    /// not decode.
+    fn cut_short() -> Vec<u8> {
+        let mut bytes = vec![0xbf]; // map(indefinite)
+        bytes.push(0x66);
+        bytes.extend_from_slice(b"images"); // "images"
+        bytes.push(0x9f); // array(indefinite)
+        bytes.push(0xbf); // map(indefinite)
+        bytes.push(0x67);
+        bytes.extend_from_slice(b"version"); // a key with no value after it
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff]);
+        bytes
+    }
+
+    #[test]
+    fn a_mark_whose_listing_did_not_fit_the_board_is_still_a_mark() {
+        // The reply to a mark is a whole listing, and arming the swap is what
+        // makes that listing too long: MCUboot answers a refusal with ten
+        // bytes of `rc` that always decode, so a reply that will not decode
+        // can only have come from the path that already wrote the trailer.
+        let mut fake = zapp_smp::fake::FakeDevice::new(128);
+        fake.buffers = None;
+        fake.listing_bytes = Some(cut_short());
+        let marks = Arc::clone(&fake.marks);
+        let mut client = SmpClient::new(Box::new(fake)).with_timeout(Duration::from_millis(50));
+
+        arm(&mut client, Half::Right, &BUNDLE_HASH)
+            .expect("a listing that did not fit is not a mark that did not happen");
+        // And the mark really went out, permanently.
+        assert_eq!(
+            marks.lock().unwrap().clone(),
+            vec![(BUNDLE_HASH.to_vec(), true)]
+        );
+    }
+
+    #[test]
+    fn a_mark_the_board_actually_refused_still_fails() {
+        // The other side of it: an `rc` the board sent on purpose decodes
+        // perfectly well, and must not be swallowed with the short listings.
+        let mut fake = zapp_smp::fake::FakeDevice::new(128);
+        fake.buffers = None;
+        fake.fail_with = Some(33); // IMG_MGMT_ERR_IMAGE_SETTING_TEST_TO_ACTIVE_DENIED
+        let mut client = SmpClient::new(Box::new(fake)).with_timeout(Duration::from_millis(50));
+
+        let err = arm(&mut client, Half::Right, &BUNDLE_HASH)
+            .expect_err("a refusal is not a short listing");
+        let said = format!("{err:#}");
+        assert!(said.contains("Could not mark the right half"), "{said}");
+    }
+
+    #[test]
+    fn a_failure_says_what_the_board_called_it_and_not_only_what_this_end_was_doing() {
+        // The line the wired path prints used to be the outermost context on
+        // its own, which turned "bad CBOR from the board" into "Could not read
+        // the right half's image state" and cost a bench session.
+        let err = anyhow::anyhow!("bad CBOR from the board: invalid type: break")
+            .context("Could not read the right half's image state");
+        assert_eq!(
+            root_cause(&err).as_deref(),
+            Some("bad CBOR from the board: invalid type: break")
+        );
+        // A failure nothing wrapped has nothing to add, and must not repeat
+        // itself in brackets.
+        assert_eq!(root_cause(&anyhow::anyhow!("the cable came out")), None);
     }
 
     #[test]
