@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_core::device::{self, Keyboard};
+use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::flash::FlashProgress;
 use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
@@ -1126,20 +1126,8 @@ fn keep_looking(
 
 /// One look: is there a keyboard on USB, and does it answer for both halves?
 fn both_halves_report() -> bool {
-    let attached = match device::list_devices() {
-        Ok(attached) => attached,
-        Err(err) => {
-            log::debug!("could not look at what is plugged in: {err}");
-            return false;
-        }
-    };
-
-    // A board still in a bootloader is not it: the whole point is that the
-    // STM32 left one.
-    let found = attached
-        .iter()
-        .find(|device| device.bootloader.is_none() && device.keyboard == Some(Keyboard::Voyager2));
-    let Some(keyboard) = found else {
+    let attached = attached().unwrap_or_default();
+    let Some(keyboard) = voyager2_among(&attached) else {
         log::debug!("no keyboard on USB yet");
         return false;
     };
@@ -1149,6 +1137,36 @@ fn both_halves_report() -> bool {
         return false;
     };
     both_reported(&telemetry)
+}
+
+/// What is plugged in, or nothing when the bus cannot be read.
+fn attached() -> Option<Vec<UsbDevice>> {
+    device::list_devices()
+        .inspect_err(|err| log::debug!("could not look at what is plugged in: {err}"))
+        .ok()
+}
+
+/// The attached Voyager 2 running its own firmware, if one is there.
+///
+/// The model is checked, not just "a ZSA keyboard": an original Voyager on the
+/// same cable is a board no bundle can be written to, and counting it sends the
+/// update down the wire at something that will never answer.
+///
+/// A board still in a bootloader is not it either. For the restart wait that is
+/// the whole point — the STM32 has to have left one — and for routing it is
+/// [`bootloader_present`]'s to find.
+fn voyager2_among(attached: &[UsbDevice]) -> Option<&UsbDevice> {
+    attached
+        .iter()
+        .find(|device| device.bootloader.is_none() && device.keyboard == Some(Keyboard::Voyager2))
+}
+
+/// Whether a Voyager 2 running its own firmware is plugged in right now.
+///
+/// For deciding which way to send a bundle, alongside [`bootloader_present`]:
+/// between them they are every USB state a bundle can be written from.
+pub fn voyager2_present() -> bool {
+    attached().is_some_and(|attached| voyager2_among(&attached).is_some())
 }
 
 /// Whether both halves are in what the board answered.
@@ -1466,6 +1484,7 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zapp_core::device::BootloaderKind;
     use zapp_smp::fake::FakeSlot;
     use zapp_smp::{client, img};
     use zapp_wired::ignition;
@@ -2576,6 +2595,69 @@ mod tests {
             heard(Some(84), true),
             heard(Some(81), true)
         )));
+    }
+
+    /// A ZSA board on USB, the way `list_devices` reports one.
+    fn plugged_in(keyboard: Option<Keyboard>, pid: u16) -> UsbDevice {
+        UsbDevice {
+            keyboard,
+            bootloader: None,
+            serial: Some("layout/revision".to_string()),
+            vid: 0x3297,
+            pid,
+        }
+    }
+
+    /// The other ZSA keyboards, none of which a bundle can be written to.
+    fn the_other_models() -> Vec<UsbDevice> {
+        vec![
+            plugged_in(Some(Keyboard::Voyager), 0x1977),
+            plugged_in(Some(Keyboard::Moonlander), 0x1969),
+            plugged_in(Some(Keyboard::ErgodoxEz), 0x1307),
+            plugged_in(Some(Keyboard::PlanckEz), 0x6060),
+        ]
+    }
+
+    #[test]
+    fn another_zsa_keyboard_on_the_cable_is_not_a_voyager_2() {
+        // The bug this guards: a wired Voyager plugged in while the Voyager 2
+        // is on Bluetooth used to count as "a keyboard on USB", so the bundle
+        // went down the cable and sat waiting for a reset button on a board it
+        // could never be written to.
+        for other in the_other_models() {
+            let pid = other.pid;
+            assert!(
+                voyager2_among(&[other]).is_none(),
+                "{pid:#06x} was taken for a Voyager 2"
+            );
+        }
+        assert!(voyager2_among(&the_other_models()).is_none());
+    }
+
+    #[test]
+    fn a_voyager_2_among_other_boards_is_still_found() {
+        // Whichever order the bus happens to report them in: a user with two
+        // ZSA keyboards plugged in must still get the cable.
+        let mut mixed = the_other_models();
+        mixed.push(plugged_in(Some(Keyboard::Voyager2), 0x1978));
+        assert_eq!(voyager2_among(&mixed).map(|found| found.pid), Some(0x1978));
+        mixed.reverse();
+        assert_eq!(voyager2_among(&mixed).map(|found| found.pid), Some(0x1978));
+    }
+
+    #[test]
+    fn a_voyager_2_in_a_bootloader_is_not_one_running_its_firmware() {
+        // `bootloader_present` finds that one. Counting it here would report a
+        // board as back from its restart while it is still sitting in MCUboot.
+        let mut booting = plugged_in(Some(Keyboard::Voyager2), 0x0792);
+        booting.bootloader = Some(BootloaderKind::IgnitionV2);
+        assert!(voyager2_among(&[booting]).is_none());
+        // A bootloader that names no keyboard at all is not it either.
+        let mut generic = plugged_in(None, 0xDF11);
+        generic.vid = 0x0483;
+        generic.bootloader = Some(BootloaderKind::Stm32Dfu);
+        assert!(voyager2_among(&[generic]).is_none());
+        assert!(voyager2_among(&[]).is_none());
     }
 
     #[test]

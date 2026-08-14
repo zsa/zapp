@@ -545,21 +545,26 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
 
 /// A bundle, over whichever way the keyboard is reachable.
 ///
-/// The cable wins whenever the keyboard is on it, whether it is already in its
+/// The cable wins whenever the Voyager 2 is on it, whether it is already in its
 /// bootloader or still running its own firmware — the wired path waits for the
 /// bootloader and asks for the reset press. Bluetooth is for a keyboard that
 /// is not plugged in at all, not for one that is plugged in and simply has not
 /// been put in its bootloader yet: that one is a cable update the user is part
 /// way through, and sending it over the radio instead would be a surprise.
 ///
+/// The model is what decides, not "some ZSA board is on USB": a user with an
+/// original Voyager on the cable and a Voyager 2 on Bluetooth has to get the
+/// radio, or the update goes down a wire the bundle can never reach the board
+/// through and stops asking for a reset button that would not help.
+///
 /// `named` picks between bonded boards over Bluetooth. The cable ignores it:
 /// there is only ever one keyboard plugged in.
 fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
-    if nrf_wired::bootloader_present() || device::find_keyboard().is_ok() {
+    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
         return nrf_wired::flash(path, force);
     }
 
-    println!("No keyboard on USB — going over Bluetooth.");
+    println!("No Voyager 2 on USB — going over Bluetooth.");
     let link = LinkArgs {
         device: named.map(str::to_string),
         ..LinkArgs::default()
