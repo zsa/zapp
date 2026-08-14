@@ -43,10 +43,12 @@ const RETRY_EVERY: Duration = Duration::from_secs(3);
 
 /// How long to give a half to confirm the image it came back on.
 ///
-/// Both halves confirm themselves once their radio has proved out — the left on
-/// an encrypted BLE connection, the right once its link to the left is up — and
-/// the gate in `shared/src/zsa_boot_confirm.c` waits 30 s of uptime before it
-/// fires. This is that, plus room for a link that took its time.
+/// Both halves confirm themselves once their link to the rest of the keyboard
+/// has proved out — the left when its UART link to the controller running QMK
+/// comes up, the right when it first reaches the left — and over Bluetooth both
+/// of those are there: the keyboard is assembled and running, so each half's
+/// proof lands within a moment of it booting. This is that, plus room for a
+/// link that took its time.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 const CONFIRM_POLL: Duration = Duration::from_secs(5);
 
@@ -171,7 +173,8 @@ impl Progress {
         if self.settled {
             return format!(
                 "Both halves are running the new firmware, but at least one has not confirmed\n\
-                 it, so that half puts its old firmware back on the next restart.\n\n\
+                 it — it never proved its link to the other half — so that half puts its old\n\
+                 firmware back on the next restart.\n\n\
                  Leave the keyboard connected for a minute and re-run `{rerun}` — a half\n\
                  already running its image is confirmed rather than uploaded again, and\n\
                  the run says which half was still pending."
@@ -184,8 +187,9 @@ impl Progress {
                  this could see it. The left was not touched, so it is still running the\n\
                  firmware it was — and the keyboard is half working until the right is\n\
                  back, because the two are on different builds.\n\n\
-                 Nothing was confirmed. The right was only marked for test, so it puts its\n\
-                 old firmware back by itself the next time it restarts.\n\n\
+                 The right was only marked for test, and it keeps that image only once it\n\
+                 has reached the left. If it did, re-running finishes the pair; if it never\n\
+                 did, it puts its old firmware back the next time it restarts.\n\n\
                  Check the right half is switched on, charged and near the left, then\n\
                  power-cycle the keyboard and re-run `{rerun}`."
             );
@@ -199,8 +203,10 @@ impl Progress {
                      half working: the halves may not talk to each other at all, and the right\n\
                      may not type or light up. That is what a half-finished update looks like,\n\
                      not a broken keyboard.\n\n\
-                     Nothing was confirmed. The right was only marked for test, so it puts its\n\
-                     old firmware back by itself the next time it restarts.\n\n\
+                     The right was only marked for test, and it keeps that image only once\n\
+                     it has reached the left. It cannot, while the left is on the old build,\n\
+                     so as things stand it puts its old firmware back the next time it\n\
+                     restarts.\n\n\
                      Either:\n  \
                      · re-run `{rerun}` to finish the update, or\n  \
                      · power-cycle the keyboard to put the right half back as it was."
@@ -208,8 +214,9 @@ impl Progress {
             }
             return format!(
                 "The right half was restarted onto the new firmware and the left was already\n\
-                 carrying its image, so the two are on the same build. The right has not\n\
-                 confirmed, so it reverts on the next restart.\n\n\
+                 carrying its image, so the two are on the same build. The right keeps that\n\
+                 image only once it has reached the left: if it has, it is already keeping\n\
+                 it; if it has not, it reverts on the next restart.\n\n\
                  Re-run `{rerun}` to finish, or power-cycle the keyboard to put the right\n\
                  half back as it was."
             );
@@ -217,8 +224,9 @@ impl Progress {
 
         format!(
             "The halves were written, marked for test and restarted, and at least one did\n\
-             not come back where this could see it. Nothing was confirmed, so anything\n\
-             that was written puts its old firmware back on the next restart.\n\n\
+             not come back where this could see it. Each half keeps its new image only once\n\
+             it has proved its link to the other, so a half that never got that far puts\n\
+             its old firmware back on the next restart.\n\n\
              Power-cycle the keyboard to get a working pair back, then re-run `{rerun}`."
         )
     }
@@ -811,8 +819,9 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
 /// Marks a half's new image for test and restarts it.
 ///
 /// For test, never confirmed: an image that is confirmed before it has run is
-/// an image with no way back. Both halves confirm themselves once their radio
-/// has proved out, and a half that never gets that far reverts on its own.
+/// an image with no way back. Both halves confirm themselves once their link to
+/// the rest of the keyboard has proved out, and a half that never gets that far
+/// reverts on its own.
 fn restart(steps: &mut Steps, client: &mut SmpClient, half: Half, hash: &[u8]) -> Result<()> {
     steps.announce(&format!("{} half — mark for test and restart", titled(half)));
     client
@@ -923,18 +932,19 @@ fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Result<(bool, Vec<
 /// it will not.
 ///
 /// Waiting rather than confirming is the point: the firmware confirms itself
-/// once its radio has proved healthy, and that gate is the only thing standing
-/// between a bad image and a keyboard that stays on it. Confirming from here
-/// bypasses it, so it is the fallback and it says so out loud.
+/// once its link to the rest of the keyboard has proved out, and that gate is
+/// the only thing standing between a bad image and a keyboard that stays on it.
+/// Confirming from here bypasses it, so it is the fallback and it says so out
+/// loud.
 fn await_confirm(link: &LinkArgs, half: Half, hash: &[u8], already: bool) -> Result<()> {
     if already {
         println!("  {half}: confirmed");
         return Ok(());
     }
 
-    // One session held open for the whole wait: the left's own gate wants an
-    // encrypted connection to fire on, and reconnecting per poll would cost
-    // more than the poll.
+    // One session held open for the whole wait: reconnecting per poll would
+    // cost more than the poll, and a half that is about to confirm answers on
+    // the connection that is already there.
     let mut client = smp_connect(link, half).ok();
     let started = Instant::now();
     let mut noted = Instant::now();
@@ -1339,7 +1349,11 @@ mod tests {
             ..Progress::default()
         });
         assert!(advice.contains("different protocol versions"), "{advice}");
-        assert!(advice.contains("puts its\nold firmware back"), "{advice}");
+        // And what happens to the right's image is told as the condition it
+        // actually is: it keeps the image only if it reached the left, which it
+        // cannot have while the left is still on the old build.
+        assert!(advice.contains("keeps that image only once"), "{advice}");
+        assert!(advice.contains("puts its old firmware back"), "{advice}");
         assert!(advice.contains("re-run"), "{advice}");
         assert!(advice.contains("power-cycle"), "{advice}");
     }
@@ -1384,6 +1398,11 @@ mod tests {
         });
         assert!(!advice.contains("different protocol"), "{advice}");
         assert!(advice.contains("same build"), "{advice}");
+        // Both halves are on the build the right needs to reach the left, so
+        // the right may well have kept its image already. Saying flatly that it
+        // reverts would send someone to power-cycle a keyboard that is fine.
+        assert!(advice.contains("if it has, it is already keeping"), "{advice}");
+        assert!(advice.contains("if it has not, it reverts"), "{advice}");
     }
 
     #[test]

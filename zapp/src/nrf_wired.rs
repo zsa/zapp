@@ -15,6 +15,16 @@
 //! The write goes into the spare slot and is marked for test, the same as the
 //! Bluetooth path: MCUboot swaps it in on the next boot, the application
 //! confirms it, and a half that does not confirm is reverted.
+//!
+//! What a half confirms on is the difference between the two paths. Each half's
+//! firmware keeps its new image only once it has proved its link to the rest of
+//! the keyboard — the left when its UART link to the STM32 running QMK comes up,
+//! the right when it first reaches the left over the radio or answers a
+//! telemetry read that QMK asked for over the wire. None of that can happen
+//! during a wired session: the STM32 is running ignition, not QMK, from the
+//! first BEGIN to the reset at the end. So no half can be confirmed while this
+//! file is looking at it, and the confirm is checked where it can be — after the
+//! session, by asking the keyboard itself, in [`came_back`].
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -60,8 +70,8 @@ const WAIT_FOR_RIGHT: Duration = Duration::from_secs(30);
 /// not asked several thousand times.
 const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
 
-/// How long both halves get to swap, boot and confirm before the read-back
-/// gives up on them.
+/// How long both halves get to swap and come back up before the read-back gives
+/// up on them.
 ///
 /// A ceiling rather than a wait: the read-back re-reads both halves every
 /// [`SETTLE_POLL`] and stops the moment they carry the bundle. Swap-using-move
@@ -140,21 +150,17 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                 Err(err) => log::debug!("the bootloader went down with the reset: {err}"),
             }
 
-            // Advisory only. Both halves were read back against the bundle in
-            // their bootloaders, which is what says the flash took; this asks
-            // QMK, which is a different firmware on a different chip and may
-            // not be there at all.
-            if outcome == Outcome::Flashed {
-                if !came_back(CONFIRM_WINDOW) {
-                    println!(
-                        "{}",
-                        wrap(
-                            "Note: both halves match the bundle, but the keyboard has not come \
-                             back on USB. Unplug it and plug it back in."
-                        )
-                    );
-                }
+            // The last check, and not an optional one: the halves keep their
+            // new images only once they have proved their links, and this is
+            // the only point in the run where they can.
+            if let Err(err) = finish(outcome, || came_back(CONFIRM_WINDOW)) {
+                log::debug!("failure detail: {err:#}");
+                println!();
+                println!("{}", wrap(&format!("Error: {err}.")));
+                std::process::exit(1);
+            }
 
+            if outcome == Outcome::Flashed {
                 println!("Done!");
             }
             Ok(())
@@ -276,12 +282,13 @@ fn run<L: IgnitionLink + 'static>(
 /// The read-back inside `write_half` happens with the half still sitting in the
 /// recovery that wrote it, and the image still in the spare slot. This one runs
 /// after MCUboot swapped and the half restarted, so slot 0 carrying the
-/// bundle's hash proves the swap completed and `confirmed` proves the
-/// application booted far enough to keep it.
+/// bundle's hash is the swap having completed on an image MCUboot verified.
 ///
 /// Both answers come from the halves' own bootloaders. Nothing here asks an
 /// application anything, which is what makes it the check the run passes or
-/// fails on.
+/// fails on — and also what it cannot see: a half in recovery has no link to
+/// the rest of the keyboard and so has nothing to confirm on. That half of the
+/// story is [`came_back`]'s.
 ///
 /// A half that is still swapping answers nothing, or answers with the image it
 /// had, so a pass that fails is retried until `settle` runs out and the last
@@ -377,8 +384,9 @@ fn read_back<L: IgnitionLink + 'static>(
         Err(err) => {
             log::debug!("could not re-open a session to read the halves back: {err:#}");
             // Staging is not installing. Each half swaps on its next restart
-            // and reverts unless its application confirms, so a check that was
-            // not made cannot be reported as an update that took.
+            // and reverts unless its application proves its link afterwards, so
+            // a check that was not made cannot be reported as an update that
+            // took.
             if right_absent(ignition) {
                 return Err(err).context(unverified());
             }
@@ -405,7 +413,7 @@ fn read_back<L: IgnitionLink + 'static>(
             entry.hash = Some(slot.hash.clone());
             entry.version = slot.version.clone();
         }
-        log::debug!("{half}: swapped to {} and confirmed it", short(&wanted));
+        log::debug!("{half}: restarted carrying {}", short(&wanted));
 
         // Out of the bootloaders again, the same way `write_half` does it.
         match half {
@@ -433,13 +441,14 @@ fn read_back<L: IgnitionLink + 'static>(
 }
 
 /// What a read-back nobody could make says. Both images are staged and armed,
-/// which is not the same as installed: an image whose application does not
-/// confirm is reverted, and nothing here saw whether that happened.
+/// which is not the same as installed: an image whose half never proves its
+/// link to the rest of the keyboard is reverted, and nothing here saw how far
+/// either of them got.
 fn unverified() -> String {
     "both images were staged but could not be checked afterwards, because the right half \
      did not answer when the bootloaders were re-entered. Each half installs its image on \
-     the next restart and undoes it unless its firmware confirms, so this update may not \
-     have taken. Run the same command again"
+     the next restart and undoes it unless it links up with the rest of the keyboard \
+     afterwards, so this update may not have taken. Run the same command again"
         .to_string()
 }
 
@@ -586,6 +595,9 @@ fn write_half<L: IgnitionLink + 'static>(
     let mut staged = Staged::Nothing;
     let carried = if installed(&before, &wanted) && !force {
         log::debug!("{half}: already carrying this image, not written again");
+        if primary(&before).is_some_and(|slot| !slot.confirmed) {
+            log::debug!("{half}: it has not confirmed that image, so it has yet to link up once");
+        }
         before
     } else {
         staged = Staged::Image;
@@ -620,9 +632,9 @@ fn write_half<L: IgnitionLink + 'static>(
             .with_context(|| format!("Could not read the {half} half's image state back"))?;
         landed(&after, &wanted, half, Checked::Written)?;
 
-        // For test, not confirmed: the application confirms itself at boot,
-        // which is what the read-back checks and what leaves MCUboot a way
-        // back.
+        // For test, not confirmed: the application confirms itself once it has
+        // proved its link to the rest of the keyboard, which is what leaves
+        // MCUboot a way back out of an image that cannot talk.
         client
             .mark(&wanted, false)
             .with_context(|| format!("Could not mark the {half} half's new image for test"))?;
@@ -861,6 +873,15 @@ fn going_backwards(slots: &[ImageSlot], image: &[u8], half: Half) -> Option<Stri
     ))
 }
 
+/// Whether the half is already running the image the bundle carries.
+///
+/// The hash on its own, deliberately, and the confirm is not part of it: a
+/// confirm says the half's links have proved out since it booted, which is a
+/// fact about the keyboard being alive rather than about what is in flash, and
+/// a half pulled into recovery by this very run cannot have any. Reading it as
+/// "not installed" would send the same image down again — and MCUboot refuses
+/// to mark for test a hash that resolves to the slot it is running, so the
+/// re-write could not be armed anyway.
 fn installed(slots: &[ImageSlot], wanted: &[u8]) -> bool {
     primary(slots).is_some_and(|slot| slot.hash == wanted)
 }
@@ -913,10 +934,18 @@ impl Checked {
 
 /// Fails unless the slot the board reports is the image the bundle carries.
 ///
-/// After the restart it also has to be confirmed: MCUboot reports an
-/// unconfirmed primary slot as `active` without `confirmed` — the `REVERT`
-/// case in `boot/boot_serial/src/boot_serial.c` — which means the old image
-/// comes back on the next boot.
+/// The hash is the whole of it, at both points. A hash only appears in
+/// MCUboot's listing for an image it has read and verified, so the bundle's
+/// hash in the primary slot is the swap having physically completed on a signed
+/// image — which is what this run can check and all it needs to.
+///
+/// Not the confirm. A half confirms on its link to the rest of the keyboard,
+/// and no half has one while the STM32 is running ignition, so an unconfirmed
+/// primary slot here is what a working update looks like mid-session rather
+/// than a fault. Whether the halves keep their images is [`came_back`]'s to
+/// answer, after the session. A half that reports itself confirmed anyway —
+/// older firmware, or one whose proof somehow already fired — passes just the
+/// same.
 fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half, checked: Checked) -> Result<()> {
     let lead = checked.lead(half);
     let named_slot = checked.named_slot();
@@ -938,14 +967,6 @@ fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half, checked: Checked) -> R
             short(&slot.hash),
             short(wanted),
             checked.wrong()
-        );
-    }
-    if matches!(checked, Checked::Restarted) && !slot.confirmed {
-        bail!(
-            "{lead} the bundle's image, but has not confirmed it. That means the half never \
-             finished booting its new firmware, so MCUboot puts the old image back on the \
-             next restart and this update is undone. Unplug the keyboard, plug it back in, \
-             and run the same command again."
         );
     }
     Ok(())
@@ -1073,11 +1094,46 @@ fn report_slot(slots: &[ImageSlot]) {
 ///
 /// It has to enumerate, its halves have to link up, and only then has either
 /// of them anything to say about itself. Generous on purpose: the cost of a
-/// window that is too short is telling someone an update that worked did not.
+/// window that is too short is telling someone an update that worked did not,
+/// and since the halves keep their images on the strength of those same links,
+/// that is now a run that fails rather than a note under a run that passed.
+/// The window is also what drives half of what it is waiting for — QMK's first
+/// telemetry read is what the right half proves itself on — so it is looking
+/// for something it is helping to happen, not sitting out a fixed delay.
 const CONFIRM_WINDOW: Duration = Duration::from_secs(15);
 
 /// The pause between looks, while the keyboard is still on its way back.
 const CONFIRM_GAP: Duration = Duration::from_millis(500);
+
+/// What the restart check's answer means for the run.
+///
+/// A keyboard that answers for both halves is the proof each half's firmware is
+/// waiting for, in the same shape: the left's reading only reaches the host
+/// once its UART link to QMK is up, which is the left's own gate, and the
+/// right's crossed the wire between the halves and was served to a QMK
+/// telemetry read, which is both of the right's. So this is not a second
+/// opinion on the read-backs — it is the only thing in the run that can see
+/// whether the halves will keep what they were given.
+///
+/// Nothing to look for when nothing was written: both halves are running what
+/// they were running before the session, which they had already proved.
+fn finish(outcome: Outcome, look: impl FnOnce() -> bool) -> Result<()> {
+    if outcome != Outcome::Flashed || look() {
+        return Ok(());
+    }
+    bail!("{}", unproven())
+}
+
+/// What a keyboard that never came back after the update says.
+fn unproven() -> String {
+    "both halves took the update, but the keyboard has not come back on USB with both of them \
+     reporting. Each half keeps its new image only once it has proved its link to the rest of \
+     the keyboard — the left to the controller, the right to the left — and neither could do \
+     that while this update was running, so a half that has not proved its link since puts its \
+     old firmware back on the next restart. Unplug the keyboard, plug it back in, and run the \
+     same command again"
+        .to_string()
+}
 
 /// Whether the keyboard came back on its own firmware, with both halves in it.
 ///
@@ -1755,7 +1811,7 @@ mod tests {
     #[test]
     fn a_written_half_stages_into_image_two_and_marks_it_for_test_never_confirmed() {
         let (result, _control, device) = flash_loopback_written();
-        result.expect("both halves swapped and confirmed");
+        result.expect("both halves swapped");
 
         // Image 2 is slot1_partition under direct image upload. Image 0 or 1
         // would be the slot the half is running.
@@ -1774,10 +1830,7 @@ mod tests {
     #[test]
     fn a_swap_that_completed_and_was_confirmed_passes_the_read_back() {
         let (result, control, device) = flash_loopback_written();
-        assert_eq!(
-            result.expect("both halves swapped and confirmed"),
-            Outcome::Flashed
-        );
+        assert_eq!(result.expect("both halves swapped"), Outcome::Flashed);
 
         assert!(count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0);
         // Two sessions: the one that wrote, and the one that read back after
@@ -1792,17 +1845,20 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_the_halves_never_confirmed_fails_and_says_the_update_is_undone() {
-        // The bundle's image is in slot 0 and running, so every hash matches.
-        // Only the missing confirm says MCUboot is about to put it back.
+    fn a_swap_the_halves_have_not_confirmed_yet_is_what_a_wired_run_expects() {
+        // The state every wired run reads: the bundle's image swapped into slot
+        // 0 and running, and no confirm on it, because a half in recovery has
+        // no link to the rest of the keyboard to confirm on. Failing here would
+        // fail every wired flash.
         let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
         let (result, _control, _device) = flash_loopback_setup(&blob, false, |device| {
             device.tweak(|fake| fake.listings = a_whole_run(reverting(&BUNDLE_HASH, &DEVICE_HASH)))
         });
 
-        let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("has not confirmed it"), "{err}");
-        assert!(err.contains("this update is undone"), "{err}");
+        assert_eq!(
+            result.expect("an unconfirmed swap is not a failed one"),
+            Outcome::Flashed
+        );
     }
 
     #[test]
@@ -2099,7 +2155,7 @@ mod tests {
     #[test]
     fn a_read_back_the_right_half_will_not_answer_fails_the_run() {
         // Staging is not installing: the write pass proved the bytes reached
-        // the spare slot, and an image that swaps in and is never confirmed is
+        // the spare slot, and an image whose half never links up afterwards is
         // reverted. A check that could not be made is not a success.
         let blob = bundled(&signed(0x11, &DEVICE_HASH), &signed(0x22, &DEVICE_HASH));
         let bundle = bundle::parse(&blob).unwrap();
@@ -2232,26 +2288,52 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_that_completed_but_was_not_confirmed_is_a_failure_that_says_it_reverts() {
-        // MCUboot's BOOT_SWAP_TYPE_REVERT: the new image is in slot 0 and
-        // running, but nothing confirmed it, so the next boot puts the old one
-        // back. The hash alone would call this a success.
+    fn a_swap_that_completed_passes_whether_or_not_the_half_has_confirmed_it() {
+        // MCUboot's BOOT_SWAP_TYPE_REVERT listing: the new image is in slot 0
+        // and running with nothing confirming it. Over the cable that is what
+        // every half looks like — the STM32 is running ignition, so no half has
+        // a link to prove itself on — and the hash is a verified image in the
+        // slot the half runs from, which is the swap having completed.
         let wanted = [0xa1; 32];
-        let reverting = [
+        let unconfirmed = [
             ImageSlot {
                 active: true,
                 ..slot(0, &wanted)
             },
             kept(1, &[0x99; 32]),
         ];
+        assert!(landed(&unconfirmed, &wanted, Half::Left, Checked::Restarted).is_ok());
 
-        let err = landed(&reverting, &wanted, Half::Left, Checked::Restarted)
+        // And the hash still decides: the same unconfirmed slot carrying
+        // something else is the failure it always was.
+        let wrong = landed(
+            &[ImageSlot {
+                active: true,
+                ..slot(0, &[0x99; 32])
+            }],
+            &wanted,
+            Half::Right,
+            Checked::Restarted,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong.contains("not what the bundle carries"), "{wrong}");
+
+        // An unverifiable slot reports no hash at all, confirm or no confirm.
+        let empty = landed(&[slot(0, &[])], &wanted, Half::Left, Checked::Restarted)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("has not confirmed it"), "{err}");
-        assert!(err.contains("this update is undone"), "{err}");
-        // Not a hash complaint: the right image is in the right place.
-        assert!(!err.contains("not the"), "{err}");
+        assert!(empty.contains("not bootable"), "{empty}");
+    }
+
+    #[test]
+    fn a_half_carrying_the_image_without_a_confirm_is_still_carrying_it() {
+        // The confirm is a fact about the keyboard's links being up, not about
+        // what is in flash, so the skip decision does not read it. A half
+        // pulled into recovery by this very run cannot have confirmed anything.
+        let wanted = [0xa1; 32];
+        assert!(installed(&[slot(0, &wanted)], &wanted));
+        assert!(installed(&[kept(0, &wanted)], &wanted));
     }
 
     // ---- What a failure says -------------------------------------------
@@ -2508,6 +2590,35 @@ mod tests {
     }
 
     // ---- Confirming the keyboard came back -----------------------------
+
+    #[test]
+    fn a_keyboard_that_does_not_come_back_fails_a_run_that_wrote_something() {
+        // It used to be a note under a successful run. It cannot be: with the
+        // halves confirming on their links rather than on booting, this is the
+        // only thing in the run that can see whether they will keep what they
+        // were given.
+        let err = finish(Outcome::Flashed, || false)
+            .expect_err("a keyboard that never came back is not a finished update");
+        let said = format!("{err}");
+        assert!(said.contains("has not come back on USB"), "{said}");
+        assert!(said.contains("proved its link"), "{said}");
+        assert!(said.contains("puts its old firmware back"), "{said}");
+        assert!(said.contains("run the same command again"), "{said}");
+    }
+
+    #[test]
+    fn a_keyboard_that_comes_back_with_both_halves_reporting_finishes_the_run() {
+        assert!(finish(Outcome::Flashed, || true).is_ok());
+    }
+
+    #[test]
+    fn a_run_that_wrote_nothing_is_not_waited_on() {
+        // Both halves are running what they were running before the session,
+        // which they had already proved. There is nothing new to keep, so
+        // nothing to prove, and a keyboard someone unplugged after an
+        // up-to-date run is not a failure.
+        assert!(finish(Outcome::UpToDate, || panic!("it looked anyway")).is_ok());
+    }
 
     /// Runs the window against a keyboard that answers on the `answers_on`th
     /// look, on a clock the pause moves itself. Answers with whether it was
