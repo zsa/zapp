@@ -117,6 +117,33 @@ enum Commands {
         #[command(subcommand)]
         command: DfuCommands,
     },
+    /// Pair the two halves by provisioning their shared ESB key over the cable
+    #[command(
+        long_about = "Provision the ESB pairing key onto both halves over the cable.\n\n\
+            A Voyager 2's two halves talk to each other over a private radio link, \
+            and they link only when both carry the same 30-byte key. `zapp bond` \
+            writes one fresh key to both halves through the bootloader, reads it \
+            back off each, then reboots the keyboard and waits for both halves to \
+            report over USB — which is the pair having re-linked on the new key. A \
+            key mismatch is silent: the link just never forms, so that telemetry is \
+            the only real proof.\n\n\
+            Put the keyboard in its bootloader first (reset button on the left \
+            half); bond waits for it and asks. Pass --key to write a specific key \
+            instead of generating one, or --show to read what the two halves carry \
+            without writing anything.",
+        after_long_help = "Examples:\n  \
+            zapp bond\n  \
+            zapp bond --show\n  \
+            zapp bond --key 4a1b2c...  (60 hex characters)"
+    )]
+    Bond {
+        /// Write this exact 30-byte key (60 hex characters) instead of generating one
+        #[arg(long, value_name = "HEX")]
+        key: Option<String>,
+        /// Read both halves' current key and report whether they match, writing nothing
+        #[arg(long)]
+        show: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -232,6 +259,16 @@ fn main() -> Result<()> {
                 println!("{advice}");
             }
             result
+        }
+        Commands::Bond { key, show } => {
+            if show {
+                if key.is_some() {
+                    anyhow::bail!("--show reads what the halves carry; it takes no --key");
+                }
+                nrf_wired::bond_show()
+            } else {
+                nrf_wired::bond(key.as_deref())
+            }
         }
     }
 }

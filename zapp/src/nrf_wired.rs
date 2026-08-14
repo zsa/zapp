@@ -50,6 +50,7 @@ use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::flash::FlashProgress;
 use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
+use zapp_smp::settings::{self, EsbConfig};
 use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError};
 use zapp_wired::ignition::{usb::UsbLink, Halves, SessionState, TargetState};
 use zapp_wired::{
@@ -1566,6 +1567,396 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bonding: the ESB pairing key onto both halves
+// ---------------------------------------------------------------------------
+
+/// Provisions a pairing key onto both halves over the cable.
+///
+/// Generates a fresh key unless one is given as 60 hex characters. Both halves
+/// take a byte-identical bundle — there is no role field, and the pair links
+/// only when both carry the same one. Writing it is not the proof: a key
+/// mismatch is silent, the radio link simply never forms, with no state either
+/// half can report. So the run ends the way [`flash`] does, by watching the
+/// keyboard come back on USB with both halves reporting — which is the two
+/// applications having re-linked on the new key.
+pub fn bond(key: Option<&str>) -> Result<()> {
+    let config = match key {
+        Some(text) => EsbConfig::parse_hex(text)
+            .map_err(|err| anyhow!("that is not a usable pairing key: {err}"))?,
+        None => EsbConfig::generate(),
+    };
+
+    match key {
+        Some(_) => println!("Using the pairing key you supplied."),
+        None => println!("Generated a fresh pairing key."),
+    }
+    describe_config(&config);
+
+    let shared = Shared::new(open()?);
+    let mut ignition = Ignition::new(shared.clone());
+
+    match bond_run(&shared, &mut ignition, &config, REPLY_TIMEOUT) {
+        Ok(()) => {
+            // Both halves have the bundle and read it back; put the session
+            // away and let each reboot into its application to reload it.
+            end_and_reset(&mut ignition);
+            prove_bond(came_back(CONFIRM_WINDOW));
+            Ok(())
+        }
+        Err(err) => bond_failed(&mut ignition, err),
+    }
+}
+
+/// Reads both halves' pairing keys and reports whether they match, writing
+/// nothing.
+///
+/// The support command for "are these two halves even paired": it never puts a
+/// key on the wire, only reads each half's `esb/config` back and prints the two
+/// fingerprints and whether they agree. A half that was never provisioned reads
+/// back as such rather than as a failure.
+pub fn bond_show() -> Result<()> {
+    let shared = Shared::new(open()?);
+    let mut ignition = Ignition::new(shared.clone());
+
+    match bond_show_run(&shared, &mut ignition, REPLY_TIMEOUT) {
+        Ok(report) => {
+            // A read-only look still opened a session, which left both halves
+            // in their bootloaders; boot them back the same way.
+            end_and_reset(&mut ignition);
+            print_show(&report);
+            Ok(())
+        }
+        Err(err) => bond_failed(&mut ignition, err),
+    }
+}
+
+/// Writes both halves and reads each back, the right half first.
+fn bond_run<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    config: &EsbConfig,
+    timeout: Duration,
+) -> Result<()> {
+    let status = open_session(ignition, WAIT_FOR_RIGHT)?;
+    log::debug!(
+        "session active: TRRS {} kHz, {} bytes per message, left {}, right {}",
+        status.i2c_khz,
+        status.max_payload,
+        running(status.left_state),
+        running(status.right_state)
+    );
+
+    // The right half first, for the same reason the flash has it: the right is
+    // the half that can fail to come back at all, and finding that out before
+    // the left is touched leaves a keyboard with one provisioned half rather
+    // than a session that will not reopen.
+    let mut readbacks: Vec<(Half, Vec<u8>)> = Vec::new();
+    for half in [Half::Right, Half::Left] {
+        let readback = provision_half(shared, ignition, half, config, &status, timeout)?;
+        readbacks.push((half, readback));
+    }
+
+    // Both halves take the same bundle, so two halves that read back different
+    // bytes are a keyboard whose pair could never link. Refuse it here rather
+    // than reboot into a mismatch — the per-half retry already had its go.
+    let right = &readbacks[0].1;
+    let left = &readbacks[1].1;
+    if !keys_agree(left, right) {
+        bail!(
+            "the two halves read back different pairing keys (left {}, right {}); they would \
+             not pair. Run bond again",
+            settings::fingerprint_hex(left),
+            settings::fingerprint_hex(right)
+        );
+    }
+    Ok(())
+}
+
+/// Points the bridge at one half, writes the bundle, reads it back, and reboots
+/// the half into its application.
+///
+/// One retry: a single line dropped on the TRRS bus is worth trying again
+/// before the run is given up, and the read-back is what catches it. The half
+/// is rebooted out of recovery whether the write took or not, so a failure does
+/// not leave it sitting in the bootloader.
+fn provision_half<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    half: Half,
+    config: &EsbConfig,
+    status: &Status,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    ignition
+        .select(half)
+        .with_context(|| format!("Could not point the bridge at the {half} half"))?;
+    // Finish any line MCUboot was left holding, the way the flash does.
+    if let Err(err) = ignition.send(half.into(), b"\n") {
+        log::debug!("could not send the {half} half a resync newline: {err}");
+    }
+
+    let mut client = connect(shared, half, status.payload_budget(), timeout);
+
+    let mut last_readback: Option<Vec<u8>> = None;
+    for attempt in 1..=2 {
+        client
+            .settings_write(settings::ESB_CONFIG_NAME, config.as_bytes())
+            .with_context(|| format!("Could not write the {half} half's pairing key"))?;
+        let readback = client
+            .settings_read(settings::ESB_CONFIG_NAME)
+            .with_context(|| format!("Could not read the {half} half's pairing key back"))?;
+
+        if readback.as_slice() == config.as_bytes().as_slice() {
+            log::debug!("{half}: wrote and read back the pairing key");
+            reboot_half(ignition, &mut client, half)?;
+            println!(
+                "  {} half: wrote and read back {} bytes.",
+                titled(half),
+                settings::ESB_CONFIG_LEN
+            );
+            return Ok(readback);
+        }
+        log::warn!(
+            "{half}: read back {} not {}, on attempt {attempt}",
+            settings::fingerprint_hex(&readback),
+            settings::hex(&config.key_fingerprint())
+        );
+        last_readback = Some(readback);
+    }
+
+    // Boot it out of recovery even on failure, then report.
+    let _ = reboot_half(ignition, &mut client, half);
+    bail!(
+        "the {half} half read back a different pairing key than was written, twice (got {}). \
+         The write is not landing — check the cable between the halves and run bond again",
+        settings::fingerprint_hex(last_readback.as_deref().unwrap_or_default())
+    )
+}
+
+/// Reads both halves' pairing keys, writing nothing.
+fn bond_show_run<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    timeout: Duration,
+) -> Result<ShowReport> {
+    let status = open_session(ignition, WAIT_FOR_RIGHT)?;
+
+    let mut keys: Vec<(Half, HalfKey)> = Vec::new();
+    for half in [Half::Right, Half::Left] {
+        ignition
+            .select(half)
+            .with_context(|| format!("Could not point the bridge at the {half} half"))?;
+        if let Err(err) = ignition.send(half.into(), b"\n") {
+            log::debug!("could not send the {half} half a resync newline: {err}");
+        }
+        let mut client = connect(shared, half, status.payload_budget(), timeout);
+
+        let key = match client.settings_read(settings::ESB_CONFIG_NAME) {
+            Ok(value) => HalfKey::Provisioned(value),
+            // ENOENT: the whitelisted setting was never written. Not a
+            // failure — a half running on the development fallback key.
+            Err(SmpError::Remote { rc: 5, .. }) => HalfKey::NotProvisioned,
+            Err(err) => {
+                let _ = reboot_half(ignition, &mut client, half);
+                return Err(err)
+                    .with_context(|| format!("Could not read the {half} half's pairing key"));
+            }
+        };
+        reboot_half(ignition, &mut client, half)?;
+        keys.push((half, key));
+    }
+
+    Ok(ShowReport {
+        right: keys.remove(0).1,
+        left: keys.remove(0).1,
+    })
+}
+
+/// Reboots one half out of recovery and into its application, the way the flash
+/// does: the right through its own SMP reset, the left by releasing the MD pin
+/// and resetting it. The right also points the bridge back at the left, so no
+/// poll lands on a chip that is mid-reboot.
+fn reboot_half<L: IgnitionLink + 'static>(
+    ignition: &mut Ignition<Shared<L>>,
+    client: &mut SmpClient,
+    half: Half,
+) -> Result<()> {
+    match half {
+        Half::Right => {
+            client
+                .reset()
+                .context("Could not restart the right half out of MCUboot")?;
+            ignition
+                .select(Half::Left)
+                .context("Could not point the bridge away from the right half")?;
+        }
+        Half::Left => {
+            ignition
+                .release_md()
+                .context("Could not release the left half's MD pin")?;
+            ignition
+                .reset_target(Half::Left)
+                .context("Could not restart the left half")?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether two read-back bundles are the same, so the pair can link.
+fn keys_agree(left: &[u8], right: &[u8]) -> bool {
+    left == right
+}
+
+/// Puts the session away and reboots the STM32 out of its own recovery, best
+/// effort — both are on the way out and a failure here says nothing useful.
+fn end_and_reset<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>) {
+    if let Err(err) = ignition.end() {
+        log::debug!("could not end the session: {err}");
+    }
+    if let Err(err) = ignition.reset_self() {
+        log::debug!("the bootloader went down with the reset: {err}");
+    }
+}
+
+/// The failure epilogue shared by both bond commands, worded like the flash's.
+fn bond_failed<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>, err: anyhow::Error) -> ! {
+    let notes = advice(ignition);
+    if let Err(err) = ignition.end() {
+        log::debug!("could not end the session after the failure: {err}");
+    }
+    log::debug!("failure detail: {err:#}");
+    let mut line = match root_cause(&err) {
+        Some(cause) => format!("Error: {err} ({cause})."),
+        None => format!("Error: {err}."),
+    };
+    for note in notes {
+        line.push(' ');
+        line.push_str(&note);
+    }
+    println!();
+    println!("{}", wrap(&line));
+    std::process::exit(1);
+}
+
+/// Says what was written, and never the key: the AES key reaches neither a log
+/// nor a screen, so a fingerprint stands in for it.
+fn describe_config(config: &EsbConfig) {
+    println!("  channel {}", config.rf_channel());
+    println!(
+        "  address {}:{}",
+        settings::hex(config.base0()),
+        settings::hex(&[config.prefix0()])
+    );
+    println!("  device id {}", settings::hex(config.device_id()));
+    println!(
+        "  key fingerprint {}",
+        settings::hex(&config.key_fingerprint())
+    );
+}
+
+/// What the restart check's answer means for a bond.
+///
+/// The bytes are on both halves and read back before this runs, so nothing here
+/// undoes the provisioning. What it proves — or does not — is whether the pair
+/// re-linked, and a silent mismatch shows up exactly as a keyboard that does
+/// not come back. A run that cannot see the link exits non-zero, the way the
+/// flash's does, so a script can tell a proven pair from an unproven one.
+fn prove_bond(came_back: bool) {
+    if came_back {
+        println!("The pair re-linked — both halves are talking on the new key.");
+    } else {
+        println!();
+        println!("{}", wrap(&unproven_bond()));
+        std::process::exit(1);
+    }
+}
+
+/// What a bond whose pair did not come back on USB says.
+fn unproven_bond() -> String {
+    "the pairing key landed and was read back on both halves, but the pair has not proven its \
+     radio link yet: the keyboard did not come back on USB with both halves reporting. A key \
+     mismatch looks exactly like this, because a mismatched pair simply never links. Unplug the \
+     keyboard and plug it back in, check both halves report, and if it still does not come back, \
+     run bond again"
+        .to_string()
+}
+
+/// One half's pairing key, as `--show` found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HalfKey {
+    Provisioned(Vec<u8>),
+    /// ENOENT: the setting was never written.
+    NotProvisioned,
+}
+
+/// What `--show` read from both halves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShowReport {
+    right: HalfKey,
+    left: HalfKey,
+}
+
+/// Whether a keyboard's two halves are paired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchState {
+    /// Both provisioned, same key.
+    Paired,
+    /// Both provisioned, different keys.
+    Mismatched,
+    /// At least one half is not provisioned, so there is no pair to judge.
+    Incomplete,
+}
+
+impl ShowReport {
+    fn match_state(&self) -> MatchState {
+        match (&self.left, &self.right) {
+            (HalfKey::Provisioned(left), HalfKey::Provisioned(right)) => {
+                if keys_agree(left, right) {
+                    MatchState::Paired
+                } else {
+                    MatchState::Mismatched
+                }
+            }
+            _ => MatchState::Incomplete,
+        }
+    }
+}
+
+/// The line one half's key reads as, fingerprint only.
+fn show_line(name: &str, key: &HalfKey) -> String {
+    match key {
+        HalfKey::Provisioned(bytes) => {
+            format!("  {name} half: {}", settings::fingerprint_hex(bytes))
+        }
+        HalfKey::NotProvisioned => format!(
+            "  {name} half: not provisioned — running on the development fallback key if the \
+             app build has it enabled"
+        ),
+    }
+}
+
+/// The verdict line, from whether the two halves' keys agree.
+fn show_verdict(state: MatchState) -> String {
+    match state {
+        MatchState::Paired => {
+            "The two halves carry the same pairing key — they are paired.".to_string()
+        }
+        MatchState::Mismatched => "The two halves carry different pairing keys — they are NOT \
+             paired. Run `zapp bond` to pair them."
+            .to_string(),
+        MatchState::Incomplete => "At least one half is not provisioned, so there is no pair to \
+             check. Run `zapp bond` to provision both."
+            .to_string(),
+    }
+}
+
+fn print_show(report: &ShowReport) {
+    println!("{}", show_line("Left", &report.left));
+    println!("{}", show_line("Right", &report.right));
+    println!("{}", wrap(&show_verdict(report.match_state())));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2939,5 +3330,188 @@ mod tests {
         );
         let bundle = bundle::parse(&blob).unwrap();
         assert_eq!(ordering_of(&wanted_version(&bundle)), Some((2, 3, 4)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bonding
+    // -----------------------------------------------------------------------
+
+    /// A fixed, valid pairing bundle: channel 42, base0 1..4, prefix 5, and a
+    /// distinct key so its fingerprint is stable across runs.
+    fn a_config() -> EsbConfig {
+        let mut bytes = [0u8; settings::ESB_CONFIG_LEN];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        bytes[0] = 42; // rf_channel
+        EsbConfig::from_bytes(bytes).expect("a valid fixed bundle")
+    }
+
+    /// Runs `bond_run` against the in-memory keyboard.
+    fn bond_loopback(
+        config: &EsbConfig,
+        setup: impl FnOnce(&LoopbackDevice),
+    ) -> (Result<()>, Vec<(u8, u16)>, LoopbackDevice) {
+        let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        setup(&device);
+        let shared = Shared::new(link);
+        let mut ignition = Ignition::new(shared.clone());
+        let result = bond_run(&shared, &mut ignition, config, Duration::from_millis(50));
+        if result.is_ok() {
+            ignition.end().unwrap();
+        }
+        let control = shared.0.lock().unwrap().control.clone();
+        (result, control, device)
+    }
+
+    /// Runs `bond_show_run` against the in-memory keyboard.
+    fn show_loopback(setup: impl FnOnce(&LoopbackDevice)) -> (Result<ShowReport>, LoopbackDevice) {
+        let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        setup(&device);
+        let shared = Shared::new(link);
+        let mut ignition = Ignition::new(shared.clone());
+        let result = bond_show_run(&shared, &mut ignition, Duration::from_millis(50));
+        if result.is_ok() {
+            ignition.end().unwrap();
+        }
+        (result, device)
+    }
+
+    #[test]
+    fn bonding_writes_the_same_bundle_to_both_halves_and_reads_it_back() {
+        let config = a_config();
+        let (result, _control, device) = bond_loopback(&config, |_| {});
+        result.expect("both halves provisioned");
+
+        // The value that ended up on the board is exactly the bundle.
+        assert_eq!(device.esb_config().as_deref(), Some(config.as_bytes().as_slice()));
+        // One write per half, no retries, and both carried the whole bundle.
+        let writes = device.setting_writes();
+        assert_eq!(writes.len(), 2, "a half was written more than once");
+        assert!(writes.iter().all(|value| value == config.as_bytes()));
+    }
+
+    #[test]
+    fn bonding_reads_each_half_back_over_group_three() {
+        let (result, _control, device) = bond_loopback(&a_config(), |_| {});
+        result.unwrap();
+        // Per half: one write and one read on the settings group.
+        let settings_ops = device
+            .requests()
+            .iter()
+            .filter(|(group, command)| *group == settings::GROUP && *command == settings::CMD_RW)
+            .count();
+        assert_eq!(settings_ops, 4, "expected a write and a read on each half");
+    }
+
+    #[test]
+    fn bonding_opens_one_session_and_reboots_both_halves() {
+        let (result, control, device) = bond_loopback(&a_config(), |_| {});
+        result.unwrap();
+        // One BEGIN: the whole thing is one session.
+        assert_eq!(
+            control
+                .iter()
+                .filter(|(request, _)| *request == ignition::REQ_BEGIN)
+                .count(),
+            1,
+            "{control:?}"
+        );
+        // The right half is rebooted out of MCUboot with its own SMP reset.
+        assert_eq!(device.resets(), 1, "the right half was not rebooted");
+    }
+
+    #[test]
+    fn a_half_that_will_not_take_the_write_is_retried_once_then_fails() {
+        // The board acks the write but keeps its old value — a dropped line —
+        // so the read-back never matches. One retry, then the run gives up.
+        let preset = vec![0x77u8; settings::ESB_CONFIG_LEN];
+        let (result, _control, device) = bond_loopback(&a_config(), |device| {
+            device.tweak(|fake| {
+                fake.esb_config = Some(preset.clone());
+                fake.esb_config_frozen = true;
+            })
+        });
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("read back a different pairing key"), "{err}");
+        assert!(err.contains("twice"), "{err}");
+        // The right half is tried first, and it is written twice before the
+        // run is given up — the left is never reached.
+        assert_eq!(device.setting_writes().len(), 2, "not exactly one retry");
+    }
+
+    #[test]
+    fn show_reads_both_halves_and_calls_a_matching_pair_paired() {
+        let bundle = a_config().as_bytes().to_vec();
+        let (result, _device) = show_loopback(|device| {
+            device.tweak(|fake| fake.esb_config = Some(bundle.clone()))
+        });
+        let report = result.expect("a read-only look");
+        assert_eq!(report.match_state(), MatchState::Paired);
+        assert_eq!(report.left, HalfKey::Provisioned(bundle.clone()));
+        assert_eq!(report.right, HalfKey::Provisioned(bundle));
+    }
+
+    #[test]
+    fn show_writes_nothing() {
+        let bundle = a_config().as_bytes().to_vec();
+        let (result, device) = show_loopback(|device| {
+            device.tweak(|fake| fake.esb_config = Some(bundle.clone()))
+        });
+        result.unwrap();
+        assert!(device.setting_writes().is_empty(), "--show wrote to a half");
+    }
+
+    #[test]
+    fn show_reports_a_half_that_was_never_provisioned_rather_than_failing() {
+        // esb_config left as None, so the board answers ENOENT.
+        let (result, _device) = show_loopback(|_| {});
+        let report = result.expect("ENOENT is not a failure on --show");
+        assert_eq!(report.left, HalfKey::NotProvisioned);
+        assert_eq!(report.right, HalfKey::NotProvisioned);
+        assert_eq!(report.match_state(), MatchState::Incomplete);
+    }
+
+    #[test]
+    fn the_match_verdict_reads_a_mismatch_as_not_paired() {
+        // Two halves cannot disagree over the single in-memory device, so the
+        // verdict is checked on the values directly.
+        let mismatched = ShowReport {
+            left: HalfKey::Provisioned(vec![0x01; settings::ESB_CONFIG_LEN]),
+            right: HalfKey::Provisioned(vec![0x02; settings::ESB_CONFIG_LEN]),
+        };
+        assert_eq!(mismatched.match_state(), MatchState::Mismatched);
+        assert!(show_verdict(MatchState::Mismatched).contains("NOT"));
+        assert!(show_verdict(MatchState::Paired).contains("paired"));
+        assert!(show_verdict(MatchState::Incomplete).contains("not provisioned"));
+    }
+
+    #[test]
+    fn a_show_line_carries_a_fingerprint_and_never_the_key() {
+        let config = a_config();
+        let line = show_line("Left", &HalfKey::Provisioned(config.as_bytes().to_vec()));
+        // The fingerprint, not the 30 bytes.
+        assert!(line.contains(&settings::fingerprint_hex(config.as_bytes())));
+        // None of the AES-key bytes spelled out in full.
+        let key_hex = settings::hex(&config.as_bytes()[14..30]);
+        assert!(!line.contains(&key_hex), "the key leaked into the line: {line}");
+    }
+
+    #[test]
+    fn identical_bundles_agree_and_different_ones_do_not() {
+        let config = a_config();
+        assert!(keys_agree(config.as_bytes(), config.as_bytes()));
+        let mut other = *config.as_bytes();
+        other[14] ^= 0xff;
+        assert!(!keys_agree(config.as_bytes(), &other));
+    }
+
+    #[test]
+    fn the_unproven_message_names_the_silent_mismatch_and_what_to_do() {
+        let said = unproven_bond();
+        assert!(said.contains("read back on both halves"), "{said}");
+        assert!(said.contains("mismatch"), "{said}");
+        assert!(said.contains("run bond again"), "{said}");
     }
 }

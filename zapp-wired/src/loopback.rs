@@ -65,6 +65,22 @@ impl LoopbackDevice {
         self.fake.lock().unwrap().marks.lock().unwrap().clone()
     }
 
+    /// What `esb/config` currently holds, or `None` if it was never written.
+    pub fn esb_config(&self) -> Option<Vec<u8>> {
+        self.fake.lock().unwrap().esb_config.clone()
+    }
+
+    /// Every value written to `esb/config`, in order.
+    pub fn setting_writes(&self) -> Vec<Vec<u8>> {
+        self.fake
+            .lock()
+            .unwrap()
+            .setting_writes
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
     /// The largest request that reached it whole.
     pub fn largest_request(&self) -> usize {
         *self.fake.lock().unwrap().largest.lock().unwrap()

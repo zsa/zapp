@@ -18,6 +18,7 @@ pub mod image;
 pub mod img;
 pub mod proto;
 pub mod session;
+pub mod settings;
 pub mod transport;
 pub mod zsa_err;
 

@@ -7,6 +7,7 @@ use zapp_core::flash::FlashProgress;
 use crate::img::{self, ImageSlot};
 use crate::proto::{self, Header, Op, Reassembler, HEADER_LEN};
 use crate::session::{self, Declaration, Status};
+use crate::settings;
 use crate::transport::SmpTransport;
 use crate::{cbor, image, SmpError};
 
@@ -277,6 +278,24 @@ impl SmpClient {
         let payload = img::state_write(hash, confirm);
         let reply = self.transact(Op::Write, img::GROUP, img::CMD_STATE, &payload)?;
         img::parse_state(&reply)
+    }
+
+    /// Reads a whitelisted setting's raw bytes.
+    ///
+    /// A name the board does not carry, or one it has never been written, comes
+    /// back as a [`SmpError::Remote`] with the board's `ENOENT` in it, which a
+    /// caller reads to tell "not provisioned" apart from a link that failed.
+    pub fn settings_read(&mut self, name: &str) -> Result<Vec<u8>, SmpError> {
+        let payload = settings::read_request(name);
+        let reply = self.transact(Op::Read, settings::GROUP, settings::CMD_RW, &payload)?;
+        settings::parse_read(&reply)
+    }
+
+    /// Writes a whitelisted setting.
+    pub fn settings_write(&mut self, name: &str, value: &[u8]) -> Result<(), SmpError> {
+        let payload = settings::write_request(name, value);
+        let reply = self.transact(Op::Write, settings::GROUP, settings::CMD_RW, &payload)?;
+        settings::parse_write(&reply)
     }
 
     /// Declares an update: both halves' images, by both hashes, and the build
