@@ -253,10 +253,14 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
          cut off the only route to the right. Check both halves are powered and linked",
     )?;
 
-    let mut plan = [
+    // What each half would need if nobody had asked for a rewrite. Kept even
+    // under --force, because a half that is already running the bundle's image
+    // cannot be marked for test however hard this end tries — see `swaps`.
+    let installed = [
         (Half::Right, bundle::step_for(bundle.image(Half::Right), &right_slots)),
         (Half::Left, bundle::step_for(bundle.image(Half::Left), &left_slots)),
     ];
+    let mut plan = installed;
     if force {
         plan = [(Half::Right, Step::Upload), (Half::Left, Step::Upload)];
     }
@@ -284,14 +288,27 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     progress.left_pending = pending(Half::Left);
     progress.right_pending = pending(Half::Right);
 
+    // Whether a half is already running the bundle's image and keeping it, and
+    // whether its upload is followed by a mark and a restart. See `swaps_after`.
+    let settled = |wanted: Half| step_of(&installed, wanted) == Step::Installed;
+    let swaps = |wanted: Half| swaps_after(step_of(&plan, wanted), step_of(&installed, wanted));
+
     let uploads = plan.iter().filter(|(_, step)| *step == Step::Upload).count();
-    let restarting = uploads > 0;
+    let swapping = [Half::Right, Half::Left]
+        .into_iter()
+        .filter(|half| swaps(*half))
+        .count();
+    let restarting = swapping > 0;
     let confirming = plan.iter().any(|(_, step)| *step != Step::Installed);
-    // Only when both halves are being written: with one upload there is no
-    // right-half restart standing between this run and the left.
-    let waiting = uploads == 2;
+    // Only when the right actually restarts and the left still has an upload to
+    // send after it: nothing else stands between this run and the left.
+    let waiting = swaps(Half::Right)
+        && plan
+            .iter()
+            .any(|(half, step)| *half == Half::Left && *step == Step::Upload);
     let mut steps = Steps {
-        total: uploads * 2
+        total: uploads
+            + swapping
             + usize::from(waiting)
             + usize::from(restarting)
             + usize::from(confirming),
@@ -366,6 +383,13 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         // one about a slot written and nothing marked.
         progress.written = true;
         upload(&mut client, half, image)?;
+        // The transfer was still worth doing under --force — it is the one part
+        // of this that proves the link end to end — but there is nothing to
+        // swap to, so the mark that would fail is not sent.
+        if !swaps(half) {
+            println!("  {half} already runs this exact image — nothing to swap");
+            continue;
+        }
         restart(&mut steps, &mut client, half, &hash)?;
         match half {
             Half::Right => progress.right_restarted = true,
@@ -386,7 +410,15 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // its declared image and reports a version mismatch as ready, precisely so
     // this gap does not deadlock the pair. The right's confirm lands here
     // instead, once the left is back on the matching build and the link is up.
-    let mut confirmed = [(Half::Right, false), (Half::Left, false)];
+    // A half that was left unswapped has confirmed the bundle's image already —
+    // that is exactly what made it unswappable — so there is nothing for the
+    // confirm pass to wait on. Seeded from `settled` rather than from `swaps`:
+    // a half that is running its image on an unconfirmed test boot is not
+    // uploaded to either, and that one does still need confirming.
+    let mut confirmed = [
+        (Half::Right, settled(Half::Right)),
+        (Half::Left, settled(Half::Left)),
+    ];
     // What each half is actually carrying, for the cross-half check at the end.
     // Seeded from the reads at the top and replaced for every half that came
     // back from a restart.
@@ -704,6 +736,38 @@ fn cross_check(plan: &[(Half, Step)], next: Next) -> Option<String> {
             _ => "nothing in particular",
         }
     ))
+}
+
+/// One half's step out of a plan.
+///
+/// Both arrays are built with both halves in them, so the fallback is
+/// unreachable; `Installed` is the inert answer if it ever were.
+fn step_of(steps: &[(Half, Step)], wanted: Half) -> Step {
+    steps
+        .iter()
+        .find(|(half, _)| *half == wanted)
+        .map_or(Step::Installed, |(_, step)| *step)
+}
+
+/// Whether a half's upload is followed by a mark and a restart.
+///
+/// `planned` is what this run will do to the half; `found` is what the half was
+/// carrying when the run started.
+///
+/// A half already running the bundle's image, confirmed, is uploaded under
+/// --force but never marked. MCUboot refuses to mark the slot a board is
+/// running from for test — image manager rc 33,
+/// `IMG_MGMT_ERR_IMAGE_SETTING_TEST_TO_ACTIVE_DENIED`, from `!confirm && slot ==
+/// active_slot` — and it is right to, because there is nothing to swap to. A
+/// mark carries a hash, and a hash names an image rather than a slot, so a board
+/// with the same build in both slots resolves it to the active one and says no.
+/// Flashing the running build with --force does that every time; a real update
+/// never can, because its hash is not the one the board is running.
+///
+/// Only reachable under --force. Without it such a half reads as
+/// [`Step::Installed`] and the run stops before any session is opened.
+fn swaps_after(planned: Step, found: Step) -> bool {
+    planned == Step::Upload && found != Step::Installed
 }
 
 fn restarted(progress: Progress, half: Half) -> bool {
@@ -1395,6 +1459,48 @@ mod tests {
     /// A plan the way `run` builds one: the right first, then the left.
     fn plan(right: Step, left: Step) -> [(Half, Step); 2] {
         [(Half::Right, right), (Half::Left, left)]
+    }
+
+    #[test]
+    fn a_half_already_running_the_bundles_image_is_uploaded_but_never_marked() {
+        // The bench case: the same build flashed over the wire again and again
+        // leaves both slots holding it, so the hash a mark carries resolves to
+        // the slot the board is running from and the firmware refuses it with
+        // image manager rc 33. --force still sends the upload — it is the one
+        // part of the run that proves the link end to end — and nothing
+        // follows it.
+        assert!(!swaps_after(Step::Upload, Step::Installed));
+    }
+
+    #[test]
+    fn a_half_that_really_needs_the_image_is_still_marked_and_restarted() {
+        assert!(swaps_after(Step::Upload, Step::Upload));
+        // A half running the bundle's image on an unconfirmed test boot is not
+        // settled: it has a swap outstanding, and skipping it would leave the
+        // keyboard to revert on its next restart.
+        assert!(swaps_after(Step::Upload, Step::Confirm));
+        // And nothing is marked where nothing was uploaded.
+        assert!(!swaps_after(Step::Installed, Step::Installed));
+        assert!(!swaps_after(Step::Confirm, Step::Confirm));
+    }
+
+    #[test]
+    fn a_step_is_read_by_half_rather_than_by_position() {
+        // The two arrays `run` keeps are both right-first; reading one by index
+        // would silently swap the halves over.
+        let forced = plan(Step::Upload, Step::Upload);
+        let found = plan(Step::Installed, Step::Upload);
+        assert_eq!(step_of(&found, Half::Right), Step::Installed);
+        assert_eq!(step_of(&found, Half::Left), Step::Upload);
+        // So under --force the right is skipped and the left is not.
+        assert!(!swaps_after(
+            step_of(&forced, Half::Right),
+            step_of(&found, Half::Right)
+        ));
+        assert!(swaps_after(
+            step_of(&forced, Half::Left),
+            step_of(&found, Half::Left)
+        ));
     }
 
     #[test]

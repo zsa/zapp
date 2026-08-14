@@ -521,6 +521,20 @@ mod tests {
     }
 
     #[test]
+    fn the_same_build_in_both_slots_still_reads_as_installed() {
+        // What flashing one build over and over leaves behind: every swap puts
+        // the outgoing copy in the other slot, so both hold the same image.
+        // The active one is what decides, and the run that follows must not try
+        // to mark it — the board refuses to test-mark the slot it is running
+        // from (image manager rc 33).
+        let both = [
+            slot(&[0xa1; 64], true, true),
+            slot(&[0xa1; 64], false, true),
+        ];
+        assert_eq!(step_for(&left_image(), &both), Step::Installed);
+    }
+
+    #[test]
     fn a_half_running_something_else_is_written() {
         let other = [slot(&[0x99; 64], true, true)];
         assert_eq!(step_for(&left_image(), &other), Step::Upload);
