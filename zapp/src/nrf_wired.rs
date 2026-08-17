@@ -641,9 +641,9 @@ fn write_half<L: IgnitionLink + 'static>(
             .with_context(|| format!("Could not read the {half} half's image state back"))?;
         landed(&after, &wanted, half, Checked::Written)?;
 
-        // Permanent, not for test. A test image has to be confirmed by the
-        // half's own firmware, which cannot happen while the STM32 is running
-        // ignition — and the read-back's own session re-entry is a reboot, so
+        // Permanent, not for test. A test image is kept only by a confirm sent
+        // to the running application, which nothing over this cable can send —
+        // and the read-back's own session re-entry is a reboot, so
         // MCUboot would revert the image this run just wrote before anything
         // could look at it. Marking it kept is what makes the read-back
         // possible; see the note at the top of this file.
