@@ -900,8 +900,12 @@ fn both_on_the_bundle(bundle: &Bundle, running: &[(Half, Vec<u8>)]) -> Result<()
 }
 
 /// What a restarted half came back as.
+///
+/// `pub(crate)` because the wired path in [`crate::nrf_wired`] reaches the same
+/// three answers through its own transport and hands them to the same
+/// [`decide`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Landed {
+pub(crate) enum Landed {
     /// Reachable, and running the image that was written.
     Ok { confirmed: bool, active: Vec<u8> },
     /// Reachable, running something else — MCUboot put the old image back, or
@@ -913,7 +917,7 @@ enum Landed {
 
 impl Landed {
     /// The one sentence this verdict is worth.
-    fn why(&self, half: Half) -> String {
+    pub(crate) fn why(&self, half: Half) -> String {
         match self {
             Landed::Ok { active, .. } => {
                 format!("The {half} half came back running {}.", short(active))
@@ -1145,7 +1149,7 @@ fn revert_both(
 
 /// Keep both halves, or put both back.
 #[derive(Debug, PartialEq, Eq)]
-enum Decision {
+pub(crate) enum Decision {
     Keep,
     Revert { reasons: Vec<String> },
 }
@@ -1157,7 +1161,7 @@ enum Decision {
 /// perfect is a revert — a keyboard is a pair or it is nothing. `mismatch` is
 /// [`both_on_the_bundle`]'s complaint, a revert case like any other, since two
 /// halves on two builds cannot talk to each other.
-fn decide(landed: &[(Half, Landed)], mismatch: Option<String>) -> Decision {
+pub(crate) fn decide(landed: &[(Half, Landed)], mismatch: Option<String>) -> Decision {
     let mut reasons: Vec<String> = landed
         .iter()
         .filter(|(_, verdict)| !matches!(verdict, Landed::Ok { .. }))

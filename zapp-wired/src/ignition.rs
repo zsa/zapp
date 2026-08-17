@@ -37,11 +37,29 @@ pub const REQ_STATUS: u8 = 0x83;
 pub const REQ_RELEASE_MD: u8 = 0x84;
 /// Reset the target named in `wValue`.
 pub const REQ_RESET_TARGET: u8 = 0x85;
+/// Ask the running half named in `wValue` to confirm the image it is executing.
+/// The data stage carries [`CONFIRM_HASH_LEN`] bytes of the hash the host
+/// expects it to be running. Queued rather than blocking, and refused unless
+/// the session is idle.
+pub const REQ_CONFIRM: u8 = 0x86;
+/// Read [`ConfirmResult`]. Polled after [`REQ_CONFIRM`].
+pub const REQ_CONFIRM_RESULT: u8 = 0x87;
 /// Diagnostic: what answers on the TRRS I2C bus.
 pub const REQ_I2C_SCAN: u8 = 0x90;
 
 /// Bytes in a STATUS response.
 pub const STATUS_LEN: usize = 16;
+
+/// Bytes in a CONFIRM_RESULT response.
+pub const CONFIRM_RESULT_LEN: usize = 36;
+
+/// Bytes of hash a confirm query names an image by.
+///
+/// The images on this product are hashed with SHA-512 and MCUboot publishes all
+/// 64 bytes, but the query and its reply both carry only the leading 32
+/// (`ZSA_CONFIRM_HASH_LEN`, and the firmware compares exactly that prefix), so
+/// the whole exchange fits one 64-byte control packet.
+pub const CONFIRM_HASH_LEN: usize = 32;
 
 /// The only STATUS layout this build can read.
 ///
@@ -225,6 +243,129 @@ fn i2c_khz(bytes: &[u8]) -> u16 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The confirm tunnel
+// ---------------------------------------------------------------------------
+
+/// How far along ignition's queued confirm exchange is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmState {
+    Idle,
+    Busy,
+    Done,
+    Unrecognised(u8),
+}
+
+impl ConfirmState {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Idle,
+            1 => Self::Busy,
+            2 => Self::Done,
+            other => Self::Unrecognised(other),
+        }
+    }
+}
+
+/// How the exchange itself went, which is ignition's answer rather than the
+/// target's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmRc {
+    Ok,
+    /// The query went out and nothing came back inside ignition's own 2 s.
+    Timeout,
+    /// The query never reached the target at all.
+    Transport,
+    /// It answered with the wrong shape.
+    BadReply,
+    Unrecognised(u8),
+}
+
+impl ConfirmRc {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Ok,
+            1 => Self::Timeout,
+            2 => Self::Transport,
+            3 => Self::BadReply,
+            other => Self::Unrecognised(other),
+        }
+    }
+}
+
+/// What the target did with the query. Only meaningful once the exchange is
+/// [`ConfirmState::Done`] with [`ConfirmRc::Ok`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmStatus {
+    /// The hash matched and the trailer is now confirmed.
+    Ok,
+    /// The hash matched and it was already confirmed.
+    Already,
+    /// A different image is running; nothing was written.
+    Mismatch,
+    /// It could not read the hash of what it is running.
+    Unreadable,
+    /// The hash matched and the trailer write failed.
+    WriteFail,
+    Unrecognised(u8),
+}
+
+impl ConfirmStatus {
+    fn from_code(code: u8) -> Self {
+        match code {
+            0x00 => Self::Ok,
+            0x01 => Self::Already,
+            0x02 => Self::Mismatch,
+            0x03 => Self::Unreadable,
+            0x04 => Self::WriteFail,
+            other => Self::Unrecognised(other),
+        }
+    }
+
+    /// Whether the target is running the image that was named and keeping it.
+    pub fn kept(self) -> bool {
+        matches!(self, Self::Ok | Self::Already)
+    }
+}
+
+/// One read of ignition's confirm result block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmResult {
+    pub state: ConfirmState,
+    pub rc: ConfirmRc,
+    pub status: ConfirmStatus,
+    /// Which half was asked, echoed back. `None` when nothing has been.
+    pub target: Option<Half>,
+    /// The leading [`CONFIRM_HASH_LEN`] bytes of what the target reports it is
+    /// running, all zero when it never answered.
+    pub hash: Vec<u8>,
+}
+
+impl ConfirmResult {
+    /// A CONFIRM_RESULT response, checked before it is believed.
+    ///
+    /// No version byte to check, unlike [`Status`]: every field is an
+    /// enumeration this build carries an `Unrecognised` arm for, so a firmware
+    /// that adds a code is read rather than refused.
+    pub fn parse(bytes: &[u8]) -> Result<Self, WiredError> {
+        if bytes.len() < CONFIRM_RESULT_LEN {
+            return Err(WiredError::ShortConfirm { got: bytes.len() });
+        }
+        Ok(Self {
+            state: ConfirmState::from_code(bytes[0]),
+            rc: ConfirmRc::from_code(bytes[1]),
+            status: ConfirmStatus::from_code(bytes[2]),
+            target: half_of_value(bytes[3] as u16),
+            hash: bytes[4..4 + CONFIRM_HASH_LEN].to_vec(),
+        })
+    }
+
+    /// Whether ignition has finished with the exchange, however it went.
+    pub fn done(&self) -> bool {
+        self.state == ConfirmState::Done
+    }
+}
+
 /// The whole of the I/O against ignition.
 ///
 /// Everything above this is arithmetic, which is the point: the codec, the
@@ -233,6 +374,26 @@ fn i2c_khz(bytes: &[u8]) -> u16 {
 pub trait IgnitionLink: Send {
     /// A vendor request with no data stage.
     fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError>;
+
+    /// A vendor request that writes `data` in its data stage.
+    ///
+    /// [`REQ_CONFIRM`] is the only one, so this is defaulted rather than
+    /// required: the links that never carry it — the in-memory ones, and the
+    /// recorders in these tests — say so instead of quietly sending the request
+    /// with its payload dropped, which the bootloader would stall anyway.
+    /// Anything wrapping a link has to forward it; [`Retrying`] does.
+    fn control_out_data(
+        &mut self,
+        request: u8,
+        value: u16,
+        data: &[u8],
+    ) -> Result<(), WiredError> {
+        let _ = (value, data);
+        Err(WiredError::Request {
+            request,
+            reason: "this link carries no data stage".into(),
+        })
+    }
 
     /// A vendor request that reads `length` bytes back.
     fn control_in(&mut self, request: u8, value: u16, length: usize)
@@ -255,6 +416,15 @@ fn half_value(half: Half) -> u16 {
     match half {
         Half::Left => 1,
         Half::Right => 2,
+    }
+}
+
+/// The same numbering, read back: which half a firmware field names.
+fn half_of_value(value: u16) -> Option<Half> {
+    match value {
+        1 => Some(Half::Left),
+        2 => Some(Half::Right),
+        _ => None,
     }
 }
 
@@ -342,6 +512,36 @@ impl<L: IgnitionLink> Ignition<L> {
         let status = Status::parse(&bytes)?;
         log::debug!("STATUS {status:?}");
         Ok(status)
+    }
+
+    /// Asks a half that is running its application to confirm the image it is
+    /// executing, if that image is the one `hash` names.
+    ///
+    /// Queues the exchange and returns; [`Self::confirm_result`] is how it
+    /// finishes. Ignition refuses this while a recovery session is open — the
+    /// replies come back on the UART and the TRRS mailbox a session owns — so
+    /// the caller has to have ended one first.
+    ///
+    /// `hash` may be longer than the [`CONFIRM_HASH_LEN`] bytes that go on the
+    /// wire, because the images are hashed with SHA-512 and both ends compare
+    /// the same leading prefix. Anything shorter is refused rather than padded.
+    pub fn confirm_start(&mut self, half: Half, hash: &[u8]) -> Result<(), WiredError> {
+        if hash.len() < CONFIRM_HASH_LEN {
+            return Err(WiredError::ShortHash { got: hash.len() });
+        }
+        log::debug!("CONFIRM {half}");
+        self.link
+            .control_out_data(REQ_CONFIRM, half_value(half), &hash[..CONFIRM_HASH_LEN])
+    }
+
+    /// One read of the queued confirm's result block.
+    pub fn confirm_result(&mut self) -> Result<ConfirmResult, WiredError> {
+        let bytes = self
+            .link
+            .control_in(REQ_CONFIRM_RESULT, 0, CONFIRM_RESULT_LEN)?;
+        let result = ConfirmResult::parse(&bytes)?;
+        log::trace!("CONFIRM_RESULT {result:?}");
+        Ok(result)
     }
 
     /// Whatever answered on the TRRS I2C bus, as the firmware reported it.
@@ -514,6 +714,20 @@ impl<L: IgnitionLink> IgnitionLink for Retrying<L> {
         self.control(request, false, |link| link.control_out(request, value))
     }
 
+    fn control_out_data(
+        &mut self,
+        request: u8,
+        value: u16,
+        data: &[u8],
+    ) -> Result<(), WiredError> {
+        // Idempotent all the same — CONFIRM queues a request rather than
+        // advancing anything — but held to the write policy, because a fault on
+        // a write leaves it unknown whether the device acted on it.
+        self.control(request, false, |link| {
+            link.control_out_data(request, value, data)
+        })
+    }
+
     fn control_in(
         &mut self,
         request: u8,
@@ -654,6 +868,15 @@ pub mod usb {
 
     impl IgnitionLink for UsbLink {
         fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
+            self.control_out_data(request, value, &[])
+        }
+
+        fn control_out_data(
+            &mut self,
+            request: u8,
+            value: u16,
+            data: &[u8],
+        ) -> Result<(), WiredError> {
             self.interface
                 .control_out(
                     ControlOut {
@@ -662,7 +885,7 @@ pub mod usb {
                         request,
                         value,
                         index: INTERFACE as u16,
-                        data: &[],
+                        data,
                     },
                     CONTROL_TIMEOUT,
                 )
@@ -840,12 +1063,26 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         control: Vec<(u8, u16)>,
+        /// The data stages, for the one request that has one.
+        wrote: Vec<(u8, u16, Vec<u8>)>,
         status: Vec<u8>,
+        /// What a CONFIRM_RESULT read answers with, when one is asked for.
+        confirm: Vec<u8>,
     }
 
     impl IgnitionLink for Recorder {
         fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
             self.control.push((request, value));
+            Ok(())
+        }
+        fn control_out_data(
+            &mut self,
+            request: u8,
+            value: u16,
+            data: &[u8],
+        ) -> Result<(), WiredError> {
+            self.control.push((request, value));
+            self.wrote.push((request, value, data.to_vec()));
             Ok(())
         }
         fn control_in(
@@ -855,7 +1092,10 @@ mod tests {
             length: usize,
         ) -> Result<Vec<u8>, WiredError> {
             self.control.push((request, value));
-            let mut answer = self.status.clone();
+            let mut answer = match request {
+                REQ_CONFIRM_RESULT => self.confirm.clone(),
+                _ => self.status.clone(),
+            };
             answer.truncate(length);
             Ok(answer)
         }
@@ -907,6 +1147,198 @@ mod tests {
             ignition.status(),
             Err(WiredError::ShortStatus { got: 8 })
         ));
+    }
+
+    // ---- The confirm tunnel ---------------------------------------------
+
+    /// A finished result block: the target answered and kept the image.
+    fn confirm_bytes(state: u8, rc: u8, status: u8, target: u8, hash: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; CONFIRM_RESULT_LEN];
+        bytes[0] = state;
+        bytes[1] = rc;
+        bytes[2] = status;
+        bytes[3] = target;
+        bytes[4..4 + hash.len()].copy_from_slice(hash);
+        bytes
+    }
+
+    #[test]
+    fn a_confirm_goes_out_as_the_half_number_and_thirty_two_bytes_of_hash() {
+        let hash: Vec<u8> = (0..64u8).collect();
+        let mut ignition = Ignition::new(Recorder::default());
+        ignition.confirm_start(Half::Right, &hash).unwrap();
+        ignition.confirm_start(Half::Left, &hash).unwrap();
+
+        let link = ignition.into_link();
+        assert_eq!(
+            link.control,
+            vec![(REQ_CONFIRM, 2), (REQ_CONFIRM, 1)],
+            "1 is left and 2 is right, the same as SELECT"
+        );
+        // The leading 32 of a SHA-512, which is the prefix both ends compare.
+        assert_eq!(
+            link.wrote,
+            vec![
+                (REQ_CONFIRM, 2, hash[..32].to_vec()),
+                (REQ_CONFIRM, 1, hash[..32].to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hash_too_short_to_name_an_image_is_refused_before_it_goes_out() {
+        let mut ignition = Ignition::new(Recorder::default());
+        let err = ignition.confirm_start(Half::Left, &[0x11; 31]).unwrap_err();
+        assert!(matches!(err, WiredError::ShortHash { got: 31 }), "{err:?}");
+        assert!(ignition.into_link().control.is_empty());
+    }
+
+    #[test]
+    fn a_result_block_parses_field_by_field() {
+        let hash = [0xab; CONFIRM_HASH_LEN];
+        let mut ignition = Ignition::new(Recorder {
+            confirm: confirm_bytes(2, 0, 1, 2, &hash),
+            ..Recorder::default()
+        });
+        let result = ignition.confirm_result().unwrap();
+        assert!(result.done());
+        assert_eq!(result.rc, ConfirmRc::Ok);
+        assert_eq!(result.status, ConfirmStatus::Already);
+        assert!(result.status.kept());
+        assert_eq!(result.target, Some(Half::Right));
+        assert_eq!(result.hash, hash);
+    }
+
+    #[test]
+    fn a_result_still_being_worked_on_is_not_done_and_names_no_hash() {
+        let mut ignition = Ignition::new(Recorder {
+            // What `confirm_start` leaves behind: busy, and 0xFF for a status
+            // nobody has reported yet.
+            confirm: confirm_bytes(1, 0, 0xFF, 1, &[]),
+            ..Recorder::default()
+        });
+        let result = ignition.confirm_result().unwrap();
+        assert!(!result.done());
+        assert_eq!(result.state, ConfirmState::Busy);
+        assert_eq!(result.status, ConfirmStatus::Unrecognised(0xFF));
+        assert_eq!(result.hash, vec![0u8; CONFIRM_HASH_LEN]);
+    }
+
+    #[test]
+    fn every_way_the_exchange_itself_can_fail_reads_back_as_itself() {
+        for (code, expected) in [
+            (0u8, ConfirmRc::Ok),
+            (1, ConfirmRc::Timeout),
+            (2, ConfirmRc::Transport),
+            (3, ConfirmRc::BadReply),
+            (9, ConfirmRc::Unrecognised(9)),
+        ] {
+            let parsed = ConfirmResult::parse(&confirm_bytes(2, code, 0, 1, &[])).unwrap();
+            assert_eq!(parsed.rc, expected, "rc {code}");
+        }
+    }
+
+    #[test]
+    fn only_a_match_the_target_is_keeping_counts_as_kept() {
+        for (code, kept) in [
+            (0x00u8, true),  // confirmed now
+            (0x01, true),    // was already confirmed
+            (0x02, false),   // a different image is running
+            (0x03, false),   // it could not read its own hash
+            (0x04, false),   // the trailer write failed
+            (0x77, false),   // a code from a newer firmware
+        ] {
+            let parsed = ConfirmResult::parse(&confirm_bytes(2, 0, code, 1, &[])).unwrap();
+            assert_eq!(parsed.status.kept(), kept, "status {code:#04x}");
+        }
+    }
+
+    #[test]
+    fn a_result_that_is_too_short_is_refused_rather_than_padded() {
+        let bytes = confirm_bytes(2, 0, 0, 1, &[0x11; CONFIRM_HASH_LEN]);
+        for length in 0..CONFIRM_RESULT_LEN {
+            assert!(
+                matches!(
+                    ConfirmResult::parse(&bytes[..length]),
+                    Err(WiredError::ShortConfirm { .. })
+                ),
+                "{length} bytes"
+            );
+        }
+        assert!(ConfirmResult::parse(&bytes).is_ok());
+    }
+
+    #[test]
+    fn a_link_that_carries_no_data_stage_says_so_rather_than_dropping_it() {
+        // The trait's default. A wrapper that forgot to forward the request
+        // fails loudly here rather than sending CONFIRM with no hash on it.
+        struct NoData;
+        impl IgnitionLink for NoData {
+            fn control_out(&mut self, _request: u8, _value: u16) -> Result<(), WiredError> {
+                Ok(())
+            }
+            fn control_in(&mut self, _r: u8, _v: u16, len: usize) -> Result<Vec<u8>, WiredError> {
+                Ok(vec![0; len])
+            }
+            fn bulk_out(&mut self, _message: &[u8]) -> Result<(), WiredError> {
+                Ok(())
+            }
+            fn bulk_in(&mut self, _timeout: Duration) -> Result<Vec<u8>, WiredError> {
+                Ok(Vec::new())
+            }
+        }
+        let err = Ignition::new(NoData)
+            .confirm_start(Half::Left, &[0x11; 32])
+            .unwrap_err();
+        assert!(
+            matches!(err, WiredError::Request { request: REQ_CONFIRM, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_confirm_that_stalls_once_is_submitted_again_with_its_hash_intact() {
+        // The retry has to forward the data stage too, or the second attempt
+        // would reach the bootloader with nothing in it.
+        #[derive(Default)]
+        struct StallOnce {
+            stalled: bool,
+            wrote: Vec<Vec<u8>>,
+        }
+        impl IgnitionLink for StallOnce {
+            fn control_out(&mut self, _request: u8, _value: u16) -> Result<(), WiredError> {
+                Ok(())
+            }
+            fn control_out_data(
+                &mut self,
+                request: u8,
+                _value: u16,
+                data: &[u8],
+            ) -> Result<(), WiredError> {
+                self.wrote.push(data.to_vec());
+                match std::mem::replace(&mut self.stalled, true) {
+                    false => Err(WiredError::Stalled { request }),
+                    true => Ok(()),
+                }
+            }
+            fn control_in(&mut self, _r: u8, _v: u16, len: usize) -> Result<Vec<u8>, WiredError> {
+                Ok(vec![0; len])
+            }
+            fn bulk_out(&mut self, _message: &[u8]) -> Result<(), WiredError> {
+                Ok(())
+            }
+            fn bulk_in(&mut self, _timeout: Duration) -> Result<Vec<u8>, WiredError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let link = Retrying::with_policy(StallOnce::default(), CONTROL_ATTEMPTS, Duration::ZERO);
+        let mut ignition = Ignition::new(link);
+        ignition.confirm_start(Half::Right, &[0x5a; 32]).unwrap();
+        assert_eq!(
+            ignition.into_link().into_inner().wrote,
+            vec![vec![0x5a; 32], vec![0x5a; 32]]
+        );
     }
 
     // ---- Stalls ---------------------------------------------------------

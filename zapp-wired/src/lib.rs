@@ -76,6 +76,18 @@ pub enum WiredError {
     )]
     StatusVersion { got: u8 },
 
+    #[error(
+        "a confirm result needs {expected} bytes, got {got}",
+        expected = ignition::CONFIRM_RESULT_LEN
+    )]
+    ShortConfirm { got: usize },
+
+    #[error(
+        "a confirm names an image by {expected} bytes of hash and this one has {got}",
+        expected = ignition::CONFIRM_HASH_LEN
+    )]
+    ShortHash { got: usize },
+
     #[error("an encoded frame of {len} bytes is past the board's {budget}-byte message limit")]
     FrameTooLong { len: usize, budget: usize },
 

@@ -19,7 +19,9 @@ use zapp_smp::fake::{FakeDevice, Mark};
 use zapp_smp::proto::Reassembler as FrameReassembler;
 use zapp_smp::{Half, SmpTransport, TransportError};
 
-use crate::ignition::{Ignition, IgnitionLink, STATUS_LEN, STATUS_VERSION};
+use crate::ignition::{
+    Ignition, IgnitionLink, CONFIRM_HASH_LEN, CONFIRM_RESULT_LEN, STATUS_LEN, STATUS_VERSION,
+};
 use crate::pipe::{self, Event, EventCode, Outbound, Target};
 use crate::transport::{LeftTransport, RightTransport};
 use crate::{nlip, WiredError};
@@ -30,6 +32,68 @@ const PACKET: usize = 64;
 /// The largest frame the in-memory device will reassemble.
 const DEVICE_CAPACITY: usize = 2475;
 
+/// What an in-memory half answers a confirm query with.
+///
+/// The confirm tunnel is not SMP and never reaches [`FakeDevice`]: ignition
+/// asks the half's *application* over the UART or the TRRS mailbox, so from the
+/// host's side it is only two vendor requests and a 36-byte block. This is that
+/// block, per half. The default is a half running exactly what the host named
+/// and keeping it.
+#[derive(Debug, Clone, Default)]
+pub struct ConfirmAnswer {
+    /// `enum confirm_rc`: 0 is an exchange that completed, 1 a target that
+    /// never answered, 2 a query that never reached it.
+    pub rc: u8,
+    /// `enum zsa_confirm_status`: 0 confirmed, 1 already confirmed, 2 a
+    /// different image, 3 unreadable, 4 the trailer write failed.
+    pub status: u8,
+    /// What the half reports it is running. `None` echoes the hash it was asked
+    /// about, which is a half carrying exactly what the host expected.
+    pub hash: Option<Vec<u8>>,
+}
+
+/// The confirm exchange, as far as the host can see it.
+#[derive(Default)]
+struct Confirms {
+    /// Every `(half, hash)` the host asked about, in order.
+    asked: Vec<(Half, Vec<u8>)>,
+    left: ConfirmAnswer,
+    right: ConfirmAnswer,
+    /// The block the next CONFIRM_RESULT read answers with.
+    result: Vec<u8>,
+}
+
+impl Confirms {
+    /// Answers a query the way ignition would once its exchange is done.
+    fn take(&mut self, half: Half, asked: &[u8]) {
+        self.asked.push((half, asked.to_vec()));
+        let answer = match half {
+            Half::Left => self.left.clone(),
+            Half::Right => self.right.clone(),
+        };
+
+        let mut block = vec![0u8; CONFIRM_RESULT_LEN];
+        block[0] = 2; // done
+        block[1] = answer.rc;
+        // A target that never answered reports no status and no hash, which is
+        // the 0xFF `confirm_start` leaves in place.
+        block[2] = match answer.rc {
+            0 => answer.status,
+            _ => 0xFF,
+        };
+        block[3] = match half {
+            Half::Left => 1,
+            Half::Right => 2,
+        };
+        if answer.rc == 0 {
+            let hash = answer.hash.unwrap_or_else(|| asked.to_vec());
+            let len = hash.len().min(CONFIRM_HASH_LEN);
+            block[4..4 + len].copy_from_slice(&hash[..len]);
+        }
+        self.result = block;
+    }
+}
+
 /// The device on the other end, for a test that wants to look at it or lean on
 /// it.
 #[derive(Clone)]
@@ -37,6 +101,7 @@ pub struct LoopbackDevice {
     fake: Arc<Mutex<FakeDevice>>,
     /// Every `DATA` payload the host wrote, in order.
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    confirms: Arc<Mutex<Confirms>>,
 }
 
 impl LoopbackDevice {
@@ -113,6 +178,20 @@ impl LoopbackDevice {
     pub fn tweak<R>(&self, change: impl FnOnce(&mut FakeDevice) -> R) -> R {
         change(&mut self.fake.lock().unwrap())
     }
+
+    /// Every confirm query the host sent, as `(half, hash)`.
+    pub fn confirms(&self) -> Vec<(Half, Vec<u8>)> {
+        self.confirms.lock().unwrap().asked.clone()
+    }
+
+    /// What one half answers a confirm query with from now on.
+    pub fn answers_confirm(&self, half: Half, answer: ConfirmAnswer) {
+        let mut confirms = self.confirms.lock().unwrap();
+        match half {
+            Half::Left => confirms.left = answer,
+            Half::Right => confirms.right = answer,
+        }
+    }
 }
 
 /// An ignition that is a data structure.
@@ -134,6 +213,8 @@ pub struct LoopbackLink {
     inbound: VecDeque<Vec<u8>>,
     /// Shared with the handle, so a test can see what was written.
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The confirm tunnel's two vendor requests, likewise.
+    confirms: Arc<Mutex<Confirms>>,
 }
 
 impl LoopbackLink {
@@ -146,10 +227,12 @@ impl LoopbackLink {
         device.buffers = None;
         let device = Arc::new(Mutex::new(device));
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let confirms = Arc::new(Mutex::new(Confirms::default()));
         (
             Self {
                 device: Arc::clone(&device),
                 sent: Arc::clone(&sent),
+                confirms: Arc::clone(&confirms),
                 max_payload,
                 selected: None,
                 control: Vec::new(),
@@ -158,7 +241,11 @@ impl LoopbackLink {
                 replies: FrameReassembler::default(),
                 inbound: VecDeque::new(),
             },
-            LoopbackDevice { fake: device, sent },
+            LoopbackDevice {
+                fake: device,
+                sent,
+                confirms,
+            },
         )
     }
 
@@ -235,6 +322,25 @@ impl IgnitionLink for LoopbackLink {
         Ok(())
     }
 
+    fn control_out_data(
+        &mut self,
+        request: u8,
+        value: u16,
+        data: &[u8],
+    ) -> Result<(), WiredError> {
+        self.control.push((request, value));
+        if request == crate::ignition::REQ_CONFIRM {
+            let half = match value {
+                1 => Half::Left,
+                2 => Half::Right,
+                // The bootloader stalls anything else, and so does this.
+                _ => return Err(WiredError::Stalled { request }),
+            };
+            self.confirms.lock().unwrap().take(half, data);
+        }
+        Ok(())
+    }
+
     fn control_in(
         &mut self,
         request: u8,
@@ -245,6 +351,14 @@ impl IgnitionLink for LoopbackLink {
         let mut answer = match request {
             crate::ignition::REQ_STATUS => self.status(),
             crate::ignition::REQ_I2C_SCAN => vec![0u8; crate::ignition::I2C_SCAN_LEN],
+            crate::ignition::REQ_CONFIRM_RESULT => {
+                let confirms = self.confirms.lock().unwrap();
+                match confirms.result.is_empty() {
+                    // Idle: nothing has been asked yet.
+                    true => vec![0u8; CONFIRM_RESULT_LEN],
+                    false => confirms.result.clone(),
+                }
+            }
             other => {
                 return Err(WiredError::Request {
                     request: other,

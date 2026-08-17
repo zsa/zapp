@@ -448,6 +448,15 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
         self.0.lock().unwrap().control_out(request, value)
     }
 
+    fn control_out_data(
+        &mut self,
+        request: u8,
+        value: u16,
+        data: &[u8],
+    ) -> Result<(), WiredError> {
+        self.0.lock().unwrap().control_out_data(request, value, data)
+    }
+
     fn control_in(&mut self, request: u8, value: u16, length: usize) -> Result<Vec<u8>, WiredError> {
         self.0.lock().unwrap().control_in(request, value, length)
     }
