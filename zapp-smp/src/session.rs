@@ -110,10 +110,10 @@ pub enum Next {
     None,
     /// Write the right half. Always first when the right needs anything.
     Right,
-    /// The right is carrying its declared image and has confirmed it; the left
-    /// is what is left.
+    /// The right is reachable and carrying its declared image; the left is what
+    /// is left.
     Left,
-    /// Both halves carry what was declared and both have confirmed.
+    /// Both halves carry what was declared.
     Complete,
     /// A step a firmware newer than this build named. Reported rather than
     /// guessed at, the same way an unknown refusal code is.
@@ -167,7 +167,8 @@ pub struct Status {
     /// The build version as declared, empty when nothing is.
     pub version: String,
     pub next: Next,
-    /// The left carries its declared image and has confirmed it.
+    /// The left carries its declared image and has confirmed it. Reported
+    /// rather than gated on: `next` moves on without the confirm.
     pub left_done: bool,
     /// The right does.
     pub right_done: bool,
