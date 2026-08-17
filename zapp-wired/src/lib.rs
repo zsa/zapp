@@ -55,6 +55,17 @@ pub enum WiredError {
     #[error("the bootloader refused vendor request {request:#04x}: it stalled")]
     Stalled { request: u8 },
 
+    /// A control transfer failed below the protocol — the host controller
+    /// reported a hardware fault or protocol violation (EPROTO, EILSEQ and the
+    /// rest), not an answer from the device.
+    ///
+    /// Its own variant rather than a [`Self::Request`], because on a read it is
+    /// the second control failure worth trying again: see [`Retrying`]. Reads
+    /// the same as a [`Self::Request`] to a caller, since a fault the retries
+    /// do not clear is a failed request like any other.
+    #[error("vendor request {request:#04x} failed: {reason}")]
+    Faulted { request: u8, reason: String },
+
     #[error("a status response needs {expected} bytes, got {got}", expected = ignition::STATUS_LEN)]
     ShortStatus { got: usize },
 

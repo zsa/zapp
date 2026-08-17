@@ -406,7 +406,7 @@ pub const CONTROL_ATTEMPTS: u32 = 7;
 /// genuinely refused still fails in well under a fifth of a second.
 pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
 
-/// A link that submits a stalled control transfer again.
+/// A link that submits a stalled or faulted control transfer again.
 ///
 /// A host controller retries a NAK by itself and never a STALL, so a control
 /// request that races a state change on the device is a transient nothing below
@@ -424,10 +424,18 @@ pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
 /// idempotent — `STATUS` and `I2C_SCAN` are reads, and `SELECT`, `RELEASE_MD`
 /// and `END` all set a state rather than advancing one.
 ///
+/// [`WiredError::Faulted`] is retried on the same policy, but only for reads.
+/// usbmon caught a single control transfer completing EPROTO with no data
+/// between two STATUS replies 3 ms either side of it, both healthy, and an
+/// install was abandoned on that one transfer. A read costs nothing to repeat;
+/// a write that faults is ambiguous — the transfer failed on the bus, so
+/// whether the device acted on it is unknown — and is left to the caller.
+///
 /// Deliberately narrow:
 ///
-/// * Only [`WiredError::Stalled`]. A timeout, a disconnect or a protocol error
-///   is not retried, because none of them go away by being asked again.
+/// * Only [`WiredError::Stalled`], plus [`WiredError::Faulted`] on
+///   `control_in`. A timeout or a disconnect is not retried, because neither
+///   goes away by being asked again.
 /// * Only control transfers. A stalled bulk endpoint stays halted until it is
 ///   cleared, so a blind retry there would spin rather than recover.
 /// * Bounded. A request the bootloader genuinely refuses stalls every single
@@ -463,43 +471,47 @@ impl<L> Retrying<L> {
 }
 
 impl<L: IgnitionLink> Retrying<L> {
-    /// One control transfer, submitted again for as long as it stalls.
+    /// One control transfer, submitted again for as long as it stalls — and,
+    /// when the request is an idempotent read, for as long as it faults.
     fn control<T>(
         &mut self,
         request: u8,
+        idempotent: bool,
         mut transfer: impl FnMut(&mut L) -> Result<T, WiredError>,
     ) -> Result<T, WiredError> {
         let mut backoff = self.backoff;
         for attempt in 1..self.attempts {
-            match transfer(&mut self.inner) {
-                Err(WiredError::Stalled { .. }) => {
-                    log::debug!(
-                        "vendor request {request:#04x} stalled on attempt {attempt} of {}; \
-                         submitting it again in {backoff:?}",
-                        self.attempts,
-                    );
-                    // Not the kind of wait this crate got rid of: nothing is
-                    // being given time to happen, the bus is being let go of
-                    // for long enough that the device's control endpoint has
-                    // drained the transfer it is still finishing.
-                    std::thread::sleep(backoff);
-                    // Doubling, because the window is not a fixed length: it
-                    // is however long the bootloader takes to come round, and
-                    // a policy that only covers the window it was measured
-                    // against fails the moment the firmware does slightly more.
-                    backoff = backoff.saturating_mul(2);
-                }
-                settled => return settled,
-            }
+            let settled = transfer(&mut self.inner);
+            let again = match &settled {
+                Err(WiredError::Stalled { .. }) => "stalled",
+                Err(WiredError::Faulted { .. }) if idempotent => "faulted",
+                _ => return settled,
+            };
+            log::debug!(
+                "vendor request {request:#04x} {again} on attempt {attempt} of {}; \
+                 submitting it again in {backoff:?}",
+                self.attempts,
+            );
+            // Not the kind of wait this crate got rid of: nothing is being
+            // given time to happen, the bus is being let go of for long enough
+            // that the device's control endpoint has drained the transfer it
+            // is still finishing.
+            std::thread::sleep(backoff);
+            // Doubling, because the window is not a fixed length: it is
+            // however long the bootloader takes to come round, and a policy
+            // that only covers the window it was measured against fails the
+            // moment the firmware does slightly more.
+            backoff = backoff.saturating_mul(2);
         }
-        // The last attempt's answer is the one the caller gets, stall included.
+        // The last attempt's answer is the one the caller gets, stall or fault
+        // included.
         transfer(&mut self.inner)
     }
 }
 
 impl<L: IgnitionLink> IgnitionLink for Retrying<L> {
     fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
-        self.control(request, |link| link.control_out(request, value))
+        self.control(request, false, |link| link.control_out(request, value))
     }
 
     fn control_in(
@@ -508,7 +520,7 @@ impl<L: IgnitionLink> IgnitionLink for Retrying<L> {
         value: u16,
         length: usize,
     ) -> Result<Vec<u8>, WiredError> {
-        self.control(request, |link| link.control_in(request, value, length))
+        self.control(request, true, |link| link.control_in(request, value, length))
     }
 
     fn bulk_out(&mut self, message: &[u8]) -> Result<(), WiredError> {
@@ -618,15 +630,21 @@ pub mod usb {
         }
     }
 
-    /// A failed control transfer, with a stall kept apart from the rest.
+    /// A failed control transfer, with a stall and a bus fault kept apart from
+    /// the rest.
     ///
-    /// The distinction is the whole point: [`Retrying`] submits a stall again
-    /// and nothing else, so a timeout or a disconnect has to stay a
-    /// [`WiredError::Request`] or it would be tried three more times for
-    /// nothing.
+    /// The distinction is the whole point: [`Retrying`] submits a stall again,
+    /// and a fault again on a read, so a timeout or a disconnect has to stay a
+    /// [`WiredError::Request`] or it would be tried six more times for nothing.
+    /// `Fault` is what the usbfs backend maps EPROTO, EILSEQ, EOVERFLOW, ECOMM
+    /// and ETIME to.
     fn control_error(request: u8, err: nusb::transfer::TransferError) -> WiredError {
         match err {
             nusb::transfer::TransferError::Stall => WiredError::Stalled { request },
+            fault @ nusb::transfer::TransferError::Fault => WiredError::Faulted {
+                request,
+                reason: fault.to_string(),
+            },
             other => WiredError::Request {
                 request,
                 reason: other.to_string(),
@@ -903,7 +921,11 @@ mod tests {
         stalls: u32,
         /// Stall everything, the way a genuinely refused request behaves.
         always: bool,
-        /// Fail with something that is not a stall, which must not be retried.
+        /// Control transfers still to be faulted before one is answered.
+        faults: u32,
+        /// Fault every one, the way a link that is really broken behaves.
+        always_faults: bool,
+        /// Fail with a disconnect, which must not be retried on any request.
         broken: bool,
         controls: u32,
         bulks: u32,
@@ -916,6 +938,13 @@ mod tests {
                 return Err(WiredError::Request {
                     request,
                     reason: "the device went away".into(),
+                });
+            }
+            if self.always_faults || self.faults > 0 {
+                self.faults = self.faults.saturating_sub(1);
+                return Err(WiredError::Faulted {
+                    request,
+                    reason: "hardware fault or protocol violation".into(),
                 });
             }
             if self.always || self.stalls > 0 {
@@ -1002,6 +1031,52 @@ mod tests {
         assert!(err.to_string().contains("refused"), "{err}");
         // Bounded, and it spent every attempt it had rather than stopping early.
         assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_control_read_that_faults_once_is_submitted_again_and_answers() {
+        // The bug from the bench: one control transfer completes EPROTO with
+        // no data between two healthy STATUS polls 3 ms apart.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            faults: 1,
+            ..Stalls::default()
+        }));
+        let status = ignition.status().expect("the second attempt");
+        assert_eq!(status.i2c_khz, 50);
+        assert_eq!(spent(ignition).controls, 2);
+    }
+
+    #[test]
+    fn a_read_that_faults_every_time_still_fails_once_the_tries_are_spent() {
+        let mut ignition = Ignition::new(retrying(Stalls {
+            always_faults: true,
+            ..Stalls::default()
+        }));
+        let err = ignition.status().unwrap_err();
+        assert!(
+            matches!(err, WiredError::Faulted { request: REQ_STATUS, .. }),
+            "{err:?}"
+        );
+        // Reads as a plain failed request, which is what a spent fault is.
+        assert!(
+            err.to_string()
+                .ends_with("failed: hardware fault or protocol violation"),
+            "{err}"
+        );
+        assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_control_write_that_faults_is_not_tried_again() {
+        // A fault on a write leaves it ambiguous whether the request landed,
+        // so only the reads are re-submitted.
+        let mut ignition = Ignition::new(retrying(Stalls {
+            always_faults: true,
+            ..Stalls::default()
+        }));
+        let err = ignition.select(Half::Left).unwrap_err();
+        assert!(matches!(err, WiredError::Faulted { .. }), "{err:?}");
+        assert_eq!(spent(ignition).controls, 1);
     }
 
     #[test]
