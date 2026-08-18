@@ -350,10 +350,13 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
 
     if restarting {
         println!();
-        println!("The keyboard cannot be typed on while this runs, and both halves go dark or");
-        println!("blue — that is by design, not a fault. It takes a couple of minutes. Nothing");
-        println!("is kept until it has proved itself, so a keyboard interrupted half-way gets");
-        println!("its old firmware back on the next power cycle.");
+        println!("The keyboard cannot be typed on while this runs. Each half shows its own");
+        println!("progress on its status LEDs: green blinking fast while its image is written,");
+        println!("green solid while it restarts and waits to be confirmed, then back to normal.");
+        println!("Red solid means that half's update was refused or aborted; red blinking slowly");
+        println!("means the two halves are on different builds until this finishes. It takes a");
+        println!("couple of minutes. Nothing is kept until it has proved itself, so a keyboard");
+        println!("interrupted half-way gets its old firmware back on the next power cycle.");
     }
 
     // ---- Say what is being installed, before writing any of it -----------
