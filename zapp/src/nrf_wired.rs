@@ -42,14 +42,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 
 use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::flash::FlashProgress;
 use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
 use zapp_smp::settings::{self, EsbConfig};
-use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError};
+use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError, TransportError};
 use zapp_wired::ignition::{
     usb::UsbLink, ConfirmMode, ConfirmRc, ConfirmResult, ConfirmStatus, Halves, SessionState,
     TargetState,
@@ -58,7 +58,8 @@ use zapp_wired::{
     Ignition, IgnitionLink, LeftTransport, Retrying, RightTransport, Status, WiredError,
 };
 
-use crate::zsab::{named, short, wrap, Landed};
+use crate::new_spinner;
+use crate::zsab::{named, short, sizes, wrap, Landed};
 
 /// How long to give ignition's entry sequence.
 ///
@@ -83,6 +84,14 @@ const WAIT_FOR_RIGHT: Duration = Duration::from_secs(30);
 /// A pause between attempts, so a bootloader that refuses one straight away is
 /// not asked several thousand times.
 const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
+
+/// How long an attempt may run before the wait says what it is waiting for.
+///
+/// The first attempt is the long one: ignition settles the left half and then
+/// polls the mailbox twice, eleven seconds of a session that is going nowhere.
+/// Announcing the wait once it is clearly a wait, rather than once an attempt
+/// has failed, is the difference between a line and a blank terminal.
+const RIGHT_SPINNER_AFTER: Duration = Duration::from_secs(1);
 
 /// How long both halves get to swap and come back up before the confirm gives
 /// up on them.
@@ -146,7 +155,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // the whole of the output. The session is still put back the same
             // way, because BEGIN left both halves in their bootloaders.
             if outcome == Outcome::UpToDate {
-                println!("The keyboard is up to date, skipping the flash.");
+                println!("{}", crate::zsab::UP_TO_DATE);
             }
 
             // Only once everything landed: an END on the way out of a failure
@@ -187,7 +196,16 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // notes are read out of a session that is still open, and the next
             // attempt needs one that is not — the bootloader refuses BEGIN
             // outright while a session is active.
-            let notes = advice(&mut ignition);
+            //
+            // A half that stopped answering is the one failure with nothing to
+            // ask about: the bootloader's notes are about the bus and the
+            // session, and neither says anything a cable that came out does not
+            // already. The session is still put back, because the next attempt
+            // needs it closed.
+            let notes = match err.downcast_ref::<HalfGone>() {
+                Some(_) => Vec::new(),
+                None => advice(&mut ignition),
+            };
             if let Err(err) = ignition.end() {
                 log::debug!("could not end the session after the failure: {err}");
             }
@@ -201,10 +219,18 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // at a failure the board had already named.
             log::debug!("failure detail: {err:#}");
             let mut line = match root_cause(&err) {
-                Some(cause) => format!("Error: {err} ({cause})."),
-                None => format!("Error: {err}."),
+                Some(cause) => format!("Error: {err} ({cause})"),
+                None => format!("Error: {err}"),
             };
+            if !line.ends_with('.') {
+                line.push('.');
+            }
+            // A note the error already carries, as with a session that
+            // recorded the fault it failed on, is not said twice.
             for note in notes {
+                if line.contains(&note) {
+                    continue;
+                }
                 line.push(' ');
                 line.push_str(&note);
             }
@@ -258,7 +284,8 @@ fn run<L: IgnitionLink + 'static>(
     let mut deciding = false;
     for half in [Half::Right, Half::Left] {
         steps.announce(&format!("{} half", titled(half)));
-        let written = write_half(shared, ignition, half, bundle, &status, force, timeout)?;
+        let written = write_half(shared, ignition, half, bundle, &status, force, timeout)
+            .map_err(|err| half_gone(half, err))?;
         deciding |= written.staged != Staged::Nothing;
         carried.push(Carried {
             half,
@@ -298,7 +325,7 @@ fn run<L: IgnitionLink + 'static>(
     // the right confirmed on its own.
     steps.announce("Waiting for both halves to come back on the new firmware");
     steps.announce("Checking both halves came out on the bundle's version");
-    let spinner = (!settle.is_zero()).then(|| new_spinner(&installing(Duration::ZERO, settle)));
+    let spinner = (!settle.is_zero()).then(|| new_spinner("Waiting for the halves to restart..."));
     let mut pair = WiredPair {
         shared,
         ignition,
@@ -310,8 +337,12 @@ fn run<L: IgnitionLink + 'static>(
         spinner,
         payload_budget: status.payload_budget(),
     };
-    crate::confirm::settle(&mut pair, &[Half::Right, Half::Left], &[Half::Right, Half::Left])
-        .map(|()| Outcome::Flashed)
+    let settled =
+        crate::confirm::settle(&mut pair, &[Half::Right, Half::Left], &[Half::Right, Half::Left]);
+    // Whatever it came to, the line the spinner owns is given back before
+    // anything else is said.
+    pair.clear();
+    settled.map(|()| Outcome::Flashed)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +365,8 @@ struct WiredPair<'a, L: IgnitionLink + 'static> {
     settle: Duration,
     /// When the shared settle window opened.
     started: Instant,
-    /// One spinner for both reads, taken and cleared once they are in.
+    /// One spinner for the whole settle, its message swapped as the phase
+    /// changes. Nothing else may print while it holds the line.
     spinner: Option<ProgressBar>,
     /// What the write-pass session said one message may carry, for the
     /// connections the revert reboot makes.
@@ -344,14 +376,7 @@ struct WiredPair<'a, L: IgnitionLink + 'static> {
 impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L> {
     fn running(&mut self, half: Half) -> Landed {
         let wanted = self.bundle.hash(half).unwrap_or_default();
-        read_settle(
-            self.ignition,
-            half,
-            &wanted,
-            self.started,
-            self.settle,
-            self.spinner.as_ref(),
-        )
+        read_settle(self.ignition, half, &wanted, self.started, self.settle)
     }
 
     fn mismatch(&mut self, landed: &[(Half, Landed)]) -> Option<String> {
@@ -384,16 +409,15 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
     }
 
     fn read_summary(&mut self, landed: &[(Half, Landed)]) {
-        // The spinner owns the line until it is cleared, so nothing is said
-        // about either half until both have been read.
-        if let Some(spinner) = self.spinner.take() {
-            spinner.finish_and_clear();
-        }
         for (half, verdict) in landed {
             if let Landed::Ok { active, .. } = verdict {
-                println!("  {half}: running {} and keeping it", short(active));
+                log::debug!("{half}: running {} and keeping it", short(active));
             }
         }
+    }
+
+    fn keeping(&mut self) {
+        self.saying("Confirming both halves...");
     }
 
     /// Resets both halves onto the firmware they were running, and says so.
@@ -410,6 +434,8 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
     /// reach, so the session is re-opened and each half is taken out of it the
     /// same way `write_half` does — the boot MCUboot reverts on.
     fn revert_pair(&mut self, landed: Vec<(Half, Landed)>, reasons: Vec<String>) -> anyhow::Error {
+        // Nothing below shares a line with a spinner.
+        self.clear();
         println!();
         println!("Putting both halves back on the firmware they were running");
         for reason in &reasons {
@@ -445,7 +471,7 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
             }
             // A READ, not a commit: putting a half back must never write its
             // trailer. It is back where it was only if it is now running `was`.
-            let back = read_settle(self.ignition, half, &was, started, self.settle, None);
+            let back = read_settle(self.ignition, half, &was, started, self.settle);
             let ok = matches!(&back, Landed::Ok { active, .. } if *active == was);
             if !ok {
                 println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
@@ -479,6 +505,23 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
 }
 
 impl<L: IgnitionLink + 'static> WiredPair<'_, L> {
+    /// Puts the spinner on `message`, for the phase that is starting.
+    ///
+    /// A run with no settle window carries no spinner at all, and stays that
+    /// way: the tests drive one, and nothing there is waiting for anything.
+    fn saying(&mut self, message: &str) {
+        if let Some(spinner) = &self.spinner {
+            spinner.set_message(message.to_string());
+        }
+    }
+
+    /// Gives the line back, so something else can be said on it.
+    fn clear(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.finish_and_clear();
+        }
+    }
+
     /// Takes both halves through one ordinary boot, right then left.
     ///
     /// The session it opens is what puts them in their bootloaders; the resets
@@ -526,7 +569,6 @@ fn read_settle<L: IgnitionLink>(
     wanted: &[u8],
     started: Instant,
     settle: Duration,
-    spinner: Option<&ProgressBar>,
 ) -> Landed {
     let deadline = started + settle;
     loop {
@@ -553,9 +595,6 @@ fn read_settle<L: IgnitionLink>(
             verdict.why(half)
         );
         std::thread::sleep(SETTLE_POLL.min(left));
-        if let Some(spinner) = spinner {
-            spinner.set_message(installing(started.elapsed(), settle));
-        }
     }
 }
 
@@ -742,15 +781,6 @@ fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
     }
 }
 
-/// The spinner's line while the halves are installing.
-fn installing(gone: Duration, settle: Duration) -> String {
-    format!(
-        "Installing the update on both halves ({} s of up to {} s)",
-        gone.as_secs(),
-        settle.as_secs()
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Getting a session open
 // ---------------------------------------------------------------------------
@@ -763,7 +793,7 @@ fn installing(gone: Duration, settle: Duration) -> String {
 /// already closed. Asking again for half a minute is the same procedure with
 /// enough room in it to work.
 fn open_session<L: IgnitionLink>(ignition: &mut Ignition<L>, limit: Duration) -> Result<Status> {
-    keep_asking(limit, || {
+    keep_asking(limit, |waiting| {
         // No END between attempts: `begin` already closes a session it finds
         // in the way, and ending one here would throw away the fault the last
         // attempt recorded — which is what the failure is explained from.
@@ -772,7 +802,7 @@ fn open_session<L: IgnitionLink>(ignition: &mut Ignition<L>, limit: Duration) ->
                 anyhow::Error::new(err).context("Could not open a session on the bootloader"),
             ));
         }
-        wait_active(ignition)
+        wait_active(ignition, waiting)
     })
 }
 
@@ -805,6 +835,33 @@ fn right_missing(error: u16) -> bool {
     matches!(error, 0x0002..=0x0005)
 }
 
+/// The one line the whole wait is said on, however many attempts it takes.
+///
+/// Handed to each attempt so the wait can be announced from inside one, which
+/// is where the first eleven seconds of it are spent.
+#[derive(Default)]
+struct Waiting {
+    spinner: Option<ProgressBar>,
+}
+
+impl Waiting {
+    /// Puts the line up, if it is not up already.
+    fn show(&mut self) {
+        self.spinner.get_or_insert_with(|| {
+            new_spinner(
+                "Waiting for the right half, make sure the TRRS cable is properly seated...",
+            )
+        });
+    }
+
+    /// Gives the line back.
+    fn clear(self) {
+        if let Some(spinner) = self.spinner {
+            spinner.finish_and_clear();
+        }
+    }
+}
+
 /// The retry itself, with the board's side of it passed in.
 ///
 /// Separated from the link so it can be driven without one: what is worth
@@ -812,29 +869,22 @@ fn right_missing(error: u16) -> bool {
 /// opened.
 fn keep_asking<F>(limit: Duration, mut attempt: F) -> Result<Status>
 where
-    F: FnMut() -> std::result::Result<Status, NotOpened>,
+    F: FnMut(&mut Waiting) -> std::result::Result<Status, NotOpened>,
 {
     let started = Instant::now();
-    let mut spinner: Option<ProgressBar> = None;
+    let mut waiting = Waiting::default();
     loop {
-        let outcome = attempt();
+        let outcome = attempt(&mut waiting);
         let done = match &outcome {
             Ok(_) => true,
             Err(not_opened) => !not_opened.right_missing || started.elapsed() >= limit,
         };
         if done {
-            if let Some(spinner) = spinner {
-                spinner.finish_and_clear();
-            }
+            waiting.clear();
             return outcome.map_err(|not_opened| not_opened.error);
         }
-        // One line for the whole wait, however many attempts it takes.
-        if spinner.is_none() {
-            spinner = Some(new_spinner(
-                "Waiting for the right half — unplug the cable between the halves \
-                 and plug it back in",
-            ));
-        }
+        // An attempt that failed quickly may not have said anything yet.
+        waiting.show();
         std::thread::sleep(BETWEEN_ATTEMPTS);
     }
 }
@@ -1044,6 +1094,7 @@ enum Staged {
 /// poll is a USB control transfer, which is its own pacing.
 fn wait_active<L: IgnitionLink>(
     ignition: &mut Ignition<L>,
+    waiting: &mut Waiting,
 ) -> std::result::Result<Status, NotOpened> {
     let started = Instant::now();
     loop {
@@ -1071,7 +1122,13 @@ fn wait_active<L: IgnitionLink>(
                      one. It is running a build that does not carry the wired update path."
                 )));
             }
-            SessionState::Pending => {}
+            SessionState::Pending => {
+                // The entry sequence is the long part of the wait, so the wait
+                // is announced from here rather than after the attempt fails.
+                if started.elapsed() >= RIGHT_SPINNER_AFTER {
+                    waiting.show();
+                }
+            }
             SessionState::Unrecognised(code) => {
                 return Err(NotOpened::fatal(anyhow!(
                     "The bootloader reports session state {code}, which this build does not \
@@ -1110,27 +1167,24 @@ fn connect<L: IgnitionLink + 'static>(
 
 /// Sends one half's image into its spare slot, with a bar on it.
 fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
-    let bar = ProgressBar::new(image.len() as u64);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            // The half's name rides next to the bolt rather than trailing the
-            // bar: it says what is being written, so it belongs at the front,
-            // and padding it keeps the two bars lined up under each other.
-            .template("⚡ {msg:<5} {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
-    let label = titled(half);
+    let bar = crate::flash_bar(100, titled(half));
     let result = client.upload(SPARE_IMAGE, image, &|progress| match progress {
-        FlashProgress::Writing { bytes_written, .. } => {
-            bar.set_position(bytes_written as u64);
-            bar.set_message(label);
+        FlashProgress::Writing {
+            bytes_written,
+            total_bytes,
+        } => {
+            bar.set_position(((bytes_written * 100) / total_bytes) as u64);
+            bar.set_message("Writing...");
         }
-        FlashProgress::Complete => bar.finish_with_message(label),
+        FlashProgress::Complete => bar.finish_with_message("Done!"),
         _ => {}
     });
-    bar.finish_and_clear();
-    result.with_context(|| format!("The {half} half's upload failed"))
+    if let Err(err) = result {
+        // The bar owns its line until something finishes it.
+        bar.finish_and_clear();
+        return Err(err).with_context(|| format!("The {half} half's upload failed"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,6 +1326,38 @@ impl std::fmt::Display for Mismatched {
 }
 
 impl std::error::Error for Mismatched {}
+
+/// A half's link went away while it was being written — the TRRS cable came
+/// out, or the mailbox behind it did.
+///
+/// Its own type, and one carrying no source, so the failure epilogue prints
+/// this sentence and nothing else. What the chain underneath says is bridges,
+/// mailboxes and event codes, which is the truth from the inside and no help
+/// at all to someone holding a keyboard with a cable half out.
+#[derive(Debug)]
+struct HalfGone(Half);
+
+impl std::fmt::Display for HalfGone {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "The {} half stopped responding", self.0)
+    }
+}
+
+impl std::error::Error for HalfGone {}
+
+/// Turns a write pass that lost its link into [`HalfGone`], and leaves every
+/// other failure as it is.
+fn half_gone(half: Half, err: anyhow::Error) -> anyhow::Error {
+    let closed = err
+        .chain()
+        .filter_map(|link| link.downcast_ref::<SmpError>())
+        .any(|smp| matches!(smp, SmpError::Transport(TransportError::Closed)));
+    if !closed {
+        return err;
+    }
+    log::debug!("{half} half link closed: {err:#}");
+    anyhow::Error::new(HalfGone(half))
+}
 
 /// What one half came out of the run carrying.
 #[derive(Clone)]
@@ -1421,7 +1507,7 @@ fn unproven() -> String {
 /// read, so getting both is both applications up, the STM32 back on its own
 /// firmware, and the two halves talking to each other.
 fn came_back(limit: Duration) -> bool {
-    let spinner = new_spinner("Waiting for the keyboard to restart");
+    let spinner = new_spinner("Waiting for the keyboard to restart...");
     let back = keep_looking(
         limit,
         CONFIRM_GAP,
@@ -1557,15 +1643,15 @@ fn advice<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Vec<String> {
     match ignition.status() {
         Ok(status) => {
             if let Some(note) = session_error(&status) {
-                notes.push(wrap(&note));
+                notes.push(note);
             } else if let Some(note) = bus_health(&status) {
-                notes.push(wrap(&note));
+                notes.push(note);
             }
         }
-        Err(err) => notes.push(wrap(&format!(
+        Err(err) => notes.push(format!(
             "The bootloader stopped answering as well ({err}), so there is nothing left to \
              ask about what happened. Unplug the keyboard and plug it back in."
-        ))),
+        )),
     }
     notes
 }
@@ -1636,14 +1722,10 @@ fn bus_phrase(status: &Status) -> String {
 // ---------------------------------------------------------------------------
 
 fn announce(bundle: &Bundle, _path: &Path, _len: usize) {
-    let sizes: Vec<String> = [Half::Left, Half::Right]
-        .iter()
-        .map(|half| format!("{} {} bytes", half.as_str(), bundle.image(*half).len()))
-        .collect();
     println!(
-        "Bundle loaded: {} ({})",
+        "Bundle loaded: {} ({}) flashing over USB",
         named(&bundle.header.build_version),
-        sizes.join(" + ")
+        sizes(bundle)
     );
     for half in [Half::Left, Half::Right] {
         if let Some(info) = image::inspect(bundle.image(half)) {
@@ -1740,7 +1822,7 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
         Err(err) => return Err(err).context("Could not open the ZSA bootloader"),
     }
 
-    let spinner = new_spinner("Press your keyboard's reset button");
+    let spinner = new_spinner("Waiting for keyboard in bootloader mode...");
     let deadline = Instant::now() + limit;
 
     loop {
@@ -1767,19 +1849,6 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
             }
         }
     }
-}
-
-/// A spinner that says what is being waited for.
-fn new_spinner(message: &str) -> ProgressBar {
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    spinner.set_message(message.to_string());
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner
 }
 
 /// One link, held by the control path and by a transport at the same time.
@@ -2590,6 +2659,24 @@ mod tests {
     }
 
     #[test]
+    fn a_half_whose_link_went_away_is_one_sentence_with_nothing_under_it() {
+        // What the cable coming out mid-upload actually reaches `flash` as:
+        // the bridge's event, flattened to a closed transport by zapp-wired and
+        // wrapped in the upload's own context.
+        let err = anyhow::Error::new(SmpError::Transport(TransportError::Closed))
+            .context("The right half's upload failed");
+        let err = half_gone(Half::Right, err);
+        assert_eq!(err.to_string(), "The right half stopped responding");
+        // Nothing under it, so the epilogue has no root cause to print.
+        assert_eq!(root_cause(&err), None);
+        assert!(err.downcast_ref::<HalfGone>().is_some());
+
+        // Every other failure is left alone.
+        let other = half_gone(Half::Right, anyhow::anyhow!("the board refused the mark"));
+        assert_eq!(other.to_string(), "the board refused the mark");
+    }
+
+    #[test]
     fn a_permanent_mark_is_never_sent_over_the_cable() {
         // Separately from the whole-run assertion above, because this is the
         // property and not the sequence: nothing on this path may commit to an
@@ -3338,7 +3425,7 @@ mod tests {
     /// session opens, and counts how many times it was asked.
     fn attempts_until(misses: usize, error: u16) -> (Result<Status>, usize) {
         let mut asked = 0;
-        let result = keep_asking(Duration::from_secs(30), || {
+        let result = keep_asking(Duration::from_secs(30), |_| {
             asked += 1;
             if asked > misses {
                 return Ok(faulted(0, 0, 0));
@@ -3385,7 +3472,7 @@ mod tests {
     #[test]
     fn a_right_half_that_never_comes_back_gives_up_with_the_bootloaders_reason() {
         let mut asked = 0;
-        let result = keep_asking(Duration::ZERO, || {
+        let result = keep_asking(Duration::ZERO, |_| {
             asked += 1;
             Err(NotOpened {
                 right_missing: true,
@@ -3396,6 +3483,31 @@ mod tests {
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("TRRS cable"), "{err}");
         assert_eq!(asked, 1, "it kept asking past its own limit");
+    }
+
+    #[test]
+    fn the_wait_outlives_the_attempt_that_said_it() {
+        // An attempt announces the wait long before it fails, so the line has
+        // to survive into the attempts after it, and asking for it again is a
+        // no-op rather than a second line.
+        let mut asked = 0;
+        let mut lines = Vec::new();
+        let result = keep_asking(Duration::from_secs(30), |waiting| {
+            asked += 1;
+            waiting.show();
+            waiting.show();
+            lines.push(waiting.spinner.is_some());
+            if asked > 2 {
+                return Ok(faulted(0, 0, 0));
+            }
+            Err(NotOpened {
+                right_missing: true,
+                error: anyhow!("no right half"),
+            })
+        });
+
+        result.expect("the third attempt found it");
+        assert_eq!(lines, [true, true, true]);
     }
 
     // ---- One version across the keyboard -------------------------------

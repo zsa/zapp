@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 
 use zapp_ble::smp::bundle::{self, Bundle, Step};
 use zapp_ble::smp::session::{self, Declaration, Next};
@@ -22,7 +22,7 @@ use zapp_ble::{Battery, Level};
 use zapp_core::device::{self, ids::Keyboard};
 use zapp_core::flash::FlashProgress;
 
-use crate::{smp_connect, LinkArgs};
+use crate::{smp_connect, smp_connect_quiet, LinkArgs};
 
 /// How long to leave a half alone after telling it to restart.
 ///
@@ -50,6 +50,11 @@ const CONFIRM_TRIES: usize = 3;
 /// How often a long wait says it is still a wait.
 const NOTE_EVERY: Duration = Duration::from_secs(15);
 
+/// A keyboard that already carries the bundle, said the same way whichever way
+/// the bundle was going to travel.
+pub(crate) const UP_TO_DATE: &str =
+    "The keyboard is up to date, skipping the flash. Pass --force to write it anyway.";
+
 /// Updates both halves from a bundle.
 pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
     let blob = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
@@ -74,7 +79,6 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
             }
             println!();
             println!("{}", progress.advice(path));
-            println!();
             bail!("the keyboard was not fully updated")
         }
     }
@@ -260,10 +264,9 @@ impl Progress {
 
 fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -> Result<()> {
     // ---- What is there now ----------------------------------------------
-    println!();
-    println!("Reading what is installed");
+    log::debug!("reading what is installed");
 
-    let left_slots = read_state(link, Half::Left)?;
+    let left_slots = read_state(link, Half::Left, Connect::Announced)?;
     // Levels are only published over a live connection, so this is asked after
     // the left has been talked to rather than before. A failure here is an
     // unknown level, which the gate allows.
@@ -274,14 +277,14 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     let charging = charging();
     progress.battery = battery;
     progress.charging = charging;
-    println!("  charge {}", charge(battery, charging));
+    log::debug!("charge {}", charge(battery, charging));
     // Before the right half is touched, not after: reading the right goes
     // through the left's relay, and the relay is battery-gated too. On a flat
     // pack that read is the thing that fails, and it fails looking like a
     // radio-link fault — so the check that can actually name the battery has
     // to run first.
     check_battery(battery, charging)?;
-    let right_slots = read_state(link, Half::Right).context(
+    let right_slots = read_state(link, Half::Right, Connect::Announced).context(
         "The right half is reached through the left, over the halves' own radio link, and \
          that link has to be up before anything is written — updating the left first would \
          cut off the only route to the right. Check both halves are powered and linked",
@@ -304,15 +307,11 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
             Half::Left => &left_slots,
             Half::Right => &right_slots,
         };
-        println!("  {:<5}  {}", half.as_str(), describe(step, slots));
+        log::debug!("{:<5}  {}", half.as_str(), describe(step, slots));
     }
 
     if plan.iter().all(|(_, step)| *step == Step::Installed) {
-        println!();
-        println!(
-            "Both halves already carry this bundle. Nothing to do — pass --force to \
-             write them anyway."
-        );
+        println!("{UP_TO_DATE}");
         return Ok(());
     }
     let pending = |wanted: Half| {
@@ -326,37 +325,18 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // `swaps_after`.
     let swaps = |wanted: Half| swaps_after(step_of(&plan, wanted), step_of(&installed, wanted));
 
-    let uploads = plan.iter().filter(|(_, step)| *step == Step::Upload).count();
-    let swapping = [Half::Right, Half::Left]
-        .into_iter()
-        .filter(|half| swaps(*half))
-        .count();
-    let restarting = swapping > 0;
-    let confirming = plan.iter().any(|(_, step)| *step != Step::Installed);
-    // Only when the right actually restarts and the left still has an upload to
-    // send after it: nothing else stands between this run and the left.
-    let waiting = swaps(Half::Right)
-        && plan
-            .iter()
-            .any(|(half, step)| *half == Half::Left && *step == Step::Upload);
-    let mut steps = Steps {
-        total: uploads
-            + swapping
-            + usize::from(waiting)
-            + usize::from(restarting)
-            + usize::from(confirming),
-        done: 0,
-    };
-
-    if restarting {
-        println!();
-        println!("The keyboard cannot be typed on while this runs. Each half shows its own");
-        println!("progress on its status LEDs: green blinking fast while its image is written,");
-        println!("green solid while it restarts and waits to be confirmed, then back to normal.");
-        println!("Red solid means that half's update was refused or aborted; red blinking slowly");
-        println!("means the two halves are on different builds until this finishes. It takes a");
-        println!("couple of minutes. Nothing is kept until it has proved itself, so a keyboard");
-        println!("interrupted half-way gets its old firmware back on the next power cycle.");
+    // The status LEDs are the keyboard's own progress while this runs, and they
+    // say it whether or not anything here does.
+    if swaps(Half::Right) || swaps(Half::Left) {
+        log::debug!(
+            "the keyboard cannot be typed on while this runs; each half shows its own \
+             progress on its status LEDs — green blinking fast while its image is written, \
+             green solid while it restarts and waits to be confirmed, then back to normal; \
+             red solid means that half's update was refused or aborted, red blinking slowly \
+             means the two halves are on different builds until this finishes; nothing is \
+             kept until it has proved itself, so a keyboard interrupted half-way gets its \
+             old firmware back on the next power cycle"
+        );
     }
 
     // ---- Say what is being installed, before writing any of it -----------
@@ -377,7 +357,7 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // and is still going to take the images — that is what the declaration's
     // rewrite flag asks for, and it is not a disagreement worth a line.
     if !force && let Some(note) = cross_check(&plan, opened.next) {
-        println!("{note}");
+        log::warn!("{note}");
     }
 
     // ---- Write, right half first ----------------------------------------
@@ -401,16 +381,11 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         // image it was given: the board refuses the left's own upload with "the
         // right half first" until then, and the right has only just restarted.
         if half == Half::Left && progress.right_restarted {
-            steps.announce("Waiting for the right half to come back");
             wait_for_right_ready(link, &declaration)?;
             progress.right_back = true;
         }
 
-        steps.announce(&format!(
-            "{} half — upload ({} KiB)",
-            titled(half),
-            image.len() / 1024
-        ));
+        log::debug!("{} half — upload ({} KiB)", titled(half), image.len() / 1024);
         let (mut client, renewed) = connect_declared(link, half, &declaration)?;
         progress.session_id = Some(renewed.id);
 
@@ -423,10 +398,10 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         // of this that proves the link end to end — but there is nothing to
         // swap to, so the mark that would fail is not sent.
         if !swaps(half) {
-            println!("  {half} already runs this exact image — nothing to swap");
+            log::debug!("{half} already runs this exact image — nothing to swap");
             continue;
         }
-        restart(&mut steps, &mut client, half, &hash)?;
+        restart(&mut client, half, &hash)?;
         match half {
             Half::Right => progress.right_restarted = true,
             Half::Left => progress.left_restarted = true,
@@ -467,20 +442,21 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         .map(|(half, _)| *half)
         .collect();
 
-    if restarting {
-        steps.announce("Waiting for the halves to come back");
-    }
     progress.settled = true;
     {
         let mut pair = BleConfirm {
             link,
             bundle,
-            steps: &mut steps,
             progress: &mut *progress,
             running,
             before,
+            spinner: None,
         };
-        crate::confirm::settle(&mut pair, &read, &keep)?;
+        let settled = crate::confirm::settle(&mut pair, &read, &keep);
+        // Whatever it came to, the line the spinner owns is given back before
+        // anything else is said.
+        pair.clear();
+        settled?;
     }
 
     // ---- Let the session go ---------------------------------------------
@@ -491,11 +467,7 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // something that went wrong.
     close_session(link, progress);
 
-    println!();
-    println!(
-        "Done. Both halves are running {}.",
-        named(&bundle.header.build_version)
-    );
+    println!("Done!");
     Ok(())
 }
 
@@ -580,10 +552,17 @@ fn connect_declared(
 /// Re-declaring on each poll is what keeps the session's idle timer alive
 /// through the wait; an identical declaration renews rather than collides.
 fn wait_for_right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
-    println!("  right: giving it a moment to restart");
+    let spinner = crate::new_spinner("Waiting for the right half to restart...");
+    let ready = right_ready(link, declaration);
+    spinner.finish_and_clear();
+    ready
+}
+
+/// The wait itself, with the spinner's line left to its caller.
+fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
     thread::sleep(REBOOT_SETTLE);
 
-    let mut client = smp_connect(link, Half::Left)?;
+    let mut client = smp_connect_quiet(link, Half::Left)?;
     let started = Instant::now();
     let mut noted = Instant::now();
     // Whether the right was ever reporting at all. A right that never says
@@ -596,20 +575,17 @@ fn wait_for_right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()
             Ok(status) => {
                 seen |= status.right_seen;
                 if matches!(status.next, Next::Left | Next::Complete) {
-                    println!(
-                        "  right: back after {} s{}",
+                    log::debug!(
+                        "right: back after {} s, confirmed: {}",
                         started.elapsed().as_secs(),
-                        match status.right_done {
-                            true => ", confirmed",
-                            false => ", not confirmed — that is this run's last step",
-                        }
+                        status.right_done
                     );
                     return Ok(());
                 }
             }
             Err(err) => {
                 log::debug!("the left stopped answering while waiting on the right: {err:#}");
-                client = smp_connect(link, Half::Left)?;
+                client = smp_connect_quiet(link, Half::Left)?;
             }
         }
 
@@ -618,8 +594,8 @@ fn wait_for_right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()
         }
         if noted.elapsed() >= NOTE_EVERY {
             noted = Instant::now();
-            println!(
-                "  right: not back yet after {} s of {}",
+            log::debug!(
+                "right: not back yet after {} s of {}",
                 started.elapsed().as_secs(),
                 REBOOT_TIMEOUT.as_secs()
             );
@@ -668,21 +644,20 @@ fn close_session(link: &LinkArgs, progress: &Progress) {
 
 /// What the board said when the update was declared to it.
 fn announce_session(declaration: &Declaration, status: &session::Status) {
-    println!();
-    println!(
-        "Declared {} to the keyboard (session {})",
+    log::debug!(
+        "declared {} to the keyboard (session {}); the board says {} next",
         named(&declaration.version),
-        status.id
+        status.id,
+        next_as(status.next)
     );
-    println!("  the board says {} next", next_as(status.next));
     if declaration.redo {
-        println!("  asking for both halves to be written again, in the same order");
+        log::debug!("asking for both halves to be written again, in the same order");
     }
     if !status.right_seen {
-        println!("  it cannot read the right half's image state at all");
+        log::debug!("the board cannot read the right half's image state at all");
     }
     if !status.guard {
-        println!("  this board is not enforcing declared updates: a development build");
+        log::debug!("this board is not enforcing declared updates: a development build");
     }
 }
 
@@ -793,24 +768,24 @@ const RELAY_SETTLE: Duration = Duration::from_secs(5);
 /// Sends one half's image into its spare slot, over a connection the caller has
 /// already declared the update on.
 fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
-    let bar = ProgressBar::new(image.len() as u64);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
+    let bar = crate::flash_bar(100, titled(half));
     let result = client.upload(0, image, &|progress| match progress {
-        FlashProgress::Writing { bytes_written, .. } => {
-            bar.set_position(bytes_written as u64);
-            bar.set_message("Uploading...");
+        FlashProgress::Writing {
+            bytes_written,
+            total_bytes,
+        } => {
+            bar.set_position(((bytes_written * 100) / total_bytes) as u64);
+            bar.set_message("Writing...");
         }
-        FlashProgress::Complete => bar.finish_with_message("Done"),
+        FlashProgress::Complete => bar.finish_with_message("Done!"),
         _ => {}
     });
-    bar.finish_and_clear();
-    result.with_context(|| format!("The {half} half's upload failed"))?;
-    println!("  {} bytes written into the spare slot", image.len());
+    if let Err(err) = result {
+        // The bar owns its line until something finishes it.
+        bar.finish_and_clear();
+        return Err(err).with_context(|| format!("The {half} half's upload failed"));
+    }
+    log::debug!("{} bytes written into the {half} half's spare slot", image.len());
     Ok(())
 }
 
@@ -820,16 +795,15 @@ fn upload(client: &mut SmpClient, half: Half, image: &[u8]) -> Result<()> {
 /// image with no way back. Nothing on the keyboard confirms it either, so until
 /// this run does — after both halves have been seen back on what they were
 /// written — every restart puts the old image back.
-fn restart(steps: &mut Steps, client: &mut SmpClient, half: Half, hash: &[u8]) -> Result<()> {
-    steps.announce(&format!("{} half — mark for test and restart", titled(half)));
+fn restart(client: &mut SmpClient, half: Half, hash: &[u8]) -> Result<()> {
     client
         .mark(hash, false)
         .with_context(|| format!("Could not mark the {half} half's new image for test"))?;
-    println!("  marked {} for test", short(hash));
+    log::debug!("marked {} for test on the {half} half", short(hash));
     client
         .reset()
         .with_context(|| format!("Could not restart the {half} half"))?;
-    println!("  restarting");
+    log::debug!("restarting the {half} half");
     Ok(())
 }
 
@@ -917,17 +891,15 @@ impl Landed {
 /// that is missing or on the wrong image is fatal depends on the other half too,
 /// and that decision is [`decide`]'s. So this reports rather than fails.
 fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Landed {
-    println!("  {}: giving it a moment to restart", half);
     thread::sleep(REBOOT_SETTLE);
 
     let started = Instant::now();
     loop {
-        let slots = match read_state(link, half) {
+        let slots = match read_state(link, half, Connect::Quiet) {
             Ok(slots) => slots,
             Err(err) if started.elapsed() < REBOOT_TIMEOUT => {
-                log::debug!("{half} half not back yet: {err:#}");
-                println!(
-                    "  {half}: not back yet after {} s; trying again",
+                log::debug!(
+                    "{half} half not back yet after {} s: {err:#}",
                     started.elapsed().as_secs()
                 );
                 thread::sleep(RETRY_EVERY);
@@ -956,8 +928,8 @@ fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Landed {
                 version: active.version.clone(),
             };
         }
-        println!(
-            "  {half}: back after {} s, running {} ({})",
+        log::debug!(
+            "{half}: back after {} s, running {} ({})",
             started.elapsed().as_secs(),
             short(&active.hash),
             named(&active.version)
@@ -977,22 +949,22 @@ fn wait_for_boot(link: &LinkArgs, half: Half, hash: &[u8]) -> Landed {
 /// on the images they were written — there is no undoing it afterwards.
 fn confirm(link: &LinkArgs, half: Half, hash: &[u8], already: bool) -> Result<()> {
     if already {
-        println!("  {half}: already confirmed");
+        log::debug!("{half}: already confirmed");
         return Ok(());
     }
 
     let mut last = None;
     for attempt in 1..=CONFIRM_TRIES {
-        let marked = smp_connect(link, half).and_then(|mut client| Ok(client.mark(hash, true)?));
+        let marked =
+            smp_connect_quiet(link, half).and_then(|mut client| Ok(client.mark(hash, true)?));
         match marked {
             Ok(_) => {
-                println!("  {half}: confirmed");
+                log::debug!("{half}: confirmed");
                 return Ok(());
             }
             Err(err) => {
                 log::debug!("could not confirm the {half} half (try {attempt}): {err:#}");
                 if attempt < CONFIRM_TRIES {
-                    println!("  {half}: could not confirm it; trying again");
                     thread::sleep(RETRY_EVERY);
                 }
                 last = Some(err);
@@ -1013,7 +985,6 @@ fn confirm(link: &LinkArgs, half: Half, hash: &[u8], already: bool) -> Result<()
 struct BleConfirm<'a> {
     link: &'a LinkArgs,
     bundle: &'a Bundle,
-    steps: &'a mut Steps,
     progress: &'a mut Progress,
     /// What each half is carrying, replaced for every half that comes back from
     /// a restart. The mismatch check reads this.
@@ -1021,10 +992,31 @@ struct BleConfirm<'a> {
     /// The same, kept as it was read at the top of the run: what a revert puts
     /// back.
     before: Vec<(Half, Vec<u8>)>,
+    /// One spinner for the whole settle, its message swapped as the phase
+    /// changes. Nothing else may print while it holds the line.
+    spinner: Option<ProgressBar>,
+}
+
+impl BleConfirm<'_> {
+    /// Puts the spinner on `message`, starting it if this is the first phase.
+    fn saying(&mut self, message: &str) {
+        match &self.spinner {
+            Some(spinner) => spinner.set_message(message.to_string()),
+            None => self.spinner = Some(crate::new_spinner(message)),
+        }
+    }
+
+    /// Gives the line back, so something else can be said on it.
+    fn clear(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.finish_and_clear();
+        }
+    }
 }
 
 impl crate::confirm::PairConfirm for BleConfirm<'_> {
     fn running(&mut self, half: Half) -> Landed {
+        self.saying("Waiting for the halves to restart...");
         let hash = self.bundle.hash(half).unwrap_or_default();
         let verdict = wait_for_boot(self.link, half, &hash);
         // Keep the running-hash table current for the mismatch check.
@@ -1060,7 +1052,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
     }
 
     fn keeping(&mut self) {
-        self.steps.announce("Keeping the new firmware on both halves");
+        self.saying("Confirming both halves...");
     }
 
     /// Puts both halves back on what they were running, and says so.
@@ -1077,6 +1069,8 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             return anyhow::anyhow!("{}", reasons.join(" "));
         }
 
+        // Nothing below shares a line with a spinner.
+        self.clear();
         println!();
         println!("Putting both halves back on the firmware they were running");
         for reason in &reasons {
@@ -1115,7 +1109,11 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
                 .find(|(which, _)| *which == half)
                 .map(|(_, hash)| hash.clone())
                 .unwrap_or_default();
+            // The read itself is quiet, so the wait needs a line of its own —
+            // put back before anything is said about how it went.
+            self.saying("Waiting for the halves to restart...");
             let back = wait_for_boot(self.link, half, &was);
+            self.clear();
             if !matches!(back, Landed::Ok { .. }) {
                 println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
             }
@@ -1177,9 +1175,25 @@ pub(crate) fn decide(landed: &[(Half, Landed)], mismatch: Option<String>) -> Dec
     }
 }
 
+/// Whether a connection announces itself.
+///
+/// One line, one spinner: a connect made while the run is already saying what
+/// it is waiting for has to keep quiet, or the two redraw over each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connect {
+    /// Nothing else is on the line, so the wait for the board is worth a
+    /// spinner of its own — a bonded but idle board takes seconds to wake.
+    Announced,
+    /// The caller is already holding the line.
+    Quiet,
+}
+
 /// One image-state read, over a session opened for it.
-fn read_state(link: &LinkArgs, half: Half) -> Result<Vec<ImageSlot>> {
-    let mut client = smp_connect(link, half)?;
+fn read_state(link: &LinkArgs, half: Half, saying: Connect) -> Result<Vec<ImageSlot>> {
+    let mut client = match saying {
+        Connect::Announced => smp_connect(link, half)?,
+        Connect::Quiet => smp_connect_quiet(link, half)?,
+    };
     client
         .image_state()
         .with_context(|| format!("Could not read the {half} half's image state"))
@@ -1343,33 +1357,32 @@ fn charging() -> bool {
     })
 }
 
-/// Numbered phases, so a wait of minutes reads as progress rather than a hang.
-struct Steps {
-    total: usize,
-    done: usize,
-}
-
-impl Steps {
-    fn announce(&mut self, label: &str) {
-        self.done += 1;
-        println!();
-        println!("Step {}/{} · {label}", self.done, self.total);
-    }
+/// Both halves' images, right first — the order they are written in.
+///
+/// `pub(crate)` so the wired path in [`crate::nrf_wired`] says the same thing
+/// the same way.
+pub(crate) fn sizes(bundle: &Bundle) -> String {
+    [Half::Right, Half::Left]
+        .iter()
+        .map(|half| format!("{} {} KiB", half.as_str(), bundle.image(*half).len() / 1024))
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 fn announce(bundle: &Bundle, path: &Path, len: usize) {
     println!(
-        "Bundle {} · {} · {len} bytes",
-        path.display(),
-        named(&bundle.header.build_version)
+        "Bundle loaded: {} ({}) flashing over Bluetooth",
+        named(&bundle.header.build_version),
+        sizes(bundle)
     );
+    log::debug!("{} · {len} bytes", path.display());
     for half in [Half::Left, Half::Right] {
         let image = bundle.image(half);
         let version = smp::image::inspect(image)
             .map(|info| info.version)
             .unwrap_or_else(|| "no MCUboot header".to_string());
-        println!(
-            "  {:<5}  v{version} · {} bytes · {}",
+        log::debug!(
+            "{:<5}  v{version} · {} bytes · {}",
             half.as_str(),
             image.len(),
             bundle
@@ -1378,13 +1391,10 @@ fn announce(bundle: &Bundle, path: &Path, len: usize) {
                 .unwrap_or_else(|| "no hash".to_string())
         );
     }
-    match bundle.header.key_fingerprint {
-        // Nothing stamps this yet: shared/cmake/zsa_esb_key.cmake is not wired
-        // into either app, so every bundle built today carries zero and it is
-        // read as "unknown" rather than as a mismatch.
-        0 => println!("  radio key: not stamped, so not checked"),
-        fingerprint => println!("  radio key: {fingerprint:08x}"),
-    }
+    // Nothing stamps the fingerprint yet: shared/cmake/zsa_esb_key.cmake is not
+    // wired into either app, so every bundle built today carries zero and it is
+    // read as "unknown" rather than as a mismatch.
+    log::debug!("radio key fingerprint {:08x}", bundle.header.key_fingerprint);
 }
 
 fn describe(step: Step, slots: &[ImageSlot]) -> String {

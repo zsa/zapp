@@ -84,9 +84,10 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// It has to be generous, because a timeout here cannot be retried: a
 /// cancelled bulk transfer may have delivered some of its bytes, and sending
-/// them again would corrupt the stream. Anything genuinely wrong is caught by
-/// the SMP layer's own timeout, which reports it in terms of the half that
-/// stopped answering rather than as a USB error.
+/// them again would corrupt the stream. So running it out ends the link rather
+/// than failing one message — [`WiredError::WriteStalled`], which reaches a
+/// caller as a closed transport and reads as the half that stopped answering,
+/// the same as a bridge event does.
 const BULK_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Which halves a session covers. Bit 0 is left, bit 1 is right.
@@ -944,7 +945,15 @@ pub mod usb {
                 .transfer_blocking(message.to_vec().into(), BULK_WRITE_TIMEOUT)
                 .into_result()
                 .map(|_| ())
-                .map_err(|err| WiredError::Usb(err.to_string()))
+                .map_err(|err| match err {
+                    // What a timeout looks like here too, and unlike a read
+                    // there is nothing to salvage: the bridge never took the
+                    // message.
+                    nusb::transfer::TransferError::Cancelled => WiredError::WriteStalled {
+                        after: BULK_WRITE_TIMEOUT,
+                    },
+                    err => WiredError::Usb(err.to_string()),
+                })
         }
 
         fn bulk_in(&mut self, timeout: Duration) -> Result<Vec<u8>, WiredError> {

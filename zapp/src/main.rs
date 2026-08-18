@@ -50,8 +50,8 @@ enum Commands {
             left half when asked.\n\n\
             A bundle carries both halves and they are always written together, \
             the right one first. Over the cable, a right half that does not \
-            answer is waited for: unplug the cable between the halves and plug \
-            it back in while it asks.",
+            answer is waited for: make sure the TRRS cable between the halves \
+            is properly seated while it asks.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash .build/zsa_voyager_tng_default.bin\n  \
@@ -497,15 +497,17 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
     }
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
-    print_firmware_info(&fw);
 
-    // A Voyager 2 image can go either way, so it picks; everything else is a
-    // wired update and has nothing to pick between.
+    // A Voyager 2 image can go either way, so it picks the way and says which
+    // one it picked; everything else is a wired update and has nothing to pick
+    // between.
     if let Firmware::DfuBinary { data, pid, .. } = &fw
         && is_voyager2_image(*pid)
     {
         return flash_voyager2_image(&fw, data, device);
     }
+
+    print_firmware_info(&fw, Transport::Usb);
 
     if device.is_some() {
         println!(
@@ -521,6 +523,32 @@ fn is_voyager2_image(pid: u16) -> bool {
     matches!(pid, 0x1978 | 0x0792)
 }
 
+/// The way an update reaches the keyboard, for saying so on the loaded line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Usb,
+    Bluetooth,
+}
+
+impl Transport {
+    fn label(self) -> &'static str {
+        match self {
+            Transport::Usb => "USB",
+            Transport::Bluetooth => "Bluetooth",
+        }
+    }
+}
+
+/// Which way a Voyager 2 update goes: the cable whenever the keyboard is on it,
+/// in its bootloader or running its own firmware, Bluetooth otherwise.
+fn route() -> Transport {
+    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
+        Transport::Usb
+    } else {
+        Transport::Bluetooth
+    }
+}
+
 /// A Voyager 2 keyboard image, over whichever way the keyboard is reachable.
 ///
 /// The same choice a bundle makes, for the same reasons: the cable whenever the
@@ -528,11 +556,12 @@ fn is_voyager2_image(pid: u16) -> bool {
 /// all. Over the cable `named` is ignored, as there is only ever one keyboard
 /// plugged in.
 fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
-    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
+    let over = route();
+    print_firmware_info(fw, over);
+    if over == Transport::Usb {
         return wait_and_flash(fw);
     }
 
-    println!("No Voyager 2 on USB — going over Bluetooth.");
     let result = flash_over_ble(data, named);
     if result.is_err() {
         println!();
@@ -561,11 +590,10 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
 /// `named` picks between bonded boards over Bluetooth. The cable ignores it:
 /// there is only ever one keyboard plugged in.
 fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
-    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
+    if route() == Transport::Usb {
         return nrf_wired::flash(path, force);
     }
 
-    println!("No Voyager 2 on USB — going over Bluetooth.");
     let link = LinkArgs {
         device: named.map(str::to_string),
         ..LinkArgs::default()
@@ -613,7 +641,7 @@ fn cmd_flash_url(url: &str) -> Result<()> {
     };
 
     let fw = download_firmware(&revision, variant)?;
-    print_firmware_info(&fw);
+    print_firmware_info(&fw, Transport::Usb);
     wait_and_flash(&fw)
 }
 
@@ -657,7 +685,7 @@ fn cmd_update() -> Result<()> {
     };
 
     let fw = download_firmware(&latest, variant)?;
-    print_firmware_info(&fw);
+    print_firmware_info(&fw, Transport::Usb);
     wait_and_flash(&fw)
 }
 
@@ -677,7 +705,7 @@ fn print_revision_note(label: &str, layout_id: &str, revision_id: &str, geometry
     println!("  {label:<7} {revision_id}: {note}");
 }
 
-fn print_firmware_info(fw: &Firmware) {
+fn print_firmware_info(fw: &Firmware, over: Transport) {
     let desc = match fw {
         Firmware::DfuBinary { data, pid, .. } => {
             format!("{} ({} bytes)", target_name_for_pid(*pid), data.len())
@@ -695,10 +723,10 @@ fn print_firmware_info(fw: &Firmware) {
             format!("Ergodox EZ ({} bytes)", data.len())
         }
     };
-    println!("Firmware loaded: {desc}");
+    println!("Firmware loaded: {desc} flashing over {}", over.label());
 }
 
-fn new_spinner(msg: &str) -> ProgressBar {
+pub(crate) fn new_spinner(msg: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -711,17 +739,49 @@ fn new_spinner(msg: &str) -> ProgressBar {
     spinner
 }
 
-/// Connects to the board these arguments name.
+/// The one bar every flash draws, so a bundle's two halves and a keyboard image
+/// look like the same program.
+///
+/// `total` is what the position is measured against; every caller counts in
+/// percent. `prefix` names the half on a bundle's two bars, padded so they line
+/// up under each other, and is empty for a lone image.
+pub(crate) fn flash_bar(total: u64, prefix: &str) -> ProgressBar {
+    let bar = ProgressBar::new(total);
+    let template = match prefix.is_empty() {
+        true => "⚡ {bar:40.cyan/blue} {pos}% {msg}",
+        false => "⚡ {prefix:<5} {bar:40.cyan/blue} {pos}% {msg}",
+    };
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template(template)
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+    bar.set_prefix(prefix.to_string());
+    bar
+}
+
+/// Connects to the board these arguments name, saying so while it happens.
 ///
 /// The spinner is the whole point of doing this in one place: a board that is
 /// bonded but idle takes seconds to wake, and silence there looks like a hang.
+/// Only for a connect nothing else is already covering — two spinners share one
+/// line and redraw over each other, so a caller holding one of its own wants
+/// [`smp_connect_quiet`].
 pub fn smp_connect(args: &LinkArgs, half: Half) -> Result<SmpClient> {
     let spinner = new_spinner(match half {
         Half::Left => "Connecting over Bluetooth...",
         Half::Right => "Connecting to the right half over Bluetooth...",
     });
-    let client = smp::open(args.device.as_deref(), half);
+    let client = smp_connect_quiet(args, half);
     spinner.finish_and_clear();
+    client
+}
+
+/// The same connection, for a caller that is already saying what it is waiting
+/// for.
+pub fn smp_connect_quiet(args: &LinkArgs, half: Half) -> Result<SmpClient> {
+    let client = smp::open(args.device.as_deref(), half);
 
     let mut client = client.with_context(|| match half {
         Half::Left => "Could not reach the board over Bluetooth".to_string(),
@@ -830,62 +890,59 @@ fn flash_over_ble(image: &[u8], device: Option<&str>) -> Result<()> {
         );
     }
 
-    println!("Firmware: {} bytes", image.len());
-    println!("CRC-32:   {:08x}", dfu::crc32(image));
+    log::debug!("image {} bytes, crc-32 {:08x}", image.len(), dfu::crc32(image));
 
     let mut client = dfu_connect(device)?;
-    println!();
-    client
-        .make_ready(BLE_BOOTLOADER_WAIT, &report_wait)
-        .context("The STM32 is not in its bootloader, so nothing was written")?;
 
-    let pb = ProgressBar::new(image.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
+    let spinner = new_spinner("Waiting for keyboard in bootloader mode...");
+    let ready = client.make_ready(BLE_BOOTLOADER_WAIT, &report_wait);
+    spinner.finish_and_clear();
+    ready.context("The STM32 is not in its bootloader, so nothing was written")?;
 
+    let pb = flash_bar(100, "");
     let started = Instant::now();
     let result = client.flash(image, &|progress| match progress {
-        FlashProgress::Erasing { bytes_erased, .. } => {
-            pb.set_message(match bytes_erased {
-                0 => "Erasing...",
-                _ => "Erased",
-            });
+        FlashProgress::Erasing {
+            bytes_erased,
+            total_bytes,
+        } => {
+            pb.set_position(((bytes_erased * 100) / total_bytes) as u64);
+            pb.set_message("Erasing...");
         }
-        FlashProgress::Writing { bytes_written, .. } => {
-            pb.set_position(bytes_written as u64);
+        FlashProgress::Writing {
+            bytes_written,
+            total_bytes,
+        } => {
+            pb.set_position(((bytes_written * 100) / total_bytes) as u64);
             pb.set_message("Writing...");
         }
-        FlashProgress::Resetting => pb.set_message("Checking the image..."),
+        FlashProgress::Resetting => {
+            pb.set_position(100);
+            pb.set_message("Resetting...");
+        }
         FlashProgress::Complete => pb.finish_with_message("Done!"),
     });
-    pb.finish_and_clear();
-    result.context("The flash failed")?;
+    if let Err(err) = result {
+        // The bar owns its line, so it goes before anything is said about why.
+        pb.finish_and_clear();
+        return Err(err).context("The flash failed");
+    }
 
-    let took = started.elapsed();
-    println!(
-        "Wrote {} bytes in {:.1} s ({:.1} KiB/s).",
+    log::debug!(
+        "wrote {} bytes in {:.1} s",
         image.len(),
-        took.as_secs_f64(),
-        image.len() as f64 / took.as_secs_f64() / 1024.0
+        started.elapsed().as_secs_f64()
     );
-    println!("The STM32 accepted the image and is restarting on it.");
     Ok(())
 }
 
-/// What the readiness step is doing, said out loud.
+/// What the readiness step is doing.
 fn report_wait(wait: Wait) {
     match wait {
-        Wait::Already => println!("The STM32 is already in its bootloader."),
-        Wait::Rebooting => println!("Rebooting the STM32 into its bootloader..."),
-        Wait::Waiting(waited) => println!(
-            "  not there yet after {} s — pressing the keyboard's reset button also works",
-            waited.as_secs()
-        ),
-        Wait::Arrived(waited) => println!("  in the bootloader after {} s", waited.as_secs()),
+        Wait::Already => log::debug!("the STM32 is already in its bootloader"),
+        Wait::Rebooting => log::debug!("rebooting the STM32 into its bootloader"),
+        Wait::Waiting(waited) => log::debug!("not there yet after {} s", waited.as_secs()),
+        Wait::Arrived(waited) => log::debug!("in the bootloader after {} s", waited.as_secs()),
     }
 }
 
@@ -900,13 +957,7 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
     })
     .context("Failed to detect bootloader")?;
 
-    let pb = ProgressBar::new(100);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {pos}% {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
+    let pb = flash_bar(100, "");
 
     flash::flash_device(&device, fw, &|progress| match progress {
         FlashProgress::Erasing {

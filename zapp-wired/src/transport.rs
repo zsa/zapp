@@ -127,12 +127,11 @@ impl<L: IgnitionLink> Wired<L> {
     }
 
     /// Notes an event, and fails the read if it means the link is gone.
+    ///
+    /// Even the fatal one is only logged: it comes back as the error, and what
+    /// to say about a link that went away is the caller's to decide.
     fn record(&mut self, event: Event) -> Result<(), WiredError> {
-        if event.code.is_fatal() {
-            log::error!("{event}");
-        } else {
-            log::debug!("{event}");
-        }
+        log::debug!("{event}");
         if self.events.len() == EVENT_HISTORY {
             self.events.remove(0);
         }
@@ -445,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mailbox_going_away_fails_the_read_rather_than_timing_out() {
+    fn the_mailbox_going_away_closes_the_link_rather_than_timing_out() {
         let event = Event {
             code: pipe::EventCode::MailboxGone,
             detail: 0x45,
@@ -460,7 +459,11 @@ mod tests {
             }),
             1024,
         );
+        // Closed rather than an Io sentence, so a caller can tell a link that
+        // went away from every other way a read fails. What went away is still
+        // in the event history and in the debug log.
         let err = transport.read(Duration::from_secs(30)).unwrap_err();
-        assert!(err.to_string().contains("mailbox"), "{err}");
+        assert!(matches!(err, TransportError::Closed), "{err}");
+        assert_eq!(transport.events(), [event]);
     }
 }

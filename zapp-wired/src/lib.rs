@@ -18,6 +18,8 @@
 //! see [`loopback`], which is how everything above it gets written without a
 //! keyboard on the desk.
 
+use std::time::Duration;
+
 pub mod ignition;
 #[cfg(any(test, feature = "loopback"))]
 pub mod loopback;
@@ -93,10 +95,57 @@ pub enum WiredError {
 
     #[error("the bridge reported {0}")]
     Event(pipe::Event),
+
+    /// A message the bridge would not take onto its bulk endpoint, for the
+    /// whole time it was given.
+    ///
+    /// Its own variant rather than a [`Self::Usb`] string, because it is not a
+    /// USB fault: the host cancels the transfer when the timeout runs out, and
+    /// the cancellation is what surfaces. Nothing of the message reached the
+    /// target and it cannot be sent again, so the link is finished — which is
+    /// why it reads as [`zapp_smp::TransportError::Closed`].
+    #[error("the bootloader stopped taking data for {} seconds", .after.as_secs())]
+    WriteStalled { after: Duration },
 }
 
+/// A link that is gone says so as [`zapp_smp::TransportError::Closed`] — a
+/// shape a caller can match on. Two things end a link: a fatal event from the
+/// bridge, and a write the bridge never took, since a bootloader that has not
+/// drained a message in half a minute is not coming back mid-stream.
+/// Everything else flattens to its sentence, which is all a caller does with
+/// it.
 impl From<WiredError> for zapp_smp::TransportError {
     fn from(error: WiredError) -> Self {
-        Self::Io(error.to_string())
+        match &error {
+            WiredError::Event(event) if event.code.is_fatal() => Self::Closed,
+            WiredError::WriteStalled { .. } => Self::Closed,
+            _ => Self::Io(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zapp_smp::TransportError;
+
+    #[test]
+    fn a_write_the_bridge_never_took_reads_as_a_closed_link() {
+        // Same shape as a fatal event, so a caller telling "the half stopped
+        // responding" from every other failure does not have to know which of
+        // the two ways the cable went.
+        let err = TransportError::from(WiredError::WriteStalled {
+            after: Duration::from_secs(30),
+        });
+        assert!(matches!(err, TransportError::Closed), "{err}");
+    }
+
+    #[test]
+    fn every_other_failure_keeps_its_sentence() {
+        let err = TransportError::from(WiredError::NoBootloader);
+        assert!(
+            matches!(&err, TransportError::Io(text) if text.contains("no ZSA bootloader")),
+            "{err}"
+        );
     }
 }
