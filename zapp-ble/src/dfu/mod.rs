@@ -160,8 +160,8 @@ impl Fault {
                  already erased, so flash it again — over Bluetooth or over USB"
             }
             Fault::Locked => {
-                "another update is already in progress. Wait for it to finish, or run \
-                 `zapp dfu abort` to drop it"
+                "another update is already in progress. Wait for it to finish, or \
+                 power-cycle the keyboard if nothing is updating"
             }
             Fault::BadLength => {
                 "the keyboard refused the image's length: it is empty, or larger than the \
@@ -331,7 +331,8 @@ impl DfuError {
                 Fault::Locked => Some(
                     "The left half holds one update lock for every transport — Bluetooth, the \
                      nRF's own SMP path, and the relay to the right half. Something else has \
-                     it. `zapp dfu abort` drops a transfer this tool left behind.",
+                     it. Wait for that update to finish; if nothing is updating, power-cycle \
+                     the keyboard, which clears the lock.",
                 ),
                 Fault::Enter => Some(BOOTLOADER_BY_HAND),
                 _ => None,
@@ -352,9 +353,7 @@ Put the keyboard into its bootloader by hand and run this again — it starts \
 straight away when it finds it already there:
 
   · press the reset button on the left half, or
-  · hold the top-left key while plugging the keyboard in.
-
-`zapp dfu status` says whether it got there.";
+  · hold the top-left key while plugging the keyboard in.";
 
 /// Opens the update service on a bonded board.
 ///
@@ -553,7 +552,7 @@ mod tests {
         assert!(refused(Fault::Verify).to_string().contains("corrupt"));
         assert!(refused(Fault::Locked).to_string().contains("in progress"));
         assert!(refused(Fault::BadLength).to_string().contains("larger"));
-        assert!(refused(Fault::Locked).advice().unwrap().contains("abort"));
+        assert!(refused(Fault::Locked).advice().unwrap().contains("power-cycle"));
         assert!(refused(Fault::Enter).advice().unwrap().contains("reset"));
         // And a fault only the firmware knows about gets no invented advice.
         assert!(refused(Fault::Unknown(9)).advice().is_none());

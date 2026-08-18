@@ -40,17 +40,22 @@ enum Commands {
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
             bundles carrying both wireless halves, and Oryx layout URLs. When \
             given a URL, the firmware is downloaded and flashed directly.\n\n\
-            A .zsab goes over whichever way the keyboard is reachable: the \
-            cable if it is sitting in its bootloader, Bluetooth otherwise. \
-            Keyboard firmware goes over the cable, and this waits for the \
-            bootloader to appear rather than expecting it to be there already \
-            — press the reset button on the left half when asked.\n\n\
+            A .zsab bundle and a Voyager 2 keyboard image both go over \
+            whichever way the keyboard is reachable: the cable if it is on \
+            USB, Bluetooth otherwise. Over Bluetooth the STM32 is rebooted \
+            into its bootloader on the way, and one already sitting there is \
+            written straight away. Any other keyboard's firmware goes over the \
+            cable, and this waits for the bootloader to appear rather than \
+            expecting it to be there already — press the reset button on the \
+            left half when asked.\n\n\
             A bundle carries both halves and they are always written together, \
             the right one first. Over the cable, a right half that does not \
             answer is waited for: unplug the cable between the halves and plug \
             it back in while it asks.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
+            zapp flash .build/zsa_voyager_tng_default.bin\n  \
+            zapp flash .build/zsa_voyager_tng_default.bin --device \"Voyager\"\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash voyager2_0.1.9.zsab --force\n  \
             zapp flash voyager2_0.1.9.zsab --device \"Voyager\"\n  \
@@ -92,32 +97,6 @@ enum Commands {
         #[arg(long)]
         scan: bool,
     },
-    /// Flash the keyboard's own (QMK) firmware over Bluetooth
-    #[command(
-        long_about = "Flash the keyboard's own firmware over Bluetooth.\n\n\
-            A Voyager 2 has two chips. `zapp flash <file.zsab>` updates the \
-            wireless one; this updates the other — the STM32 that runs QMK, \
-            scans the matrix and drives the LEDs. The image goes over ZSA's \
-            own update service on the left half, which relays it to the STM32 \
-            over the wire between them and into the ignition bootloader.\n\n\
-            The board must already be bonded to this machine: pairing is the \
-            desktop's job. The firmware is a plain .bin — what `qmk compile` \
-            leaves in .build, or what Oryx hands you.\n\n\
-            The STM32 has to be in its bootloader before anything is written. \
-            `zapp dfu flash` checks first and only reboots it if it is not, so \
-            a keyboard already sitting there is written straight away — \
-            including one you put there yourself with the reset button.",
-        after_long_help = "Examples:\n  \
-            zapp dfu flash voyager2_default.bin\n  \
-            zapp dfu flash .build/zsa_voyager_tng_fdprod.bin --device \"Voyager\"\n  \
-            zapp dfu status\n  \
-            zapp dfu enter\n  \
-            zapp dfu abort"
-    )]
-    Dfu {
-        #[command(subcommand)]
-        command: DfuCommands,
-    },
     /// Pair the two halves by provisioning their shared ESB key over the cable
     #[command(
         long_about = "Provision the ESB pairing key onto both halves over the cable.\n\n\
@@ -145,43 +124,6 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum DfuCommands {
-    /// Write a QMK .bin into the keyboard's STM32
-    #[command(after_long_help = "The image is written straight into the STM32's \
-        application region and the chip is restarted onto it. Nothing is kept \
-        in reserve and there is no going back to the old firmware, the same as \
-        flashing over USB — but the image is checksummed on the way in, and an \
-        STM32 that does not like what it got stays in its bootloader rather \
-        than booting it.")]
-    Flash {
-        /// Path to a QMK firmware .bin
-        firmware: PathBuf,
-        #[command(flatten)]
-        args: DfuArgs,
-    },
-    /// Say whether the STM32 is in its bootloader
-    Status(DfuArgs),
-    /// Reboot the STM32 into its bootloader and leave it there
-    Enter(DfuArgs),
-    /// Drop a transfer that was left open, and release the update lock
-    Abort(DfuArgs),
-}
-
-#[derive(clap::Args)]
-struct DfuArgs {
-    /// Which board, by advertised name or by the handle `zapp devices` shows
-    #[arg(long, short = 'd')]
-    device: Option<String>,
-    /// Bytes of image per Bluetooth write. Defaults to what the link
-    /// negotiated: the ATT MTU less its 3-byte header.
-    #[arg(long)]
-    chunk: Option<usize>,
-    /// Seconds to wait for the STM32 to reach its bootloader
-    #[arg(long, default_value_t = 30)]
-    wait: u64,
 }
 
 /// Everything about reaching a board that does not say which half.
@@ -235,32 +177,15 @@ fn main() -> Result<()> {
             force,
             device,
         } => {
-            if zapp_oryx::is_oryx_url(&firmware) {
+            let result = if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
             } else {
                 cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
-            }
+            };
+            with_dfu_advice(result)
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
-        Commands::Dfu { command } => {
-            let result = match command {
-                DfuCommands::Flash { firmware, args } => cmd_dfu_flash(&firmware, &args),
-                DfuCommands::Status(args) => cmd_dfu_status(&args),
-                DfuCommands::Enter(args) => cmd_dfu_enter(&args),
-                DfuCommands::Abort(args) => cmd_dfu_abort(&args),
-            };
-            // The board's own reasons come back as a code and a sentence; the
-            // paragraph that says what to do about one is worth more than the
-            // line the error chain gives it.
-            if let Err(err) = &result
-                && let Some(advice) = dfu_advice(err)
-            {
-                println!();
-                println!("{advice}");
-            }
-            result
-        }
         Commands::Bond { key, show } => {
             if show {
                 if key.is_some() {
@@ -570,15 +495,53 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
         // suggest otherwise.
         println!("--force only applies to .zsab bundles; a keyboard image is always written.");
     }
-    if device.is_some() {
-        // Same: a keyboard image goes over USB, where there is nothing to pick
-        // between.
-        println!("--device only applies to .zsab bundles going over Bluetooth.");
-    }
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
     print_firmware_info(&fw);
+
+    // A Voyager 2 image can go either way, so it picks; everything else is a
+    // wired update and has nothing to pick between.
+    if let Firmware::DfuBinary { data, pid, .. } = &fw
+        && is_voyager2_image(*pid)
+    {
+        return flash_voyager2_image(&fw, data, device);
+    }
+
+    if device.is_some() {
+        println!(
+            "--device only applies to firmware going over Bluetooth: .zsab bundles \
+             and Voyager 2 keyboard images."
+        );
+    }
     wait_and_flash(&fw)
+}
+
+/// Whether a DFU suffix names a Voyager 2, either revision.
+fn is_voyager2_image(pid: u16) -> bool {
+    matches!(pid, 0x1978 | 0x0792)
+}
+
+/// A Voyager 2 keyboard image, over whichever way the keyboard is reachable.
+///
+/// The same choice a bundle makes, for the same reasons: the cable whenever the
+/// Voyager 2 is on it, Bluetooth only for a keyboard that is not plugged in at
+/// all. Over the cable `named` is ignored, as there is only ever one keyboard
+/// plugged in.
+fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
+    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
+        return wait_and_flash(fw);
+    }
+
+    println!("No Voyager 2 on USB — going over Bluetooth.");
+    let result = flash_over_ble(data, named);
+    if result.is_err() {
+        println!();
+        println!(
+            "If you meant to update over the cable, press the reset button on \
+             the left half to put the keyboard in its bootloader and run this again."
+        );
+    }
+    result
 }
 
 /// A bundle, over whichever way the keyboard is reachable.
@@ -814,16 +777,13 @@ pub fn smp_connect(args: &LinkArgs, half: Half) -> Result<SmpClient> {
     Ok(client)
 }
 
-/// Connects to the update service on the board these arguments name.
-fn dfu_connect(args: &DfuArgs) -> Result<DfuClient> {
+/// Connects to the update service on the board `device` names.
+fn dfu_connect(device: Option<&str>) -> Result<DfuClient> {
     let spinner = new_spinner("Connecting over Bluetooth...");
-    let client = dfu::open(args.device.as_deref());
+    let client = dfu::open(device);
     spinner.finish_and_clear();
 
-    let mut client = client.context("Could not reach the keyboard over Bluetooth")?;
-    if let Some(chunk) = args.chunk {
-        client = client.with_chunk(chunk);
-    }
+    let client = client.context("Could not reach the keyboard over Bluetooth")?;
     log::debug!("connected, {} bytes of image per write", client.chunk());
     Ok(client)
 }
@@ -835,59 +795,51 @@ fn dfu_advice(err: &anyhow::Error) -> Option<&'static str> {
         .and_then(DfuError::advice)
 }
 
-fn cmd_dfu_flash(path: &Path, args: &DfuArgs) -> Result<()> {
-    let file =
-        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let image = firmware::load_raw_image(&file)
-        .with_context(|| format!("{} is not a firmware image this can flash", path.display()))?;
-
-    if image.data.is_empty() {
-        bail!("{} has no firmware in it", path.display());
+/// Passes a result through, saying what to do about a refusal the board itself
+/// raised. The board's own reasons come back as a code and a sentence; the
+/// paragraph that says what to do about one is worth more than the line the
+/// error chain gives it.
+fn with_dfu_advice(result: Result<()>) -> Result<()> {
+    if let Err(err) = &result
+        && let Some(advice) = dfu_advice(err)
+    {
+        println!();
+        println!("{advice}");
     }
+    result
+}
+
+/// Seconds to give the STM32 to reach its bootloader, when nobody said
+/// otherwise.
+const BLE_BOOTLOADER_WAIT: Duration = Duration::from_secs(30);
+
+/// A keyboard image into the STM32, over ZSA's update service on the left half,
+/// which relays it over the wire between the chips into the ignition bootloader.
+fn flash_over_ble(image: &[u8], device: Option<&str>) -> Result<()> {
     // Refused here rather than by the keyboard: the board answers this with one
-    // error byte, and the sentence that names the file and both figures is the
-    // one that says what to do about it.
-    if image.data.len() > dfu::MAX_IMAGE {
+    // error byte, and the sentence that carries both figures is the one that
+    // says what to do about it.
+    if image.len() > dfu::MAX_IMAGE {
         bail!(
-            "{} is {} bytes, and the STM32's application region holds {} ({} KiB). \
+            "This image is {} bytes, and the STM32's application region holds {} ({} KiB). \
              This is a firmware built for another keyboard, or one built to run \
              without the ignition bootloader under it.",
-            path.display(),
-            image.data.len(),
+            image.len(),
             dfu::MAX_IMAGE,
             dfu::MAX_IMAGE / 1024
         );
     }
 
-    println!(
-        "Firmware: {} bytes{}",
-        image.data.len(),
-        match image.pid {
-            Some(pid) => format!(" · {}", target_name_for_pid(pid)),
-            None => String::new(),
-        }
-    );
-    println!("CRC-32:   {:08x}", dfu::crc32(image.data));
-    // Not fatal, because nothing here can prove what is on the other end of the
-    // radio — but a Voyager image on a Voyager 2 is a keyboard that comes back
-    // in its bootloader, and the file said which one it was for.
-    if let Some(pid) = image.pid
-        && !matches!(pid, 0x1978 | 0x0792)
-    {
-        println!(
-            "Warning: this firmware says it is for a {}, and this command flashes a \
-             Voyager 2.",
-            target_name_for_pid(pid)
-        );
-    }
+    println!("Firmware: {} bytes", image.len());
+    println!("CRC-32:   {:08x}", dfu::crc32(image));
 
-    let mut client = dfu_connect(args)?;
+    let mut client = dfu_connect(device)?;
     println!();
     client
-        .make_ready(Duration::from_secs(args.wait), &report_wait)
+        .make_ready(BLE_BOOTLOADER_WAIT, &report_wait)
         .context("The STM32 is not in its bootloader, so nothing was written")?;
 
-    let pb = ProgressBar::new(image.data.len() as u64);
+    let pb = ProgressBar::new(image.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("⚡ {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}")
@@ -896,7 +848,7 @@ fn cmd_dfu_flash(path: &Path, args: &DfuArgs) -> Result<()> {
     );
 
     let started = Instant::now();
-    let result = client.flash(image.data, &|progress| match progress {
+    let result = client.flash(image, &|progress| match progress {
         FlashProgress::Erasing { bytes_erased, .. } => {
             pb.set_message(match bytes_erased {
                 0 => "Erasing...",
@@ -916,9 +868,9 @@ fn cmd_dfu_flash(path: &Path, args: &DfuArgs) -> Result<()> {
     let took = started.elapsed();
     println!(
         "Wrote {} bytes in {:.1} s ({:.1} KiB/s).",
-        image.data.len(),
+        image.len(),
         took.as_secs_f64(),
-        image.data.len() as f64 / took.as_secs_f64() / 1024.0
+        image.len() as f64 / took.as_secs_f64() / 1024.0
     );
     println!("The STM32 accepted the image and is restarting on it.");
     Ok(())
@@ -935,47 +887,6 @@ fn report_wait(wait: Wait) {
         ),
         Wait::Arrived(waited) => println!("  in the bootloader after {} s", waited.as_secs()),
     }
-}
-
-fn cmd_dfu_status(args: &DfuArgs) -> Result<()> {
-    let report = dfu_connect(args)?
-        .query()
-        .context("Could not ask the keyboard what the STM32 is doing")?;
-
-    println!(
-        "STM32: {}",
-        match report.status.in_bootloader() {
-            true => "in the ignition bootloader, ready to be flashed",
-            false => "running its own firmware",
-        }
-    );
-    println!("  the board reports {}", report.status);
-    if report.fault != dfu::Fault::None {
-        println!("  {}", report.fault);
-    }
-    if let Some(received) = report.received.filter(|received| *received > 0) {
-        println!("  {received} bytes of a transfer have reached it");
-    }
-    Ok(())
-}
-
-fn cmd_dfu_enter(args: &DfuArgs) -> Result<()> {
-    let mut client = dfu_connect(args)?;
-    client
-        .make_ready(Duration::from_secs(args.wait), &report_wait)
-        .context("The STM32 never reached its bootloader")?;
-    println!();
-    println!("Ready. `zapp dfu flash <firmware.bin>` writes an image into it.");
-    Ok(())
-}
-
-fn cmd_dfu_abort(args: &DfuArgs) -> Result<()> {
-    let report = dfu_connect(args)?
-        .abort()
-        .context("Could not drop the transfer")?;
-    println!("The board reports {}.", report.status);
-    println!("Nothing holds the update lock now.");
-    Ok(())
 }
 
 fn wait_and_flash(fw: &Firmware) -> Result<()> {
