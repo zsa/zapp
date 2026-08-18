@@ -322,9 +322,8 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     progress.left_pending = pending(Half::Left);
     progress.right_pending = pending(Half::Right);
 
-    // Whether a half is already running the bundle's image and keeping it, and
-    // whether its upload is followed by a mark and a restart. See `swaps_after`.
-    let settled = |wanted: Half| step_of(&installed, wanted) == Step::Installed;
+    // Whether a half's upload is followed by a mark and a restart. See
+    // `swaps_after`.
     let swaps = |wanted: Half| swaps_after(step_of(&plan, wanted), step_of(&installed, wanted));
 
     let uploads = plan.iter().filter(|(_, step)| *step == Step::Upload).count();
@@ -431,81 +430,54 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         }
     }
 
-    // ---- Wait for them to come back --------------------------------------
+    // ---- Read both, then keep both, or put both back ---------------------
     //
     // The left first, and only now: between the right's restart and the left's
     // the two halves are on different firmware and cannot talk to each other, so
     // the right is unreachable for that whole stretch. Which is why the right is
-    // only *checked* here rather than kept as it went — nothing is confirmed
-    // until both halves have been seen back on the images they were written, and
-    // then either both are kept in one pass or neither is. A half that was left
-    // unswapped is already confirmed on the bundle's image — that is exactly what
-    // made it unswappable — so it has nothing outstanding. Seeded from `settled`
-    // rather than from `swaps`: a half running its image on an unconfirmed test
-    // boot is not uploaded to either, and that one does still need confirming.
-    let mut confirmed = [
-        (Half::Right, settled(Half::Right)),
-        (Half::Left, settled(Half::Left)),
-    ];
-    // What each half is actually carrying, for the cross-half check below.
-    // Seeded from the reads at the top and replaced for every half that came
-    // back from a restart.
-    let mut running = [
+    // only *read* here rather than kept as it went — nothing is confirmed until
+    // both halves have been read back on the images they were written, and then
+    // either both are kept in one pass or neither is. This is the *same*
+    // decision the wired path makes, through the one [`crate::confirm::settle`].
+    //
+    // What each half is carrying, seeded from the reads at the top and replaced
+    // for every half that comes back from a restart; and the same kept as read,
+    // for the revert to put back.
+    let running = vec![
         (Half::Left, active_hash(&left_slots)),
         (Half::Right, active_hash(&right_slots)),
     ];
-    // The same, kept as it was read: what a revert has to put back.
     let before = running.clone();
-    let mut landed: Vec<(Half, Landed)> = Vec::new();
+
+    // The halves to read (those that restarted, so their running image is in
+    // doubt) and the halves to keep (everything not already installed and
+    // confirmed). A half running its image on an unconfirmed boot is kept
+    // without being re-read; a half that only rebooted is read but may come back
+    // already confirmed, in which case it is not committed again.
+    let read: Vec<Half> = [Half::Left, Half::Right]
+        .into_iter()
+        .filter(|half| restarted(*progress, *half))
+        .collect();
+    let keep: Vec<Half> = plan
+        .iter()
+        .filter(|(_, step)| *step != Step::Installed)
+        .map(|(half, _)| *half)
+        .collect();
+
     if restarting {
         steps.announce("Waiting for the halves to come back");
-        for half in [Half::Left, Half::Right] {
-            if !restarted(*progress, half) {
-                continue;
-            }
-            let hash = bundle.hash(half).unwrap_or_default();
-            let verdict = wait_for_boot(link, half, &hash);
-            match &verdict {
-                Landed::Ok { confirmed: back, active } => {
-                    if let Some(slot) = confirmed.iter_mut().find(|(which, _)| *which == half) {
-                        slot.1 = *back;
-                    }
-                    if let Some(slot) = running.iter_mut().find(|(which, _)| *which == half) {
-                        slot.1 = active.clone();
-                    }
-                }
-                Landed::Wrong { active, .. } => {
-                    if let Some(slot) = running.iter_mut().find(|(which, _)| *which == half) {
-                        slot.1 = active.clone();
-                    }
-                }
-                Landed::Gone { .. } => {}
-            }
-            landed.push((half, verdict));
-        }
     }
-
-    // ---- Keep it, or put it all back --------------------------------------
-    //
-    // One decision for the pair. Each half has only been checked against the
-    // bundle on its own so far, and a run that finished one and left the other
-    // on what it had is two builds on one keyboard — the halves cannot talk to
-    // each other in that state, so it counts as a failure like a missing half
-    // does.
     progress.settled = true;
-    let mismatch = both_on_the_bundle(bundle, &running)
-        .err()
-        .map(|err| err.to_string());
-    progress.mismatched = mismatch.is_some();
-    match decide(&landed, mismatch) {
-        Decision::Keep => {
-            if confirming {
-                keep_both(link, bundle, &plan, &confirmed, &mut steps)?;
-            }
-        }
-        Decision::Revert { reasons } => {
-            return Err(revert_both(link, &landed, &reasons, &before, progress));
-        }
+    {
+        let mut pair = BleConfirm {
+            link,
+            bundle,
+            steps: &mut steps,
+            progress: &mut *progress,
+            running,
+            before,
+        };
+        crate::confirm::settle(&mut pair, &read, &keep)?;
     }
 
     // ---- Let the session go ---------------------------------------------
@@ -1029,122 +1001,149 @@ fn confirm(link: &LinkArgs, half: Half, hash: &[u8], already: bool) -> Result<()
         .with_context(|| format!("Could not confirm the {half} half's image"))
 }
 
-/// Confirms both halves, the right first.
+/// The Bluetooth side of [`crate::confirm::PairConfirm`].
 ///
-/// The right is the harder of the two to reach — everything to it goes through
-/// the left's relay — so it goes first: if it cannot be confirmed, the left is
-/// still unconfirmed and still revertable. Confirming the left first would spend
-/// its way back on the half most likely to fail.
-fn keep_both(
-    link: &LinkArgs,
-    bundle: &Bundle,
-    plan: &[(Half, Step)],
-    confirmed: &[(Half, bool)],
-    steps: &mut Steps,
-) -> Result<()> {
-    steps.announce("Keeping the new firmware on both halves");
-    for (half, step) in plan {
-        if *step == Step::Installed {
-            continue;
-        }
-        let hash = bundle
-            .hash(*half)
-            .with_context(|| format!("The bundle's {half} image carries no hash"))?;
-        let already = confirmed.iter().any(|(which, done)| which == half && *done);
-        confirm(link, *half, &hash, already)?;
-    }
-    Ok(())
+/// `running` is the wait-for-reboot read the run already did; `commit` is the
+/// `mark(hash, true)` that keeps an image. The right is confirmed before the
+/// left — everything to the right goes through the left's relay, so if the
+/// right cannot be kept the left is still unconfirmed and still revertable.
+struct BleConfirm<'a> {
+    link: &'a LinkArgs,
+    bundle: &'a Bundle,
+    steps: &'a mut Steps,
+    progress: &'a mut Progress,
+    /// What each half is carrying, replaced for every half that comes back from
+    /// a restart. The mismatch check reads this.
+    running: Vec<(Half, Vec<u8>)>,
+    /// The same, kept as it was read at the top of the run: what a revert puts
+    /// back.
+    before: Vec<(Half, Vec<u8>)>,
 }
 
-/// Puts both halves back on what they were running, and says so.
-///
-/// Nothing has been confirmed at this point, so a reset is the whole of the
-/// revert: MCUboot puts the old image back on an unconfirmed one, and the
-/// firmware's reset gate only holds a reset for an image marked for test or
-/// permanent. A half that is [`Landed::Gone`] cannot be reset from here at all,
-/// and is named in the message instead — a power cycle reverts it just the same.
-fn revert_both(
-    link: &LinkArgs,
-    landed: &[(Half, Landed)],
-    reasons: &[String],
-    before: &[(Half, Vec<u8>)],
-    progress: &mut Progress,
-) -> anyhow::Error {
-    // Nothing was restarted, so nothing was staged and there is nothing to put
-    // back — the halves are as they were found. Only reachable from a pair that
-    // read as mismatched before anything was touched.
-    if landed.is_empty() {
-        return anyhow::anyhow!("{}", reasons.join(" "));
+impl crate::confirm::PairConfirm for BleConfirm<'_> {
+    fn running(&mut self, half: Half) -> Landed {
+        let hash = self.bundle.hash(half).unwrap_or_default();
+        let verdict = wait_for_boot(self.link, half, &hash);
+        // Keep the running-hash table current for the mismatch check.
+        match &verdict {
+            Landed::Ok { active, .. } | Landed::Wrong { active, .. } => {
+                if let Some(slot) = self.running.iter_mut().find(|(which, _)| *which == half) {
+                    slot.1 = active.clone();
+                }
+            }
+            Landed::Gone { .. } => {}
+        }
+        verdict
     }
 
-    println!();
-    println!("Putting both halves back on the firmware they were running");
-    for reason in reasons {
-        println!("  {}", wrap(reason).replace('\n', "\n  "));
+    fn mismatch(&mut self, _landed: &[(Half, Landed)]) -> Option<String> {
+        let mismatch = both_on_the_bundle(self.bundle, &self.running)
+            .err()
+            .map(|err| err.to_string());
+        self.progress.mismatched = mismatch.is_some();
+        mismatch
     }
 
-    // Right then left, the same order everything else touches them in, with the
-    // relay's lock given time to lapse between the two.
-    for half in [Half::Right, Half::Left] {
-        let Some((_, verdict)) = landed.iter().find(|(which, _)| *which == half) else {
-            continue;
-        };
-        if matches!(verdict, Landed::Gone { .. }) {
-            println!("  {half}: cannot be reached, so it cannot be reset from here");
-            continue;
-        }
-        match smp_connect(link, half).and_then(|mut client| Ok(client.reset()?)) {
-            Ok(()) => println!("  {half}: restarting, which puts its old firmware back"),
-            Err(err) => println!("  {half}: could not be restarted ({err:#})"),
-        }
-        if half == Half::Right {
-            thread::sleep(RELAY_SETTLE);
-        }
+    fn commit(&mut self, half: Half) -> Result<()> {
+        let hash = self
+            .bundle
+            .hash(half)
+            .with_context(|| format!("The bundle's {half} image carries no hash"))?;
+        confirm(self.link, half, &hash, false)
     }
 
-    // The left first this time: it is reachable directly, and the right is only
-    // reachable through it once both are back on the same build.
-    let mut restored: Vec<(Half, bool)> = Vec::new();
-    for half in [Half::Left, Half::Right] {
-        if !landed.iter().any(|(which, _)| *which == half) {
-            continue;
+    fn revert(&mut self, half: Half) -> Result<()> {
+        smp_connect(self.link, half).and_then(|mut client| Ok(client.reset()?))
+    }
+
+    fn keeping(&mut self) {
+        self.steps.announce("Keeping the new firmware on both halves");
+    }
+
+    /// Puts both halves back on what they were running, and says so.
+    ///
+    /// Nothing has been confirmed at this point, so a reset is the whole of the
+    /// revert: MCUboot puts the old image back on an unconfirmed one. A half
+    /// that is [`Landed::Gone`] cannot be reset from here and is named in the
+    /// message instead — a power cycle reverts it just the same.
+    fn revert_pair(&mut self, landed: Vec<(Half, Landed)>, reasons: Vec<String>) -> anyhow::Error {
+        // Nothing was restarted, so nothing was staged and there is nothing to
+        // put back — the halves are as they were found. Only reachable from a
+        // pair that read as mismatched before anything was touched.
+        if landed.is_empty() {
+            return anyhow::anyhow!("{}", reasons.join(" "));
         }
-        let was = before
+
+        println!();
+        println!("Putting both halves back on the firmware they were running");
+        for reason in &reasons {
+            println!("  {}", wrap(reason).replace('\n', "\n  "));
+        }
+
+        // Right then left, the same order everything else touches them in, with
+        // the relay's lock given time to lapse between the two.
+        for half in [Half::Right, Half::Left] {
+            let Some((_, verdict)) = landed.iter().find(|(which, _)| *which == half) else {
+                continue;
+            };
+            if matches!(verdict, Landed::Gone { .. }) {
+                println!("  {half}: cannot be reached, so it cannot be reset from here");
+                continue;
+            }
+            match self.revert(half) {
+                Ok(()) => println!("  {half}: restarting, which puts its old firmware back"),
+                Err(err) => println!("  {half}: could not be restarted ({err:#})"),
+            }
+            if half == Half::Right {
+                thread::sleep(RELAY_SETTLE);
+            }
+        }
+
+        // The left first this time: it is reachable directly, and the right is
+        // only reachable through it once both are back on the same build.
+        let before = self.before.clone();
+        let mut restored: Vec<(Half, bool)> = Vec::new();
+        for half in [Half::Left, Half::Right] {
+            if !landed.iter().any(|(which, _)| *which == half) {
+                continue;
+            }
+            let was = before
+                .iter()
+                .find(|(which, _)| *which == half)
+                .map(|(_, hash)| hash.clone())
+                .unwrap_or_default();
+            let back = wait_for_boot(self.link, half, &was);
+            if !matches!(back, Landed::Ok { .. }) {
+                println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
+            }
+            restored.push((half, matches!(back, Landed::Ok { .. })));
+        }
+
+        let summary = reasons.join(" ");
+        if restored.iter().all(|(_, back)| *back) {
+            self.progress.reverted = true;
+            return anyhow::anyhow!(
+                "The update did not work out, so both halves were put back on the firmware they \
+                 were running before it. The keyboard is working and is exactly as it was; \
+                 nothing was kept. {summary}"
+            );
+        }
+
+        self.progress.revert_failed = true;
+        let where_each: Vec<String> = restored
             .iter()
-            .find(|(which, _)| *which == half)
-            .map(|(_, hash)| hash.clone())
-            .unwrap_or_default();
-        let back = wait_for_boot(link, half, &was);
-        if !matches!(back, Landed::Ok { .. }) {
-            println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
-        }
-        restored.push((half, matches!(back, Landed::Ok { .. })));
+            .map(|(half, back)| match back {
+                true => format!("the {half} half is back on the firmware it had"),
+                false => format!("the {half} half could not be seen back on it"),
+            })
+            .collect();
+        anyhow::anyhow!(
+            "The update did not work out, and putting both halves back did not finish either: {}. \
+             The keyboard may be on two different builds, in which case the halves cannot talk to \
+             each other. {summary}",
+            where_each.join(", ")
+        )
     }
-
-    let summary = reasons.join(" ");
-    if restored.iter().all(|(_, back)| *back) {
-        progress.reverted = true;
-        return anyhow::anyhow!(
-            "The update did not work out, so both halves were put back on the firmware they \
-             were running before it. The keyboard is working and is exactly as it was; nothing \
-             was kept. {summary}"
-        );
-    }
-
-    progress.revert_failed = true;
-    let where_each: Vec<String> = restored
-        .iter()
-        .map(|(half, back)| match back {
-            true => format!("the {half} half is back on the firmware it had"),
-            false => format!("the {half} half could not be seen back on it"),
-        })
-        .collect();
-    anyhow::anyhow!(
-        "The update did not work out, and putting both halves back did not finish either: {}. \
-         The keyboard may be on two different builds, in which case the halves cannot talk to \
-         each other. {summary}",
-        where_each.join(", ")
-    )
 }
 
 /// Keep both halves, or put both back.

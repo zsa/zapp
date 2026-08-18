@@ -1,3 +1,4 @@
+mod confirm;
 mod nrf_wired;
 mod zsab;
 

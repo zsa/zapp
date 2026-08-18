@@ -267,6 +267,18 @@ impl ConfirmState {
     }
 }
 
+/// Which job a [`REQ_CONFIRM`] asks of the half.
+///
+/// Carried in the high byte of `wValue`; the low byte stays the half (1 left,
+/// 2 right) and `wIndex` is left as the interface recipient it already is.
+/// READ reports the running hash and writes nothing; COMMIT writes the trailer
+/// if the running hash still matches the expected one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmMode {
+    Read = 0,
+    Commit = 1,
+}
+
 /// How the exchange itself went, which is ignition's answer rather than the
 /// target's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +309,7 @@ impl ConfirmRc {
 /// [`ConfirmState::Done`] with [`ConfirmRc::Ok`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmStatus {
-    /// The hash matched and the trailer is now confirmed.
+    /// COMMIT: the hash matched and the trailer is now confirmed.
     Ok,
     /// The hash matched and it was already confirmed.
     Already,
@@ -305,8 +317,10 @@ pub enum ConfirmStatus {
     Mismatch,
     /// It could not read the hash of what it is running.
     Unreadable,
-    /// The hash matched and the trailer write failed.
+    /// COMMIT: the hash matched and the trailer write failed.
     WriteFail,
+    /// READ: it is running the reported image, not confirmed, nothing written.
+    Running,
     Unrecognised(u8),
 }
 
@@ -318,6 +332,7 @@ impl ConfirmStatus {
             0x02 => Self::Mismatch,
             0x03 => Self::Unreadable,
             0x04 => Self::WriteFail,
+            0x05 => Self::Running,
             other => Self::Unrecognised(other),
         }
     }
@@ -525,13 +540,22 @@ impl<L: IgnitionLink> Ignition<L> {
     /// `hash` may be longer than the [`CONFIRM_HASH_LEN`] bytes that go on the
     /// wire, because the images are hashed with SHA-512 and both ends compare
     /// the same leading prefix. Anything shorter is refused rather than padded.
-    pub fn confirm_start(&mut self, half: Half, hash: &[u8]) -> Result<(), WiredError> {
+    ///
+    /// `mode` rides in the high byte of `wValue` and the half in the low byte,
+    /// so [`ConfirmMode::Read`] leaves the value at the plain half number.
+    pub fn confirm_start(
+        &mut self,
+        half: Half,
+        mode: ConfirmMode,
+        hash: &[u8],
+    ) -> Result<(), WiredError> {
         if hash.len() < CONFIRM_HASH_LEN {
             return Err(WiredError::ShortHash { got: hash.len() });
         }
-        log::debug!("CONFIRM {half}");
+        log::debug!("CONFIRM {half} {mode:?}");
+        let value = ((mode as u16) << 8) | half_value(half);
         self.link
-            .control_out_data(REQ_CONFIRM, half_value(half), &hash[..CONFIRM_HASH_LEN])
+            .control_out_data(REQ_CONFIRM, value, &hash[..CONFIRM_HASH_LEN])
     }
 
     /// One read of the queued confirm's result block.
@@ -1163,32 +1187,47 @@ mod tests {
     }
 
     #[test]
-    fn a_confirm_goes_out_as_the_half_number_and_thirty_two_bytes_of_hash() {
+    fn a_read_carries_the_half_alone_and_a_commit_carries_the_mode_in_the_high_byte() {
         let hash: Vec<u8> = (0..64u8).collect();
         let mut ignition = Ignition::new(Recorder::default());
-        ignition.confirm_start(Half::Right, &hash).unwrap();
-        ignition.confirm_start(Half::Left, &hash).unwrap();
+        ignition
+            .confirm_start(Half::Right, ConfirmMode::Read, &hash)
+            .unwrap();
+        ignition
+            .confirm_start(Half::Left, ConfirmMode::Read, &hash)
+            .unwrap();
+        ignition
+            .confirm_start(Half::Right, ConfirmMode::Commit, &hash)
+            .unwrap();
+        ignition
+            .confirm_start(Half::Left, ConfirmMode::Commit, &hash)
+            .unwrap();
 
         let link = ignition.into_link();
+        // Low byte is the half (1 left, 2 right), high byte the mode (0 READ,
+        // 1 COMMIT), so a READ is the plain half number and a COMMIT is 0x01xx.
         assert_eq!(
             link.control,
-            vec![(REQ_CONFIRM, 2), (REQ_CONFIRM, 1)],
-            "1 is left and 2 is right, the same as SELECT"
-        );
-        // The leading 32 of a SHA-512, which is the prefix both ends compare.
-        assert_eq!(
-            link.wrote,
             vec![
-                (REQ_CONFIRM, 2, hash[..32].to_vec()),
-                (REQ_CONFIRM, 1, hash[..32].to_vec()),
-            ]
+                (REQ_CONFIRM, 0x0002),
+                (REQ_CONFIRM, 0x0001),
+                (REQ_CONFIRM, 0x0102),
+                (REQ_CONFIRM, 0x0101),
+            ],
         );
+        // Every one carries the leading 32 of a SHA-512, whatever the mode.
+        assert!(link
+            .wrote
+            .iter()
+            .all(|(_, _, data)| *data == hash[..32].to_vec()));
     }
 
     #[test]
     fn a_hash_too_short_to_name_an_image_is_refused_before_it_goes_out() {
         let mut ignition = Ignition::new(Recorder::default());
-        let err = ignition.confirm_start(Half::Left, &[0x11; 31]).unwrap_err();
+        let err = ignition
+            .confirm_start(Half::Left, ConfirmMode::Read, &[0x11; 31])
+            .unwrap_err();
         assert!(matches!(err, WiredError::ShortHash { got: 31 }), "{err:?}");
         assert!(ignition.into_link().control.is_empty());
     }
@@ -1246,6 +1285,7 @@ mod tests {
             (0x02, false),   // a different image is running
             (0x03, false),   // it could not read its own hash
             (0x04, false),   // the trailer write failed
+            (0x05, false),   // READ: running it, not confirmed
             (0x77, false),   // a code from a newer firmware
         ] {
             let parsed = ConfirmResult::parse(&confirm_bytes(2, 0, code, 1, &[])).unwrap();
@@ -1288,7 +1328,7 @@ mod tests {
             }
         }
         let err = Ignition::new(NoData)
-            .confirm_start(Half::Left, &[0x11; 32])
+            .confirm_start(Half::Left, ConfirmMode::Read, &[0x11; 32])
             .unwrap_err();
         assert!(
             matches!(err, WiredError::Request { request: REQ_CONFIRM, .. }),
@@ -1334,7 +1374,9 @@ mod tests {
 
         let link = Retrying::with_policy(StallOnce::default(), CONTROL_ATTEMPTS, Duration::ZERO);
         let mut ignition = Ignition::new(link);
-        ignition.confirm_start(Half::Right, &[0x5a; 32]).unwrap();
+        ignition
+            .confirm_start(Half::Right, ConfirmMode::Commit, &[0x5a; 32])
+            .unwrap();
         assert_eq!(
             ignition.into_link().into_inner().wrote,
             vec![vec![0x5a; 32], vec![0x5a; 32]]

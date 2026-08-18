@@ -20,7 +20,8 @@ use zapp_smp::proto::Reassembler as FrameReassembler;
 use zapp_smp::{Half, SmpTransport, TransportError};
 
 use crate::ignition::{
-    Ignition, IgnitionLink, CONFIRM_HASH_LEN, CONFIRM_RESULT_LEN, STATUS_LEN, STATUS_VERSION,
+    ConfirmMode, Ignition, IgnitionLink, CONFIRM_HASH_LEN, CONFIRM_RESULT_LEN, STATUS_LEN,
+    STATUS_VERSION,
 };
 use crate::pipe::{self, Event, EventCode, Outbound, Target};
 use crate::transport::{LeftTransport, RightTransport};
@@ -32,31 +33,38 @@ const PACKET: usize = 64;
 /// The largest frame the in-memory device will reassemble.
 const DEVICE_CAPACITY: usize = 2475;
 
-/// What an in-memory half answers a confirm query with.
+/// The state of an in-memory half, from which its confirm answers are derived.
 ///
 /// The confirm tunnel is not SMP and never reaches [`FakeDevice`]: ignition
 /// asks the half's *application* over the UART or the TRRS mailbox, so from the
-/// host's side it is only two vendor requests and a 36-byte block. This is that
-/// block, per half. The default is a half running exactly what the host named
-/// and keeping it.
+/// host's side it is only two vendor requests and a 36-byte block. This models
+/// the half the two requests reach: a READ reports what it is running and
+/// writes nothing; a COMMIT writes the trailer if the running hash matches the
+/// one the host named. The default is a half running exactly what the host
+/// expects, not yet confirmed.
 #[derive(Debug, Clone, Default)]
 pub struct ConfirmAnswer {
     /// `enum confirm_rc`: 0 is an exchange that completed, 1 a target that
-    /// never answered, 2 a query that never reached it.
+    /// never answered, 2 a query that never reached it. Applies to both modes.
     pub rc: u8,
-    /// `enum zsa_confirm_status`: 0 confirmed, 1 already confirmed, 2 a
-    /// different image, 3 unreadable, 4 the trailer write failed.
-    pub status: u8,
     /// What the half reports it is running. `None` echoes the hash it was asked
     /// about, which is a half carrying exactly what the host expected.
     pub hash: Option<Vec<u8>>,
+    /// Whether the half's trailer is already confirmed.
+    pub confirmed: bool,
+    /// A COMMIT whose hash matches still fails to write its trailer.
+    pub write_fails: bool,
+    /// The half cannot read the hash of what it is running.
+    pub unreadable: bool,
 }
 
 /// The confirm exchange, as far as the host can see it.
 #[derive(Default)]
 struct Confirms {
-    /// Every `(half, hash)` the host asked about, in order.
-    asked: Vec<(Half, Vec<u8>)>,
+    /// Every `(half, hash)` a READ asked about, in order.
+    reads: Vec<(Half, Vec<u8>)>,
+    /// Every `(half, hash)` a COMMIT asked about, in order.
+    commits: Vec<(Half, Vec<u8>)>,
     left: ConfirmAnswer,
     right: ConfirmAnswer,
     /// The block the next CONFIRM_RESULT read answers with.
@@ -65,30 +73,75 @@ struct Confirms {
 
 impl Confirms {
     /// Answers a query the way ignition would once its exchange is done.
-    fn take(&mut self, half: Half, asked: &[u8]) {
-        self.asked.push((half, asked.to_vec()));
+    fn take(&mut self, half: Half, mode: ConfirmMode, asked: &[u8]) {
+        match mode {
+            ConfirmMode::Read => self.reads.push((half, asked.to_vec())),
+            ConfirmMode::Commit => self.commits.push((half, asked.to_vec())),
+        }
+
         let answer = match half {
-            Half::Left => self.left.clone(),
-            Half::Right => self.right.clone(),
+            Half::Left => &self.left,
+            Half::Right => &self.right,
         };
+        let rc = answer.rc;
+        let unreadable = answer.unreadable;
+        let write_fails = answer.write_fails;
+        let confirmed = answer.confirmed;
+        let running = answer.hash.clone().unwrap_or_else(|| asked.to_vec());
 
         let mut block = vec![0u8; CONFIRM_RESULT_LEN];
         block[0] = 2; // done
-        block[1] = answer.rc;
-        // A target that never answered reports no status and no hash, which is
-        // the 0xFF `confirm_start` leaves in place.
-        block[2] = match answer.rc {
-            0 => answer.status,
-            _ => 0xFF,
-        };
+        block[1] = rc;
         block[3] = match half {
             Half::Left => 1,
             Half::Right => 2,
         };
-        if answer.rc == 0 {
-            let hash = answer.hash.unwrap_or_else(|| asked.to_vec());
-            let len = hash.len().min(CONFIRM_HASH_LEN);
-            block[4..4 + len].copy_from_slice(&hash[..len]);
+
+        // A target that never answered reports no status and no hash, which is
+        // the 0xFF `confirm_start` leaves in place.
+        if rc != 0 {
+            block[2] = 0xFF;
+            self.result = block;
+            return;
+        }
+
+        let mut wrote_trailer = false;
+        let status: u8 = if unreadable {
+            0x03 // UNREADABLE
+        } else {
+            match mode {
+                // READ compares nothing and writes nothing.
+                ConfirmMode::Read => {
+                    if confirmed {
+                        0x01 // ALREADY
+                    } else {
+                        0x05 // RUNNING
+                    }
+                }
+                ConfirmMode::Commit => {
+                    if running != asked {
+                        0x02 // MISMATCH
+                    } else if confirmed {
+                        0x01 // ALREADY
+                    } else if write_fails {
+                        0x04 // WRITE_FAIL
+                    } else {
+                        wrote_trailer = true;
+                        0x00 // OK
+                    }
+                }
+            }
+        };
+        block[2] = status;
+        if !unreadable {
+            let len = running.len().min(CONFIRM_HASH_LEN);
+            block[4..4 + len].copy_from_slice(&running[..len]);
+        }
+        if wrote_trailer {
+            match half {
+                Half::Left => self.left.confirmed = true,
+                Half::Right => self.right.confirmed = true,
+            }
         }
         self.result = block;
     }
@@ -179,9 +232,25 @@ impl LoopbackDevice {
         change(&mut self.fake.lock().unwrap())
     }
 
-    /// Every confirm query the host sent, as `(half, hash)`.
+    /// Every READ query the host sent, as `(half, hash)`.
+    pub fn reads(&self) -> Vec<(Half, Vec<u8>)> {
+        self.confirms.lock().unwrap().reads.clone()
+    }
+
+    /// Every COMMIT query the host sent, as `(half, hash)`.
+    pub fn commits(&self) -> Vec<(Half, Vec<u8>)> {
+        self.confirms.lock().unwrap().commits.clone()
+    }
+
+    /// Every confirm query the host sent, reads then commits, as `(half, hash)`.
     pub fn confirms(&self) -> Vec<(Half, Vec<u8>)> {
-        self.confirms.lock().unwrap().asked.clone()
+        let confirms = self.confirms.lock().unwrap();
+        confirms
+            .reads
+            .iter()
+            .chain(confirms.commits.iter())
+            .cloned()
+            .collect()
     }
 
     /// What one half answers a confirm query with from now on.
@@ -330,13 +399,19 @@ impl IgnitionLink for LoopbackLink {
     ) -> Result<(), WiredError> {
         self.control.push((request, value));
         if request == crate::ignition::REQ_CONFIRM {
-            let half = match value {
+            // The half is the low byte and the mode the high byte of wValue.
+            let half = match value & 0xFF {
                 1 => Half::Left,
                 2 => Half::Right,
                 // The bootloader stalls anything else, and so does this.
                 _ => return Err(WiredError::Stalled { request }),
             };
-            self.confirms.lock().unwrap().take(half, data);
+            let mode = match value >> 8 {
+                0 => ConfirmMode::Read,
+                1 => ConfirmMode::Commit,
+                _ => return Err(WiredError::Stalled { request }),
+            };
+            self.confirms.lock().unwrap().take(half, mode, data);
         }
         Ok(())
     }
