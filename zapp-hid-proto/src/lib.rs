@@ -28,9 +28,11 @@ pub const CMD_SET_STATUS_LED: u8 = 0x07;
 pub const CMD_UPDATE_BRIGHTNESS: u8 = 0x08;
 pub const CMD_SET_RGB_ALL_LED: u8 = 0x09;
 pub const CMD_STATUS_LED_CONTROL: u8 = 0x0A;
+// 0x0B/0x0C are the firmware's ORYX_SET_AUTOMOUSE/ORYX_GET_AUTOMOUSE, unused by
+// zapp. Take opcodes from the firmware enum, never by counting down this list.
 /// Ask the board about itself: battery per half, what it can drive, what is
 /// plugged in. Answered with `EVT_TELEMETRY`.
-pub const CMD_GET_TELEMETRY: u8 = 0x0B;
+pub const CMD_GET_TELEMETRY: u8 = 0x0D;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -44,9 +46,11 @@ pub const EVT_KEY_PRESSED: u8 = 0x06;
 pub const EVT_KEY_RELEASED: u8 = 0x07;
 pub const EVT_TOGGLE_SMARTLAYER: u8 = 0x09;
 pub const EVT_TRIGGER_SMARTLAYER: u8 = 0x0A;
+// 0x0C is the firmware's ORYX_EVT_AUTOMOUSE, unused by zapp. Take opcodes from
+// the firmware enum, never by counting down this list.
 /// Answer to `CMD_GET_TELEMETRY`. Its payload is binary and fills the report,
 /// so it carries no STOP_BIT: a 0xFE inside it is data.
-pub const EVT_TELEMETRY: u8 = 0x0C;
+pub const EVT_TELEMETRY: u8 = 0x0D;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
