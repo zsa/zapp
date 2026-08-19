@@ -20,8 +20,7 @@ use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
-    BatteryReading, CMD_GET_TELEMETRY, ChargeState, Charging, HidConnection, HidEvent, Nav,
-    Source, Telemetry,
+    BatteryReading, CMD_GET_TELEMETRY, HidConnection, HidEvent, Nav, Source, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 
@@ -227,15 +226,6 @@ fn cmd_devices(scan: bool) -> Result<()> {
         Err(err) => println!("  cannot scan: {err}"),
     }
 
-    // Which models are plugged in, so a board listed twice can say which of
-    // its two entries is the live one.
-    let wired_models: Vec<_> = wired
-        .iter()
-        .flatten()
-        .filter(|device| device.bootloader.is_none())
-        .filter_map(|device| device.keyboard)
-        .collect();
-
     let monitor = BleMonitor::start(&[]);
     let wait = if scan { BLE_SCAN } else { BLE_SETTLE };
     let spinner = new_spinner("Looking for Bluetooth boards...");
@@ -258,10 +248,9 @@ fn cmd_devices(scan: bool) -> Result<()> {
             .unwrap_or_else(|| "ZSA keyboard".to_string());
         let known_as = board.name.unwrap_or_else(|| "unnamed".to_string());
         println!(
-            "  {name} · {} · {known_as:?}{}{}",
+            "  {name} · {} · {known_as:?}{}",
             state(board.presence),
             charge(board.battery),
-            also_wired(board.keyboard, &wired_models)
         );
     }
 
@@ -301,83 +290,54 @@ fn usb_telemetry(device: &UsbDevice) -> Option<Telemetry> {
     }
 }
 
-/// The lines under a wired board: what each half has left, where each reading
-/// came from, and what is plugged into it.
+/// The lines under a wired board: what each half has left and how fast it is
+/// filling, and which pointing devices the build carries and answer.
 fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
-    let mut lines = Vec::new();
-
+    let speed = charge_speed(telemetry.charging.budget_ma);
     let halves: Vec<String> = [("left", telemetry.left), ("right", telemetry.right)]
         .into_iter()
-        .map(|(half, reading)| format!("{half} {}", read_as(reading)))
+        .map(|(half, reading)| format!("{half} {}", read_as(reading, speed)))
         .collect();
-    lines.push(format!("battery · {}", halves.join(" · ")));
 
-    let pointing = [
-        ("build", telemetry.nav_build),
-        ("left", telemetry.nav_left),
-        ("right", telemetry.nav_right),
+    vec![
+        format!("{:<8} · {}", "battery", halves.join(" · ")),
+        format!(
+            "{:<8} · {}",
+            "features",
+            features(telemetry.nav_build, telemetry.nav_left, telemetry.nav_right)
+        ),
     ]
-    .into_iter()
-    .map(|(where_, nav)| format!("{where_} {}", named(nav)))
-    .collect::<Vec<_>>();
-    lines.push(format!("pointing · {}", pointing.join(" · ")));
-
-    if let Some(line) = charging_as(telemetry.charging) {
-        lines.push(line);
-    }
-
-    lines
 }
 
-/// How fast the board is charging and what decided that.
-///
-/// Two currents, because they are two different things and confusing them is
-/// what the firmware used to do: what the board draws from the source, and
-/// what reaches the cells. Nothing at all for firmware that predates the
-/// fields — an empty line would read as a board that answered "none".
-fn charging_as(charging: Charging) -> Option<String> {
-    let state = charging.state?;
-    let mut parts = vec![charging_state_as(state).to_string()];
+/// The port's declared capacity, not what is presently drawn — a source that
+/// only offered the default 500 mA can never charge fast no matter what
+/// gets negotiated after. Mirrors ZSA_PWR_BUDGET_HIGH_MA in the firmware's
+/// zsa_uart_proto.h.
+const FAST_CHARGE_BUDGET_MA: u16 = 1500;
 
-    if let Some(ma) = charging.input_limit_ma {
-        parts.push(format!("{ma} mA from the source"));
-    }
-    if let Some(ma) = charging.charge_current_ma {
-        parts.push(format!("{ma} mA to each cell"));
-    }
-    // What the source said it could give, when that is not already obvious
-    // from the limit we settled on.
-    match charging.budget_ma {
-        Some(0) | None => {}
-        Some(ma) if Some(ma) == charging.input_limit_ma => {}
-        Some(ma) => parts.push(format!("source offers {ma} mA")),
-    }
-
-    Some(format!("charging · {}", parts.join(" · ")))
-}
-
-fn charging_state_as(state: ChargeState) -> String {
-    match state {
-        ChargeState::Battery => "on battery".to_string(),
-        ChargeState::Floor => "holding at the unconfigured limit".to_string(),
-        ChargeState::Charging => "charging".to_string(),
-        ChargeState::Full => "full".to_string(),
-        ChargeState::Other(raw) => format!("a state this zapp does not know ({raw})"),
+fn charge_speed(budget_ma: Option<u16>) -> Option<&'static str> {
+    match budget_ma {
+        Some(0) | None => None, // no source identified, or firmware predates the field
+        Some(ma) if ma >= FAST_CHARGE_BUDGET_MA => Some("fast"),
+        Some(_) => Some("slow"),
     }
 }
 
 /// One half's level, what it is doing, and which path the number took. The
 /// path is worth the words: a relayed level keeps its last value when the link
 /// carrying it stops, so it reads as current long after it stopped being so.
-fn read_as(reading: BatteryReading) -> String {
+fn read_as(reading: BatteryReading, speed: Option<&str>) -> String {
     let level = match reading.level {
         Some(level) => format!("{level}%"),
         None => "unknown".to_string(),
     };
     let doing = match (reading.charging, reading.usb) {
-        (Some(true), _) => " charging",
-        (Some(false), Some(true)) => " on USB",
-        _ => "",
+        (Some(true), _) => match speed {
+            Some(speed) => format!(" {speed} charging"),
+            None => " charging".to_string(),
+        },
+        (Some(false), Some(true)) => " on USB".to_string(),
+        _ => String::new(),
     };
     match reading.source.filter(|_| reading.level.is_some()).and_then(came_from) {
         Some(from) => format!("{level}{doing} ({from})"),
@@ -387,37 +347,43 @@ fn read_as(reading: BatteryReading) -> String {
 
 /// Where a reading came from, when that tells the reader something.
 ///
-/// A half reporting its own cell is the ordinary case and saying so is noise.
-/// The rest earn their words: over the cable is live, over the radio may be a
-/// moment old, and a source this build does not know should not be dressed up
-/// as one it does.
+/// A half reporting its own cell and a half read over the cable are both the
+/// ordinary case here and saying so is noise. The rest earn their words: over
+/// the radio may be a moment old, and a source this build does not know should
+/// not be dressed up as one it does.
 fn came_from(source: Source) -> Option<&'static str> {
     match source {
         Source::Nrf => None,
-        Source::Wired => Some("read over the cable"),
+        Source::Wired => None,
         Source::Esb => Some("relayed over the radio"),
         Source::Unknown => Some("no source"),
         Source::Other(_) => Some("a source this zapp does not know"),
     }
 }
 
-/// What a nav mask names. An empty mask is a board that looked and found
-/// nothing; no mask at all is one that could not tell, and the two must not
-/// print the same.
-fn named(nav: Option<Nav>) -> String {
-    let Some(nav) = nav else {
-        return "unknown".to_string();
-    };
-    let devices: Vec<&str> = [("trackball", nav.trackball), ("trackpad", nav.trackpad)]
+/// One entry per pointing device this build knows about: not supported when
+/// the build was never compiled to drive it, connected when either half
+/// currently reports it present, disconnected when the build supports it but
+/// neither half does.
+fn features(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>) -> String {
+    let devices: [(&str, fn(Nav) -> bool); 2] = [
+        ("Trackball", |nav| nav.trackball),
+        ("Trackpad", |nav| nav.trackpad),
+    ];
+    devices
         .into_iter()
-        .filter(|&(_, present)| present)
-        .map(|(name, _)| name)
-        .collect();
-
-    match devices.is_empty() {
-        true => "none".to_string(),
-        false => devices.join(" + "),
-    }
+        .map(|(name, has)| {
+            let state = match build.filter(|&build| has(build)) {
+                None => "not supported",
+                Some(_) => match left.is_some_and(has) || right.is_some_and(has) {
+                    true => "connected",
+                    false => "disconnected",
+                },
+            };
+            format!("{name} ({state})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the halves have left.
@@ -439,17 +405,6 @@ fn charge(battery: Battery) -> String {
             Level::Percent(level) => format!(" · {level}%"),
             _ => String::new(),
         },
-    }
-}
-
-/// Points at the wired entry for a board that is listed in both places. What
-/// the radio published is what the board last had reason to publish; plugged
-/// in, it answers for itself. Saying which is which is the whole difference
-/// between a reading and a memory.
-fn also_wired(keyboard: Option<device::Keyboard>, wired: &[device::Keyboard]) -> &'static str {
-    match keyboard.is_some_and(|model| wired.contains(&model)) {
-        true => " · also on USB above, which reads live",
-        false => "",
     }
 }
 
@@ -992,6 +947,7 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zapp_core::hid::Charging;
 
     #[test]
     fn both_halves_of_a_split_board_are_named() {
@@ -1042,12 +998,19 @@ mod tests {
         }
     }
 
+    fn charging_reading(level: Option<u8>, source: Source) -> BatteryReading {
+        BatteryReading {
+            charging: Some(true),
+            ..reading(level, source)
+        }
+    }
+
     #[test]
-    fn a_wired_board_says_where_each_level_came_from() {
+    fn a_wired_board_says_what_each_half_is_doing() {
         let telemetry = Telemetry {
             version: 1,
             left: reading(Some(87), Source::Nrf),
-            right: reading(Some(64), Source::Wired),
+            right: charging_reading(Some(64), Source::Wired),
             nav_build: Some(Nav {
                 trackball: true,
                 trackpad: false,
@@ -1059,102 +1022,43 @@ mod tests {
             }),
             charging: Charging {
                 budget_ma: Some(1500),
-                input_limit_ma: Some(700),
-                charge_current_ma: Some(550),
-                state: Some(ChargeState::Charging),
+                ..Charging::default()
             },
         };
         assert_eq!(
             describe_telemetry(&telemetry),
             vec![
-                "battery · left 87% · right 64% (read over the cable)",
-                "pointing · build trackball · left none · right trackball",
-                "charging · charging · 700 mA from the source · 550 mA to each cell · source offers 1500 mA",
+                "battery  · left 87% · right 64% fast charging",
+                "features · Trackball (connected), Trackpad (not supported)",
             ]
         );
     }
 
     #[test]
-    fn the_two_currents_are_kept_apart() {
-        // What the board draws and what reaches the cells are different
-        // numbers, and reporting one as the other is the bug this line exists
-        // to make visible.
-        assert_eq!(
-            charging_as(Charging {
-                budget_ma: Some(500),
-                input_limit_ma: Some(200),
-                charge_current_ma: Some(50),
-                state: Some(ChargeState::Charging),
-            }),
-            Some(
-                "charging · charging · 200 mA from the source · 50 mA to each cell · source offers 500 mA"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn a_source_that_has_not_said_what_it_is_reads_as_held_back() {
-        assert_eq!(
-            charging_as(Charging {
-                budget_ma: Some(0),
-                input_limit_ma: Some(100),
-                charge_current_ma: Some(32),
-                state: Some(ChargeState::Floor),
-            }),
-            Some(
-                "charging · holding at the unconfigured limit · 100 mA from the source · 32 mA to each cell"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn a_source_offering_more_than_we_take_says_so() {
-        // A 3 A charger against a board whose input register stops at 1.5 A:
-        // the difference is real and the line has to show it.
-        assert_eq!(
-            charging_as(Charging {
-                budget_ma: Some(3000),
-                input_limit_ma: Some(1500),
-                charge_current_ma: Some(700),
-                state: Some(ChargeState::Charging),
-            }),
-            Some(
-                "charging · charging · 1500 mA from the source · 700 mA to each cell · source offers 3000 mA"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn firmware_without_the_charging_fields_says_nothing_at_all() {
-        // Not an empty line and not zeroes: an old board did not answer this
-        // question, which is different from answering "none".
-        assert_eq!(charging_as(Charging::default()), None);
+    fn only_a_high_power_source_charges_fast() {
+        // The port's declared capacity decides this, and a source that never
+        // said what it is decides nothing.
+        assert_eq!(charge_speed(Some(1500)), Some("fast"));
+        assert_eq!(charge_speed(Some(500)), Some("slow"));
+        assert_eq!(charge_speed(Some(0)), None);
+        assert_eq!(charge_speed(None), None);
     }
 
     #[test]
     fn a_relayed_level_is_not_dressed_up_as_a_live_one() {
         // The distinction this whole payload exists for: same number, and the
         // line has to say which of the two it is.
+        assert_eq!(read_as(reading(Some(64), Source::Wired), None), "64%");
         assert_eq!(
-            read_as(reading(Some(64), Source::Wired)),
-            "64% (read over the cable)"
-        );
-        assert_eq!(
-            read_as(reading(Some(64), Source::Esb)),
+            read_as(reading(Some(64), Source::Esb), None),
             "64% (relayed over the radio)"
         );
     }
 
     #[test]
     fn a_level_that_was_not_read_is_not_a_flat_one() {
-        assert_eq!(read_as(reading(None, Source::Wired)), "unknown");
-        assert_eq!(
-            read_as(reading(Some(0), Source::Wired)),
-            "0% (read over the cable)"
-        );
+        assert_eq!(read_as(reading(None, Source::Wired), None), "unknown");
+        assert_eq!(read_as(reading(Some(0), Source::Wired), None), "0%");
     }
 
     #[test]
@@ -1165,38 +1069,40 @@ mod tests {
             usb: None,
             source: Some(Source::Nrf),
         };
-        assert_eq!(read_as(unsure), "50%");
+        assert_eq!(read_as(unsure, None), "50%");
+        // A speed says nothing about a half that is not charging.
+        assert_eq!(read_as(unsure, Some("fast")), "50%");
 
         let charging = BatteryReading {
             charging: Some(true),
             ..unsure
         };
-        assert_eq!(read_as(charging), "50% charging");
+        assert_eq!(read_as(charging, None), "50% charging");
+        assert_eq!(read_as(charging, Some("fast")), "50% fast charging");
     }
 
     #[test]
-    fn a_half_we_could_not_read_is_not_a_half_with_nothing_in_it() {
-        assert_eq!(named(None), "unknown");
-        assert_eq!(named(Some(Nav::default())), "none");
+    fn a_device_the_build_cannot_drive_is_not_a_missing_one() {
+        let ball = Nav {
+            trackball: true,
+            trackpad: false,
+        };
+        let both = Nav {
+            trackball: true,
+            trackpad: true,
+        };
         assert_eq!(
-            named(Some(Nav {
-                trackball: true,
-                trackpad: true
-            })),
-            "trackball + trackpad"
+            features(Some(ball), Some(Nav::default()), Some(ball)),
+            "Trackball (connected), Trackpad (not supported)"
         );
-    }
-
-    #[test]
-    fn a_board_listed_twice_points_at_its_live_entry() {
-        let wired = [device::Keyboard::Voyager2];
         assert_eq!(
-            also_wired(Some(device::Keyboard::Voyager2), &wired),
-            " · also on USB above, which reads live"
+            features(Some(both), Some(Nav::default()), Some(Nav::default())),
+            "Trackball (disconnected), Trackpad (disconnected)"
         );
-        assert_eq!(also_wired(Some(device::Keyboard::Voyager), &wired), "");
-        assert_eq!(also_wired(None, &wired), "");
-        assert_eq!(also_wired(Some(device::Keyboard::Voyager2), &[]), "");
+        assert_eq!(
+            features(None, Some(ball), None),
+            "Trackball (not supported), Trackpad (not supported)"
+        );
     }
 
     #[test]

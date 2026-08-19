@@ -2046,9 +2046,9 @@ fn provision_half<L: IgnitionLink + 'static>(
         if readback.as_slice() == config.as_bytes().as_slice() {
             log::debug!("{half}: wrote and read back the pairing key");
             reboot_half(ignition, &mut client, half)?;
+            let label = format!("{} half", titled(half));
             println!(
-                "  {} half: wrote and read back {} bytes.",
-                titled(half),
+                "  {label:<10}: wrote and read back {} bytes.",
                 settings::ESB_CONFIG_LEN
             );
             return Ok(readback);
@@ -2178,15 +2178,17 @@ fn bond_failed<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>, err: anyhow:
 /// Says what was written, and never the key: the AES key reaches neither a log
 /// nor a screen, so a fingerprint stands in for it.
 fn describe_config(config: &EsbConfig) {
-    println!("  channel {}", config.rf_channel());
+    println!("  {:<15} {}", "channel", config.rf_channel());
     println!(
-        "  address {}:{}",
+        "  {:<15} {}:{}",
+        "address",
         settings::hex(config.base0()),
         settings::hex(&[config.prefix0()])
     );
-    println!("  device id {}", settings::hex(config.device_id()));
+    println!("  {:<15} {}", "device id", settings::hex(config.device_id()));
     println!(
-        "  key fingerprint {}",
+        "  {:<15} {}",
+        "key fingerprint",
         settings::hex(&config.key_fingerprint())
     );
 }
@@ -2261,12 +2263,13 @@ impl ShowReport {
 
 /// The line one half's key reads as, fingerprint only.
 fn show_line(name: &str, key: &HalfKey) -> String {
+    let label = format!("{name} half");
     match key {
         HalfKey::Provisioned(bytes) => {
-            format!("  {name} half: {}", settings::fingerprint_hex(bytes))
+            format!("  {label:<10}: {}", settings::fingerprint_hex(bytes))
         }
         HalfKey::NotProvisioned => format!(
-            "  {name} half: not provisioned — running on the development fallback key if the \
+            "  {label:<10}: not provisioned — running on the development fallback key if the \
              app build has it enabled"
         ),
     }

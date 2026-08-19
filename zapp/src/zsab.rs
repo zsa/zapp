@@ -1084,12 +1084,12 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
                 continue;
             };
             if matches!(verdict, Landed::Gone { .. }) {
-                println!("  {half}: cannot be reached, so it cannot be reset from here");
+                println!("  {half:<5}: cannot be reached, so it cannot be reset from here");
                 continue;
             }
             match self.revert(half) {
-                Ok(()) => println!("  {half}: restarting, which puts its old firmware back"),
-                Err(err) => println!("  {half}: could not be restarted ({err:#})"),
+                Ok(()) => println!("  {half:<5}: restarting, which puts its old firmware back"),
+                Err(err) => println!("  {half:<5}: could not be restarted ({err:#})"),
             }
             if half == Half::Right {
                 thread::sleep(RELAY_SETTLE);
