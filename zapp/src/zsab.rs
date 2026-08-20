@@ -71,6 +71,9 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
             // expires, and closing it costs one round trip.
             close_session(link, &progress);
 
+            if err.downcast_ref::<RightRejected>().is_some() {
+                return Err(err);
+            }
             println!();
             println!("Update failed: {err:#}");
             if let Some(note) = refusal_note(&err, progress.battery, progress.charging) {
@@ -213,15 +216,10 @@ impl Progress {
 
         if self.right_restarted && !self.right_back && !self.left_restarted && self.left_pending {
             return format!(
-                "The right half was written and restarted, and it did not come back where\n\
-                 this could see it. The left was not touched, so it is still running the\n\
-                 firmware it was — and the keyboard is half working until the right is\n\
-                 back, because the two are on different builds.\n\n\
-                 The right was only marked for test and nothing confirmed it, so it puts its\n\
-                 old firmware back the next time it restarts. Re-running finishes the pair\n\
-                 if the right can be reached again.\n\n\
-                 Check the right half is switched on, charged and near the left, then\n\
-                 power-cycle the keyboard and re-run `{rerun}`."
+                "The right half was written and restarted, and it has not come back. The left\n\
+                 was not touched, and the unconfirmed right puts its old firmware back on its\n\
+                 next restart. Check the right is on, charged and near the left, power-cycle\n\
+                 the keyboard, and re-run `{rerun}`."
             );
         }
 
@@ -569,6 +567,12 @@ fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
     // anything is a right that did not come back, which is a different thing
     // to tell someone than one that came back on the wrong image.
     let mut seen = false;
+    // Consecutive polls reporting the old image. The restart itself happens
+    // inside REBOOT_SETTLE, so the drop is usually never observed from here;
+    // the guard against a stale pre-reboot reading is repetition — the left
+    // refreshes the right's state every second, so three polls over ~9 s
+    // reporting the old image are the bootloader's answer, not a cache.
+    let mut on_old_image = 0u32;
 
     loop {
         match client.session_open(declaration) {
@@ -581,6 +585,23 @@ fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
                         status.right_done
                     );
                     return Ok(());
+                }
+                // Back from the restart but running something other than what
+                // was written: the bootloader validated the image and put the
+                // old one back. Waiting longer cannot change its mind.
+                let declared = &declaration.right.slot_hash;
+                let rejected = status
+                    .right_tag
+                    .as_ref()
+                    .is_some_and(|tag| !declared.starts_with(tag));
+                on_old_image = if rejected { on_old_image + 1 } else { 0 };
+                if on_old_image >= 3 {
+                    log::debug!(
+                        "right: back after {} s on its old image — the bootloader rejected \
+                         the written one",
+                        started.elapsed().as_secs()
+                    );
+                    return Err(anyhow::Error::new(RightRejected));
                 }
             }
             Err(err) => {
@@ -604,12 +625,14 @@ fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
     }
 
     let waited = REBOOT_TIMEOUT.as_secs();
+    if on_old_image > 0 {
+        return Err(anyhow::Error::new(RightRejected));
+    }
     if seen {
         bail!(
-            "The right half came back within {waited} s but is not carrying the image that \
-             was written to it, so the left half was left alone. MCUboot put its old image \
-             back, which means the new one did not boot."
-        )
+            "The right half is back but never settled on the written image within \
+             {waited} s. The left was not touched, so the keyboard still runs what it ran."
+        );
     }
     bail!(
         "The right half did not come back within {waited} s of its restart. The left was \
@@ -617,6 +640,22 @@ fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
          switched on, charged and near the left."
     )
 }
+
+/// The right half's bootloader refused the written image and booted the old
+/// firmware instead.
+#[derive(Debug)]
+pub struct RightRejected;
+
+impl std::fmt::Display for RightRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the firmware file was not signed properly or is corrupt. Your keyboard \
+             rebooted on the old firmware.",
+        )
+    }
+}
+
+impl std::error::Error for RightRejected {}
 
 /// Ends the session, if there is one left to end.
 ///
@@ -1552,8 +1591,8 @@ mod tests {
             left_pending: true,
             ..Progress::default()
         });
-        assert!(advice.contains("did not come back"), "{advice}");
-        assert!(advice.contains("left was not touched"), "{advice}");
+        assert!(advice.contains("has not come back"), "{advice}");
+        assert!(advice.contains("left\nwas not touched"), "{advice}");
         assert!(advice.contains("power-cycle"), "{advice}");
         // And it is not the message for a right that did come back, which is a
         // half-updated keyboard rather than a missing half.

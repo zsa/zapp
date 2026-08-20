@@ -1266,17 +1266,15 @@ fn installed(slots: &[ImageSlot], wanted: &[u8]) -> bool {
 /// more — [`confirm_both`] asks the firmware itself.
 fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
     let lead = format!("The {half} half took the whole image and then reported");
+    // A slot MCUboot cannot validate is left out of its listing (or listed
+    // without a hash): the whole image arrived and the bootloader refused it.
+    let rejected = "the firmware file was not signed properly or is corrupt. Your keyboard \
+                    keeps its old firmware.";
     let Some(slot) = secondary(slots) else {
-        bail!(
-            "{lead} no spare slot at all, so there is nothing to check it against. Nothing \
-             on that half can be trusted until it is read again."
-        );
+        bail!("{rejected}");
     };
     if slot.hash.is_empty() {
-        bail!(
-            "{lead} an empty hash for its spare slot, which is what a slot MCUboot could \
-             not verify looks like. The image on it is not bootable.",
-        );
+        bail!("{rejected}");
     }
     if slot.hash != wanted {
         bail!(
@@ -3333,17 +3331,17 @@ mod tests {
         assert!(wrong.contains("right"), "{wrong}");
         assert!(wrong.contains("did not land"), "{wrong}");
 
-        // A slot MCUboot could not verify reports no hash at all, which is a
-        // different thing to say than "it carries the wrong image".
+        // A slot MCUboot could not verify reports no hash at all (or is left
+        // out of the listing): the bootloader rejected what arrived.
         let empty = landed(&[slot(1, &[])], &wanted, Half::Left)
             .unwrap_err()
             .to_string();
-        assert!(empty.contains("not bootable"), "{empty}");
+        assert!(empty.contains("not signed properly or is corrupt"), "{empty}");
 
         let missing = landed(&[], &wanted, Half::Left)
             .unwrap_err()
             .to_string();
-        assert!(missing.contains("no spare slot"), "{missing}");
+        assert!(missing.contains("not signed properly or is corrupt"), "{missing}");
     }
 
     #[test]

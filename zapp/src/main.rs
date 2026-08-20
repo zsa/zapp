@@ -518,12 +518,16 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
     }
 
     let result = flash_over_ble(data, named);
-    if result.is_err() {
-        println!();
-        println!(
-            "If you meant to update over the cable, press the reset button on \
-             the left half to put the keyboard in its bootloader and run this again."
-        );
+    if let Err(err) = &result {
+        // Not for a keyboard that refused the image: the cable changes nothing
+        // about a signature its bootloader does not trust.
+        if err.downcast_ref::<zsab::RightRejected>().is_none() {
+            println!();
+            println!(
+                "If you meant to update over the cable, press the reset button on \
+                 the left half to put the keyboard in its bootloader and run this again."
+            );
+        }
     }
     result
 }
@@ -554,12 +558,14 @@ fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
         ..LinkArgs::default()
     };
     let result = zsab::update(path, force, &link);
-    if result.is_err() {
-        println!();
-        println!(
-            "If you meant to update over the cable, press the reset button on \
-             the left half to put the keyboard in its bootloader and run this again."
-        );
+    if let Err(err) = &result {
+        if err.downcast_ref::<zsab::RightRejected>().is_none() {
+            println!();
+            println!(
+                "If you meant to update over the cable, press the reset button on \
+                 the left half to put the keyboard in its bootloader and run this again."
+            );
+        }
     }
     result
 }
