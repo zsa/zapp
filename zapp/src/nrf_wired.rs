@@ -206,8 +206,25 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                 Some(_) => Vec::new(),
                 None => advice(&mut ignition),
             };
+
+            // Leave a keyboard, not a bootloader, on failure too. Nothing
+            // unmarked boots any different for it, and a half that was
+            // already marked for test reverts now instead of on the next
+            // power cycle — either way both halves come back on the build
+            // they ran. Best-effort: a half the bus lost cannot hear a reset.
+            if let Err(err) = ignition.release_md() {
+                log::debug!("could not release MD after the failure: {err}");
+            }
+            for half in [Half::Left, Half::Right] {
+                if let Err(err) = ignition.reset_target(half) {
+                    log::debug!("could not reset the {half} half after the failure: {err}");
+                }
+            }
             if let Err(err) = ignition.end() {
                 log::debug!("could not end the session after the failure: {err}");
+            }
+            if let Err(err) = ignition.reset_self() {
+                log::debug!("the bootloader went down with the reset: {err}");
             }
 
             // One line, plus whatever the thing that actually failed said.
