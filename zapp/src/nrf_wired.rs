@@ -69,6 +69,11 @@ use crate::zsab::{named, short, sizes, wrap, Landed};
 const BEGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to wait for each reply from a half.
+/// How many times the first read after SELECT is tried before the half is
+/// called gone, and the pause between tries.
+const SELECT_ATTEMPTS: u32 = 3;
+const SELECT_RETRY: Duration = Duration::from_millis(250);
+
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to keep asking for a session while the right half is missing.
@@ -928,30 +933,47 @@ fn write_half<L: IgnitionLink + 'static>(
     force: bool,
     timeout: Duration,
 ) -> Result<Written> {
-    ignition
-        .select(half)
-        .with_context(|| format!("Could not point the bridge at the {half} half"))?;
-
-    // Close whatever line the half was left half-way through. Everything on
-    // this side of the bridge is flushed by BEGIN and SELECT, but the buffer
-    // that matters here is MCUboot's own: a transfer interrupted part-way
-    // through a line — Ctrl-C during an upload — leaves it holding a fragment
-    // and waiting for the newline that ends it. The next request lands on the
-    // back of that fragment and never parses. A bare newline finishes it, and
-    // MCUboot discards the nonsense it completes; a half that was not
-    // mid-line sees an empty line and ignores it just the same.
-    if let Err(err) = ignition.send(half.into(), b"\n") {
-        log::debug!("could not send the {half} half a resync newline: {err}");
-    }
-
-    let mut client = connect(shared, half, status.payload_budget(), timeout);
     let wanted = bundle
         .hash(half)
         .with_context(|| format!("The bundle's {half} image carries no hash to check it by"))?;
 
-    let before = client
-        .image_state()
-        .with_context(|| format!("Could not read the {half} half's image state"))?;
+    // The first exchange after SELECT occasionally comes back "no target is
+    // selected": the bridge has not finished pointing at the half when the
+    // data lands. Nothing has been written yet, so the select is simply done
+    // again. A half that is really gone fails the same way every time.
+    let mut attempt = 0;
+    let (mut client, before) = loop {
+        attempt += 1;
+        ignition
+            .select(half)
+            .with_context(|| format!("Could not point the bridge at the {half} half"))?;
+
+        // Close whatever line the half was left half-way through. Everything
+        // on this side of the bridge is flushed by BEGIN and SELECT, but the
+        // buffer that matters here is MCUboot's own: a transfer interrupted
+        // part-way through a line — Ctrl-C during an upload — leaves it
+        // holding a fragment and waiting for the newline that ends it. The
+        // next request lands on the back of that fragment and never parses. A
+        // bare newline finishes it, and MCUboot discards the nonsense it
+        // completes; a half that was not mid-line sees an empty line and
+        // ignores it just the same.
+        if let Err(err) = ignition.send(half.into(), b"\n") {
+            log::debug!("could not send the {half} half a resync newline: {err}");
+        }
+
+        let mut client = connect(shared, half, status.payload_budget(), timeout);
+        match client.image_state() {
+            Ok(before) => break (client, before),
+            Err(SmpError::Transport(TransportError::Closed)) if attempt < SELECT_ATTEMPTS => {
+                log::debug!("{half}: link closed on the first read, selecting again ({attempt})");
+                std::thread::sleep(SELECT_RETRY);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Could not read the {half} half's image state"))
+            }
+        }
+    };
     report_slot(&before);
 
     let was = primary(&before).map(|slot| slot.hash.clone()).unwrap_or_default();
