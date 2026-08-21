@@ -153,6 +153,9 @@ pub struct FakeDevice {
     /// A half that acks a settings write but does not take it — a dropped line
     /// on the bus — so the read-back does not match and the write is retried.
     pub esb_config_frozen: bool,
+    /// Answer nothing to the first settings exchange each half is asked for,
+    /// the way a dropped request or reply looks to the host.
+    pub drop_first_settings_exchange: bool,
     /// Every value written to `esb/config`, in order.
     pub setting_writes: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -185,6 +188,7 @@ impl FakeDevice {
             marks: Arc::new(Mutex::new(Vec::new())),
             esb_config: None,
             esb_config_frozen: false,
+            drop_first_settings_exchange: false,
             setting_writes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -283,6 +287,10 @@ impl FakeDevice {
             self.answer(header, cbor::map(vec![("rc", cbor::uint(3))])); // EINVAL
             return;
         };
+        if self.drop_first_settings_exchange {
+            self.drop_first_settings_exchange = false;
+            return;
+        }
         let name = cbor::field(&request, "name").and_then(cbor::as_text);
         if name != Some(settings::ESB_CONFIG_NAME) {
             self.answer(header, cbor::map(vec![("rc", cbor::uint(5))])); // ENOENT

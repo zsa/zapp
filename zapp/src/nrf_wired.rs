@@ -71,10 +71,26 @@ const BEGIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait for each reply from a half.
 /// How many times the first read after SELECT is tried before the half is
 /// called gone, and the pause between tries.
+/// How many times one half's write-then-read-back pairing exchange is tried.
+/// Both halves of it are idempotent, and a single dropped frame is not a
+/// reason to leave a keyboard unprovisioned.
+const BOND_ATTEMPTS: u32 = 4;
+const BOND_RETRY: Duration = Duration::from_millis(500);
+
 const SELECT_ATTEMPTS: u32 = 3;
 const SELECT_RETRY: Duration = Duration::from_millis(250);
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Reply timeout override, for measuring a half that answers slowly rather
+/// than not at all. Seconds; unset or unparsable means [`REPLY_TIMEOUT`].
+fn reply_timeout() -> Duration {
+    std::env::var("ZAPP_REPLY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(REPLY_TIMEOUT)
+}
 
 /// How long to keep asking for a session while the right half is missing.
 ///
@@ -1969,7 +1985,7 @@ pub fn bond(key: Option<&str>) -> Result<()> {
     let shared = Shared::new(open()?);
     let mut ignition = Ignition::new(shared.clone());
 
-    match bond_run(&shared, &mut ignition, &config, REPLY_TIMEOUT) {
+    match bond_run(&shared, &mut ignition, &config, reply_timeout()) {
         Ok(()) => {
             // Both halves have the bundle and read it back; put the session
             // away and let each reboot into its application to reload it.
@@ -2072,13 +2088,33 @@ fn provision_half<L: IgnitionLink + 'static>(
     let mut client = connect(shared, half, status.payload_budget(), timeout);
 
     let mut last_readback: Option<Vec<u8>> = None;
-    for attempt in 1..=2 {
-        client
+    for attempt in 1..=BOND_ATTEMPTS {
+        // A dropped request or reply fails one exchange, not the command:
+        // writing the same key again is what the next attempt would do anyway,
+        // and a half left holding half a line is finished by the newline.
+        if attempt > 1 {
+            if let Err(err) = ignition.send(half.into(), b"\n") {
+                log::debug!("could not send the {half} half a resync newline: {err}");
+            }
+            std::thread::sleep(BOND_RETRY);
+        }
+
+        let exchange = client
             .settings_write(settings::ESB_CONFIG_NAME, config.as_bytes())
-            .with_context(|| format!("Could not write the {half} half's pairing key"))?;
-        let readback = client
-            .settings_read(settings::ESB_CONFIG_NAME)
-            .with_context(|| format!("Could not read the {half} half's pairing key back"))?;
+            .with_context(|| format!("Could not write the {half} half's pairing key"))
+            .and_then(|()| {
+                client
+                    .settings_read(settings::ESB_CONFIG_NAME)
+                    .with_context(|| format!("Could not read the {half} half's pairing key back"))
+            });
+        let readback = match exchange {
+            Ok(readback) => readback,
+            Err(err) if attempt < BOND_ATTEMPTS => {
+                log::debug!("{half}: pairing-key exchange failed on attempt {attempt}: {err:#}");
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
 
         if readback.as_slice() == config.as_bytes().as_slice() {
             log::debug!("{half}: wrote and read back the pairing key");
@@ -2101,7 +2137,7 @@ fn provision_half<L: IgnitionLink + 'static>(
     // Boot it out of recovery even on failure, then report.
     let _ = reboot_half(ignition, &mut client, half);
     bail!(
-        "the {half} half read back a different pairing key than was written, twice (got {}). \
+        "the {half} half read back a different pairing key than was written, {BOND_ATTEMPTS} times (got {}). \
          The write is not landing — check the cable between the halves and run bond again",
         settings::fingerprint_hex(last_readback.as_deref().unwrap_or_default())
     )
@@ -3983,9 +4019,9 @@ mod tests {
     }
 
     #[test]
-    fn a_half_that_will_not_take_the_write_is_retried_once_then_fails() {
+    fn a_half_that_will_not_take_the_write_is_retried_then_fails() {
         // The board acks the write but keeps its old value — a dropped line —
-        // so the read-back never matches. One retry, then the run gives up.
+        // so the read-back never matches. Retried, then the run gives up.
         let preset = vec![0x77u8; settings::ESB_CONFIG_LEN];
         let (result, _control, device) = bond_loopback(&a_config(), |device| {
             device.tweak(|fake| {
@@ -3996,10 +4032,28 @@ mod tests {
 
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("read back a different pairing key"), "{err}");
-        assert!(err.contains("twice"), "{err}");
-        // The right half is tried first, and it is written twice before the
-        // run is given up — the left is never reached.
-        assert_eq!(device.setting_writes().len(), 2, "not exactly one retry");
+        assert!(err.contains("4 times"), "{err}");
+        // The right half is tried first, and every attempt writes once before
+        // the run is given up — the left is never reached.
+        assert_eq!(
+            device.setting_writes().len(),
+            BOND_ATTEMPTS as usize,
+            "one write per attempt"
+        );
+    }
+
+    #[test]
+    fn a_dropped_pairing_exchange_is_retried_rather_than_failing_the_command() {
+        // The first exchange with each half goes missing, the way a dropped
+        // request or reply looks from here. Provisioning is idempotent, so the
+        // run should carry on and come out paired.
+        let (result, _control, device) = bond_loopback(&a_config(), |device| {
+            device.tweak(|fake| fake.drop_first_settings_exchange = true)
+        });
+        // Without the retry this is the error case; with it, both halves come
+        // out provisioned, each by the attempt that got through.
+        assert!(result.is_ok(), "{:#}", result.unwrap_err());
+        assert_eq!(device.setting_writes().len(), 2, "one landed write per half");
     }
 
     #[test]
