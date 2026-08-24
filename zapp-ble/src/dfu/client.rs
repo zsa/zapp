@@ -660,7 +660,6 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("corrupt"));
-        assert!(err.advice().unwrap().contains("erased"));
     }
 
     #[test]
@@ -753,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_keyboard_that_never_gets_there_says_how_to_do_it_by_hand() {
+    fn a_keyboard_that_never_gets_there_gives_up_rather_than_waiting_on() {
         let board = Arc::new(Mutex::new(Board {
             enter_works: false,
             ..Board::new()
@@ -762,7 +761,6 @@ mod tests {
             .make_ready(Duration::from_secs(2), &|_| {})
             .unwrap_err();
         assert!(matches!(err, DfuError::NotReady { .. }), "{err:?}");
-        assert!(err.advice().unwrap().contains("reset button"));
     }
 
     #[test]

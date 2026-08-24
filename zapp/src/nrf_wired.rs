@@ -206,10 +206,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // new images only once they have proved their links, and this is
             // the only point in the run where they can.
             if let Err(err) = finish(outcome, || came_back(CONFIRM_WINDOW)) {
-                log::debug!("failure detail: {err:#}");
-                println!();
-                println!("{}", wrap(&format!("Error: {err}.")));
-                std::process::exit(1);
+                report_failure(err);
             }
 
             if outcome == Outcome::Flashed {
@@ -218,22 +215,6 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             Ok(())
         }
         Err(err) => {
-            // Asked before anything is put back and put back before anything
-            // is printed, in that order and for two different reasons: the
-            // notes are read out of a session that is still open, and the next
-            // attempt needs one that is not — the bootloader refuses BEGIN
-            // outright while a session is active.
-            //
-            // A half that stopped answering is the one failure with nothing to
-            // ask about: the bootloader's notes are about the bus and the
-            // session, and neither says anything a cable that came out does not
-            // already. The session is still put back, because the next attempt
-            // needs it closed.
-            let notes = match err.downcast_ref::<HalfGone>() {
-                Some(_) => Vec::new(),
-                None => advice(&mut ignition),
-            };
-
             // Leave a keyboard, not a bootloader, on failure too. Nothing
             // unmarked boots any different for it, and a half that was
             // already marked for test reverts now instead of on the next
@@ -250,7 +231,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                     "ZAPP_KEEP_STATE_ON_FAILURE: both halves left in their bootloaders, \n\
                      nothing reset. Read what you need, then unplug and replug to recover."
                 );
-                report_failure(err, notes);
+                report_failure(err);
             }
 
             if let Err(err) = ignition.release_md() {
@@ -268,39 +249,14 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                 log::debug!("the bootloader went down with the reset: {err}");
             }
 
-            report_failure(err, notes);
+            report_failure(err);
         }
     }
 }
 
-/// Says what went wrong and stops.
-///
-/// One line, plus whatever the thing that actually failed said. The middle of
-/// the chain names bridges, mailboxes and event codes, which is what this
-/// looks like from the inside and no help to someone holding a keyboard —
-/// that stays in the debug log. The far end of it is different: it is the
-/// board's own words, and leaving them out once cost a whole bench session
-/// spent guessing at a failure the board had already named.
-fn report_failure(err: anyhow::Error, notes: Vec<String>) -> ! {
-    log::debug!("failure detail: {err:#}");
-    let mut line = match root_cause(&err) {
-        Some(cause) => format!("Error: {err} ({cause})"),
-        None => format!("Error: {err}"),
-    };
-    if !line.ends_with('.') {
-        line.push('.');
-    }
-    // A note the error already carries, as with a session that recorded the
-    // fault it failed on, is not said twice.
-    for note in notes {
-        if line.contains(&note) {
-            continue;
-        }
-        line.push(' ');
-        line.push_str(&note);
-    }
-    println!();
-    println!("{}", wrap(&line));
+/// Says what went wrong, in one line, and stops.
+fn report_failure(err: anyhow::Error) -> ! {
+    eprintln!("Error: {err:#}");
     std::process::exit(1);
 }
 
@@ -1189,11 +1145,12 @@ fn wait_active<L: IgnitionLink>(
         match status.state {
             SessionState::Active => return Ok(status),
             SessionState::Fault => {
-                let reason = session_error(&status)
-                    .unwrap_or_else(|| "the bootloader gave no reason".to_string());
                 return Err(NotOpened {
                     right_missing: right_missing(status.error),
-                    error: anyhow!("The bootloader could not open a session: {reason}"),
+                    error: anyhow!(
+                        "The bootloader could not open a session (error {:#06x})",
+                        status.error
+                    ),
                 });
             }
             SessionState::Idle => {
@@ -1693,106 +1650,6 @@ fn both_reported(telemetry: &Telemetry) -> bool {
 /// this is asking whether the half is there, not what its battery is doing.
 fn reported(reading: BatteryReading) -> bool {
     reading.level.is_some() || reading.charging.is_some() || reading.usb.is_some()
-}
-
-// ---------------------------------------------------------------------------
-// Saying what went wrong
-// ---------------------------------------------------------------------------
-
-/// The far end of a failure's chain, when it says something the top does not.
-///
-/// `anyhow`'s alternate form prints every link, which on this path is mostly
-/// plumbing. The last link is the exception: nothing wrapped it, so it is the
-/// error as the board or the bus reported it, and it is the one thing a person
-/// cannot work out from the sentence above it.
-fn root_cause(err: &anyhow::Error) -> Option<String> {
-    let root = err.chain().last()?.to_string();
-    (root != err.to_string()).then_some(root)
-}
-
-/// Everything worth printing under a failure.
-///
-/// The board is asked again rather than remembered: STATUS carries the reason
-/// the bootloader itself recorded, the bus recovery count and the bytes it had
-/// to drop, and all three are current at the moment the failure is being
-/// explained rather than at the last time anything happened to look.
-fn advice<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Vec<String> {
-    let mut notes = Vec::new();
-    match ignition.status() {
-        Ok(status) => {
-            if let Some(note) = session_error(&status) {
-                notes.push(note);
-            } else if let Some(note) = bus_health(&status) {
-                notes.push(note);
-            }
-        }
-        Err(err) => notes.push(format!(
-            "The bootloader stopped answering as well ({err}), so there is nothing left to \
-             ask about what happened. Unplug the keyboard and plug it back in."
-        )),
-    }
-    notes
-}
-
-/// The bootloader's own reason, in a sentence.
-///
-/// `None` for a session that recorded none, and for a code from a firmware
-/// newer than this build — the raw number is more honest than a guess.
-fn session_error(status: &Status) -> Option<String> {
-    if status.error == 0x0000 {
-        return None;
-    }
-    log::debug!(
-        "session error {:#06x}, bus {}",
-        status.error,
-        bus_phrase(status)
-    );
-    Some(
-        match status.error {
-            // Everything the right half is reached through is on the one
-            // cable, so every way it can go quiet has the same answer.
-            0x0002..=0x0005 | 0x0009 => "Make sure the TRRS cable is properly seated.",
-            0x0001 => "The left half did not respond.",
-            0x0006 => "This computer could not open the keyboard. On Linux, check the udev \
-                 rule is installed.",
-            0x0007 => "The keyboard's bootloader and this version of zapp do not match.",
-            0x0008 => "Something went wrong inside zapp.",
-            0x00FF => "Unplug the keyboard, plug it back in, and try again.",
-            _ => "The keyboard's bootloader is newer than this version of zapp.",
-        }
-        .to_string(),
-    )
-}
-
-/// A note about a bus that coped but had to work at it.
-///
-/// Only when the session recorded no error of its own: a run that failed
-/// somewhere else while the bus was recovering repeatedly is worth pointing at
-/// the bus anyway.
-///
-/// No counts. Reaching here means the far half was in its bootloader and the
-/// transfer was moving, so the cable is the story and the numbers behind that
-/// conclusion are ours, not the reader's.
-fn bus_health(status: &Status) -> Option<String> {
-    if status.recover_count == 0 && status.rx_drops == 0 {
-        return None;
-    }
-    log::debug!("bus health at the failure: {}", bus_phrase(status));
-    Some("Make sure the TRRS cable is properly seated.".to_string())
-}
-
-/// "3 bus recoveries at 50 kHz, 7 bytes dropped".
-fn bus_phrase(status: &Status) -> String {
-    let mut parts = vec![format!(
-        "{} bus recover{} at {} kHz",
-        status.recover_count,
-        if status.recover_count == 1 { "y" } else { "ies" },
-        status.i2c_khz
-    )];
-    if status.rx_drops > 0 {
-        parts.push(format!("{} bytes dropped on the way back", status.rx_drops));
-    }
-    parts.join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,22 +2159,10 @@ fn end_and_reset<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>) {
 
 /// The failure epilogue shared by both bond commands, worded like the flash's.
 fn bond_failed<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>, err: anyhow::Error) -> ! {
-    let notes = advice(ignition);
     if let Err(err) = ignition.end() {
         log::debug!("could not end the session after the failure: {err}");
     }
-    log::debug!("failure detail: {err:#}");
-    let mut line = match root_cause(&err) {
-        Some(cause) => format!("Error: {err} ({cause})."),
-        None => format!("Error: {err}."),
-    };
-    for note in notes {
-        line.push(' ');
-        line.push_str(&note);
-    }
-    println!();
-    println!("{}", wrap(&line));
-    std::process::exit(1);
+    report_failure(err)
 }
 
 /// Says what was written, and never the key: the AES key reaches neither a log
@@ -2798,22 +2643,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_says_what_the_board_called_it_and_not_only_what_this_end_was_doing() {
-        // The line the wired path prints used to be the outermost context on
-        // its own, which turned "bad CBOR from the board" into "Could not read
-        // the right half's image state" and cost a bench session.
-        let err = anyhow::anyhow!("bad CBOR from the board: invalid type: break")
-            .context("Could not read the right half's image state");
-        assert_eq!(
-            root_cause(&err).as_deref(),
-            Some("bad CBOR from the board: invalid type: break")
-        );
-        // A failure nothing wrapped has nothing to add, and must not repeat
-        // itself in brackets.
-        assert_eq!(root_cause(&anyhow::anyhow!("the cable came out")), None);
-    }
-
-    #[test]
     fn a_half_whose_link_went_away_is_one_sentence_with_nothing_under_it() {
         // What the cable coming out mid-upload actually reaches `flash` as:
         // the bridge's event, flattened to a closed transport by zapp-wired and
@@ -2822,8 +2651,6 @@ mod tests {
             .context("The right half's upload failed");
         let err = half_gone(Half::Right, err);
         assert_eq!(err.to_string(), "The right half stopped responding");
-        // Nothing under it, so the epilogue has no root cause to print.
-        assert_eq!(root_cause(&err), None);
         assert!(err.downcast_ref::<HalfGone>().is_some());
 
         // Every other failure is left alone.
@@ -3509,8 +3336,7 @@ mod tests {
         assert!(installed(&[kept(0, &wanted)], &wanted));
     }
 
-    // ---- What a failure says -------------------------------------------
-
+    /// A status the way the bootloader answers one that faulted.
     fn faulted(error: u16, recoveries: u8, drops: u8) -> Status {
         let mut bytes = vec![0u8; ignition::STATUS_LEN];
         bytes[0] = ignition::STATUS_VERSION;
@@ -3522,56 +3348,6 @@ mod tests {
         bytes[10..12].copy_from_slice(&1024u16.to_le_bytes());
         bytes[12] = 1;
         Status::parse(&bytes).unwrap()
-    }
-
-    #[test]
-    fn every_way_the_right_half_goes_quiet_gives_the_same_answer() {
-        // Cable, mailbox, expander, bus: one cable carries all of it, so one
-        // sentence covers all of it. The codes and counts go to the log.
-        for code in [0x0002, 0x0003, 0x0004, 0x0005, 0x0009] {
-            let note = session_error(&faulted(code, 3, 0)).unwrap();
-            assert_eq!(note, "Make sure the TRRS cable is properly seated.");
-        }
-    }
-
-    #[test]
-    fn every_error_the_bootloader_can_record_says_something_plain() {
-        for code in (1..=9).chain(std::iter::once(0xFF)) {
-            let note = session_error(&faulted(code, 0, 0)).expect("a sentence");
-            // Nothing a person cannot act on: no raw codes, no counters, no
-            // parts of the machine they have never heard of.
-            assert!(!note.contains("0x"), "a raw code in prose: {note}");
-            assert!(!note.to_lowercase().contains("mcuboot"), "{note}");
-            assert!(!note.to_lowercase().contains("mailbox"), "{note}");
-            assert!(!note.contains("bus recover"), "{note}");
-        }
-    }
-
-    #[test]
-    fn a_session_with_nothing_wrong_says_nothing() {
-        assert_eq!(session_error(&faulted(0, 0, 0)), None);
-        // A code from a firmware newer than this build still gets a sentence
-        // someone can act on rather than the number itself.
-        let newer = session_error(&faulted(0x0042, 0, 0)).unwrap();
-        assert!(!newer.contains("0x0042"), "{newer}");
-        assert!(newer.contains("newer than this version"), "{newer}");
-    }
-
-    #[test]
-    fn a_bus_that_coped_but_had_to_work_at_it_is_still_worth_a_line() {
-        assert_eq!(bus_health(&faulted(0, 0, 0)), None);
-        let note = bus_health(&faulted(0, 2, 9)).unwrap();
-        // The counts belong in the debug log, not in front of someone whose
-        // cable has come loose: reaching here means the far half was in its
-        // bootloader and bytes were moving, so seating the cable is the whole
-        // of the advice.
-        assert_eq!(note, "Make sure the TRRS cable is properly seated.");
-    }
-
-    #[test]
-    fn one_recovery_is_not_pluralised() {
-        assert!(bus_phrase(&faulted(0, 1, 0)).contains("1 bus recovery at 50 kHz"));
-        assert!(bus_phrase(&faulted(0, 0, 0)).contains("0 bus recoveries"));
     }
 
     // ---- Waiting for the right half ------------------------------------
@@ -3588,7 +3364,7 @@ mod tests {
             let status = faulted(error, 0, 0);
             Err(NotOpened {
                 right_missing: right_missing(status.error),
-                error: anyhow!("{}", session_error(&status).unwrap()),
+                error: anyhow!("the bootloader faulted ({:#06x})", status.error),
             })
         });
         (result, asked)
@@ -3631,12 +3407,12 @@ mod tests {
             asked += 1;
             Err(NotOpened {
                 right_missing: true,
-                error: anyhow!("{}", session_error(&faulted(0x0002, 0, 0)).unwrap()),
+                error: anyhow!("the bootloader faulted (0x0002)"),
             })
         });
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("TRRS cable"), "{err}");
+        assert!(err.contains("0x0002"), "{err}");
         assert_eq!(asked, 1, "it kept asking past its own limit");
     }
 

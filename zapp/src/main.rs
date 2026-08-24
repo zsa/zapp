@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_ble::dfu::{self, DfuClient, DfuError, Wait};
+use zapp_ble::dfu::{self, DfuClient, Wait};
 use zapp_ble::smp::{self, Half, SmpClient};
 use zapp_ble::{Battery, BleMonitor, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
@@ -165,25 +165,33 @@ impl Default for LinkArgs {
     }
 }
 
-fn main() -> Result<()> {
+/// Runs the command the arguments name, and says one line about a failure.
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp(None)
         .init();
 
     let cli = Cli::parse();
 
-    match cli.command {
+    if let Err(err) = dispatch(cli.command) {
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+/// One command, run to whatever it comes to.
+fn dispatch(command: Commands) -> Result<()> {
+    match command {
         Commands::Flash {
             firmware,
             force,
             device,
         } => {
-            let result = if zapp_oryx::is_oryx_url(&firmware) {
+            if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
             } else {
                 cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
-            };
-            with_dfu_advice(result)
+            }
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan } => cmd_devices(scan),
@@ -809,27 +817,6 @@ fn dfu_connect(device: Option<&str>) -> Result<DfuClient> {
     let client = client.context("Could not reach the keyboard over Bluetooth")?;
     log::debug!("connected, {} bytes of image per write", client.chunk());
     Ok(client)
-}
-
-/// The board's own advice about a refusal, wherever in the chain it is.
-fn dfu_advice(err: &anyhow::Error) -> Option<&'static str> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<DfuError>())
-        .and_then(DfuError::advice)
-}
-
-/// Passes a result through, saying what to do about a refusal the board itself
-/// raised. The board's own reasons come back as a code and a sentence; the
-/// paragraph that says what to do about one is worth more than the line the
-/// error chain gives it.
-fn with_dfu_advice(result: Result<()>) -> Result<()> {
-    if let Err(err) = &result
-        && let Some(advice) = dfu_advice(err)
-    {
-        println!();
-        println!("{advice}");
-    }
-    result
 }
 
 /// Seconds to give the STM32 to reach its bootloader, when nobody said

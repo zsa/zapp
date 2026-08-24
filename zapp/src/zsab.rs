@@ -16,8 +16,7 @@ use indicatif::ProgressBar;
 
 use zapp_ble::smp::bundle::{self, Bundle, Step};
 use zapp_ble::smp::session::{self, Declaration, Next};
-use zapp_ble::smp::zsa_err::{self, Cause, Side};
-use zapp_ble::smp::{self, Half, ImageSlot, SmpClient, SmpError};
+use zapp_ble::smp::{self, Half, ImageSlot, SmpClient};
 use zapp_ble::{Battery, Level};
 use zapp_core::device::{self, ids::Keyboard};
 use zapp_core::flash::FlashProgress;
@@ -70,194 +69,24 @@ pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
             // be there: a session left open holds the next attempt out until it
             // expires, and closing it costs one round trip.
             close_session(link, &progress);
-
-            if err.downcast_ref::<RightRejected>().is_some() {
-                return Err(err);
-            }
-            println!();
-            println!("Update failed: {err:#}");
-            if let Some(note) = refusal_note(&err, progress.battery, progress.charging) {
-                println!();
-                println!("{note}");
-            }
-            println!();
-            println!("{}", progress.advice(path));
-            bail!("the keyboard was not fully updated")
+            Err(err)
         }
     }
 }
 
 /// What has been done to the keyboard so far.
 ///
-/// Kept as it goes rather than worked out afterwards, because the message a
-/// failure needs is entirely a question of how far it got.
+/// Kept as it goes rather than worked out afterwards: the ordering rule, the
+/// reads at the end and the session close all turn on how far the run got.
 #[derive(Debug, Default, Clone, Copy)]
 struct Progress {
-    /// The update has been declared to the left half, so the board knows what
-    /// is being installed and will admit the writes that follow.
-    declared: bool,
-    /// The id the left gave that session, for the close that ends it.
+    /// The id the left gave the update session, for the close that ends it.
     session_id: Option<u32>,
-    /// An image has been put into a spare slot, marked or not.
-    written: bool,
+    /// The right has been marked and restarted, which is what the left's own
+    /// upload waits on.
     right_restarted: bool,
-    /// The right came back from that restart carrying what was declared, which
-    /// is what the board wants to see before the left is written.
-    right_back: bool,
+    /// The left has been marked and restarted, which drops the session with it.
     left_restarted: bool,
-    /// The left still needs its image — so a restarted right is a right that
-    /// is talking a protocol the left does not know.
-    left_pending: bool,
-    /// The right still needs its image, which is what the left refuses to be
-    /// written before.
-    right_pending: bool,
-    /// Both halves are back on their new images and only the confirm is left.
-    settled: bool,
-    /// The two halves came out of this on different builds.
-    mismatched: bool,
-    /// Nothing was kept and both halves were put back on what they were
-    /// running, which was seen to work.
-    reverted: bool,
-    /// Putting them back was tried and at least one half was not seen back on
-    /// its old image afterwards.
-    revert_failed: bool,
-    /// What the packs read at the last look, and whether the keyboard was on
-    /// the charger. Kept here so a refusal that turns out to be about the
-    /// battery can quote real numbers rather than the threshold alone; both
-    /// halves stay unknown until the levels have been asked for.
-    battery: Battery,
-    charging: bool,
-}
-
-impl Progress {
-    /// What the keyboard is, and what to do about it.
-    fn advice(&self, path: &Path) -> String {
-        let rerun = format!("zapp flash {}", path.display());
-
-        if !self.written {
-            if self.declared {
-                return format!(
-                    "The update was declared to the keyboard, but nothing was written. Both\n\
-                     halves are still running the firmware they were and the keyboard works\n\
-                     exactly as it did.\n\n\
-                     The session the left is holding lives in its memory and is dropped on\n\
-                     any restart, so there is nothing to clean up. If it simply expired, that\n\
-                     is all that happened: re-run `{rerun}`, which declares the same update\n\
-                     again rather than starting a second one."
-                );
-            }
-            return "Nothing was written. The keyboard is untouched and still working."
-                .to_string();
-        }
-
-        if !self.right_restarted && !self.left_restarted {
-            let order = if self.right_pending {
-                "\n\nThe right half has to be updated first, and the left will refuse its own\n\
-                 image until the right is back and carrying what was declared.\n\
-                 Check the right half is switched on, charged and near the left."
-            } else {
-                ""
-            };
-            return format!(
-                "An image was written into a spare slot, but nothing was marked and nothing\n\
-                 was restarted. Both halves are still running the firmware they were, and\n\
-                 the keyboard works exactly as it did.\n\n\
-                 If the keyboard refused because the update session expired, nothing is\n\
-                 lost: re-run `{rerun}` and it picks up from what is already installed.\
-                 {order}"
-            );
-        }
-
-        if self.revert_failed {
-            return format!(
-                "The update did not work out and this could not put the keyboard back the way\n\
-                 it found it. At least one half was not seen back on its old image, so the two\n\
-                 may be on different builds — in that state they cannot talk to each other and\n\
-                 the keyboard is half working.\n\n\
-                 Power-cycle the keyboard: a half that never confirmed its new image puts the\n\
-                 old one back on its next start, whether or not this could reach it. Then\n\
-                 re-run `{rerun}` — it reads back what each half is carrying before it writes\n\
-                 anything — before trying anything else."
-            );
-        }
-
-        if self.reverted {
-            return format!(
-                "Nothing was kept. Both halves were put back on the firmware they were running\n\
-                 before this started, and both were seen back on it, so the keyboard works\n\
-                 exactly as it did.\n\n\
-                 An image is kept only once this has confirmed it, and it confirms nothing\n\
-                 until both halves are back and carrying what was written — so a run that\n\
-                 fails anywhere before that leaves the pair as it was, together.\n\n\
-                 Re-run `{rerun}` to try again."
-            );
-        }
-
-        if self.mismatched {
-            return format!(
-                "The two halves are not on the same build. In that state they cannot talk to\n\
-                 each other, so the keyboard is half working: the halves may not see each\n\
-                 other at all, and the right may not type or light up.\n\n\
-                 Re-run `{rerun}` to put both halves on the same build. It reads back\n\
-                 what each half is carrying before it writes anything, and prints it."
-            );
-        }
-
-        if self.settled {
-            return format!(
-                "Both halves are running the new firmware, but at least one was not confirmed:\n\
-                 an image is kept only once this has confirmed it, and a half left unconfirmed\n\
-                 puts its old firmware back on the next restart.\n\n\
-                 Re-run `{rerun}` — a half already running its image is confirmed rather than\n\
-                 uploaded again, so this finishes in one pass, and the run says which half was\n\
-                 still pending."
-            );
-        }
-
-        if self.right_restarted && !self.right_back && !self.left_restarted && self.left_pending {
-            return format!(
-                "The right half was written and restarted, and it has not come back. The left\n\
-                 was not touched, and the unconfirmed right puts its old firmware back on its\n\
-                 next restart. Check the right is on, charged and near the left, power-cycle\n\
-                 the keyboard, and re-run `{rerun}`."
-            );
-        }
-
-        if self.right_restarted && !self.left_restarted {
-            if self.left_pending {
-                return format!(
-                    "The right half is running the new firmware and the left is still on the\n\
-                     old one. The two are on different protocol versions, so the keyboard is\n\
-                     half working: the halves may not talk to each other at all, and the right\n\
-                     may not type or light up. That is what a half-finished update looks like,\n\
-                     not a broken keyboard.\n\n\
-                     The right was only marked for test, and it keeps that image only once\n\
-                     this has confirmed it — which does not happen until both halves are\n\
-                     back on the same build. As things stand it puts its old firmware back\n\
-                     the next time it restarts.\n\n\
-                     Either:\n  \
-                     · re-run `{rerun}` to finish the update, or\n  \
-                     · power-cycle the keyboard to put the right half back as it was."
-                );
-            }
-            return format!(
-                "The right half was restarted onto the new firmware and the left was already\n\
-                 carrying its image, so the two are on the same build. The right keeps that\n\
-                 image only once this has confirmed it, and this run did not get that far, so\n\
-                 it reverts on the next restart.\n\n\
-                 Re-run `{rerun}` to finish, or power-cycle the keyboard to put the right\n\
-                 half back as it was."
-            );
-        }
-
-        format!(
-            "The halves were written, marked for test and restarted, and at least one did\n\
-             not come back where this could see it. A new image is kept only once this has\n\
-             confirmed it, and it confirms nothing it cannot see, so an unreachable half\n\
-             puts its old firmware back on the next restart.\n\n\
-             Power-cycle the keyboard to get a working pair back, then re-run `{rerun}`."
-        )
-    }
 }
 
 fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -> Result<()> {
@@ -273,8 +102,6 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         Battery::default()
     });
     let charging = charging();
-    progress.battery = battery;
-    progress.charging = charging;
     log::debug!("charge {}", charge(battery, charging));
     // Before the right half is touched, not after: reading the right goes
     // through the left's relay, and the relay is battery-gated too. On a flat
@@ -312,12 +139,6 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         println!("{UP_TO_DATE}");
         return Ok(());
     }
-    let pending = |wanted: Half| {
-        plan.iter()
-            .any(|(half, step)| *half == wanted && *step != Step::Installed)
-    };
-    progress.left_pending = pending(Half::Left);
-    progress.right_pending = pending(Half::Right);
 
     // Whether a half's upload is followed by a mark and a restart. See
     // `swaps_after`.
@@ -347,7 +168,6 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // upload from a stray one, nor tell that the right is finished.
     let declaration = declare(bundle, force)?;
     let opened = open_session(link, &declaration)?;
-    progress.declared = true;
     progress.session_id = Some(opened.id);
     announce_session(&declaration, &opened);
     // Not under --force. There the plan writes both halves whatever they are
@@ -380,17 +200,12 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         // right half first" until then, and the right has only just restarted.
         if half == Half::Left && progress.right_restarted {
             wait_for_right_ready(link, &declaration)?;
-            progress.right_back = true;
         }
 
         log::debug!("{} half — upload ({} KiB)", titled(half), image.len() / 1024);
         let (mut client, renewed) = connect_declared(link, half, &declaration)?;
         progress.session_id = Some(renewed.id);
 
-        // Set before the upload, not after: an upload that fails part-way has
-        // still put bytes in the spare slot, and the message for that is the
-        // one about a slot written and nothing marked.
-        progress.written = true;
         upload(&mut client, half, image)?;
         // The transfer was still worth doing under --force — it is the one part
         // of this that proves the link end to end — but there is nothing to
@@ -440,12 +255,10 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         .map(|(half, _)| *half)
         .collect();
 
-    progress.settled = true;
     {
         let mut pair = BleConfirm {
             link,
             bundle,
-            progress: &mut *progress,
             running,
             before,
             spinner: None,
@@ -1024,7 +837,6 @@ fn confirm(link: &LinkArgs, half: Half, hash: &[u8], already: bool) -> Result<()
 struct BleConfirm<'a> {
     link: &'a LinkArgs,
     bundle: &'a Bundle,
-    progress: &'a mut Progress,
     /// What each half is carrying, replaced for every half that comes back from
     /// a restart. The mismatch check reads this.
     running: Vec<(Half, Vec<u8>)>,
@@ -1071,11 +883,9 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
     }
 
     fn mismatch(&mut self, _landed: &[(Half, Landed)]) -> Option<String> {
-        let mismatch = both_on_the_bundle(self.bundle, &self.running)
+        both_on_the_bundle(self.bundle, &self.running)
             .err()
-            .map(|err| err.to_string());
-        self.progress.mismatched = mismatch.is_some();
-        mismatch
+            .map(|err| err.to_string())
     }
 
     fn commit(&mut self, half: Half) -> Result<()> {
@@ -1161,7 +971,6 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
 
         let summary = reasons.join(" ");
         if restored.iter().all(|(_, back)| *back) {
-            self.progress.reverted = true;
             return anyhow::anyhow!(
                 "The update did not work out, so both halves were put back on the firmware they \
                  were running before it. The keyboard is working and is exactly as it was; \
@@ -1169,7 +978,6 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             );
         }
 
-        self.progress.revert_failed = true;
         let where_each: Vec<String> = restored
             .iter()
             .map(|(half, back)| match back {
@@ -1285,80 +1093,6 @@ fn sentence(parts: &[String]) -> String {
         [first, second] => format!("The batteries are low: {first} and {second}"),
         [rest @ .., last] => format!("The batteries are low: {} and {last}", rest.join(", ")),
     }
-}
-
-/// The measured levels, named one by one, so a half nobody could read is not
-/// passed off as a half that answered.
-fn levels_line(battery: Battery, charging: bool) -> String {
-    let level = |level: Level| match level {
-        Level::Percent(level) => format!("{level}%"),
-        Level::Unknown => "would not say".to_string(),
-        Level::Absent => "did not report".to_string(),
-    };
-    format!(
-        "The left reads {}, the right {}{}.",
-        level(battery.left),
-        level(battery.right),
-        if charging {
-            ", and the keyboard is on the charger"
-        } else {
-            ""
-        }
-    )
-}
-
-/// The firmware's own reason for saying no, in plain sentences, with the
-/// measured levels spliced in when the reason is a battery.
-///
-/// The board answers a refusal with a ZSA code (see
-/// `zapp_ble::smp::zsa_err`), and the one line the error chain gives it is a
-/// summary rather than an answer. `None` for anything that is not a refusal
-/// this build knows — including a code from a firmware newer than this zapp,
-/// which is left to the raw group and number in the error itself rather than
-/// dressed up as something it might not be.
-fn refusal_note(err: &anyhow::Error, battery: Battery, charging: bool) -> Option<String> {
-    let refusal = refusal(err)?;
-    let advice = wrap(refusal.advice);
-
-    let measured = match refusal.cause {
-        Cause::BatteryLow(side) | Cause::SwapHeld(side) => {
-            let (named, reading) = match side {
-                Side::Left => ("left", battery.left),
-                Side::Right => ("right", battery.right),
-            };
-            Some(match reading {
-                Level::Percent(_) => format!(
-                    "{} The threshold is {}%.",
-                    levels_line(battery, charging),
-                    bundle::MIN_SOC_PERCENT
-                ),
-                // The board refused on its own measurement and this end has
-                // none, so say that rather than print a half as flat when
-                // nobody here could read it.
-                _ => format!(
-                    "{} The threshold is {}%, and the keyboard refused on its own reading \
-                     of the {named} half — this end could not read a level for it at all.",
-                    levels_line(battery, charging),
-                    bundle::MIN_SOC_PERCENT
-                ),
-            })
-        }
-        _ => None,
-    };
-
-    Some(match measured {
-        Some(measured) => format!("{advice}\n\n{}", wrap(&measured)),
-        None => advice,
-    })
-}
-
-fn refusal(err: &anyhow::Error) -> Option<zsa_err::Refusal> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<SmpError>())
-        .and_then(|smp| match smp {
-            SmpError::Remote { group, rc, .. } => zsa_err::lookup(*group, *rc),
-            _ => None,
-        })
 }
 
 /// Folds a paragraph to the width the rest of this file is written at.
@@ -1491,10 +1225,6 @@ pub(crate) fn named(version: &str) -> String {
 mod tests {
     use super::*;
 
-    fn advice_of(progress: Progress) -> String {
-        progress.advice(Path::new("fw.zsab"))
-    }
-
     /// A signed image whose trailer carries a 64-byte hash, which is what this
     /// product's images carry: MCUboot here is built for SHA-512.
     fn signed_image(payload: u8, hash: &[u8; 64]) -> Vec<u8> {
@@ -1538,200 +1268,6 @@ mod tests {
         out.extend_from_slice(&left);
         out.extend_from_slice(&right);
         out
-    }
-
-    #[test]
-    fn a_failure_before_anything_was_written_says_the_keyboard_is_fine() {
-        let advice = advice_of(Progress::default());
-        assert!(advice.contains("untouched"), "{advice}");
-    }
-
-    #[test]
-    fn an_upload_that_was_never_marked_leaves_the_keyboard_as_it_was() {
-        let advice = advice_of(Progress {
-            written: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("still running the firmware they were"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-    }
-
-    #[test]
-    fn a_right_that_restarted_without_the_left_says_the_halves_disagree() {
-        // The case that matters: half-working keyboard, and two ways out of it.
-        // The right came back from its restart — the left is only written once
-        // it has — and then the left's own write did not land.
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            right_back: true,
-            left_pending: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("different protocol versions"), "{advice}");
-        // And what happens to the right's image is told as the condition it
-        // actually is: it keeps the image only once this run confirms it, which
-        // does not happen while the left is still on the old build.
-        assert!(advice.contains("keeps that image only once"), "{advice}");
-        assert!(advice.contains("puts its old firmware back"), "{advice}");
-        assert!(advice.contains("re-run"), "{advice}");
-        assert!(advice.contains("power-cycle"), "{advice}");
-    }
-
-    #[test]
-    fn a_right_that_never_came_back_from_its_restart_says_to_go_and_look_at_it() {
-        // The failure mode the wait between the halves adds: the right was
-        // written and restarted, the left was deliberately not touched, and
-        // this end never saw the right again.
-        let advice = advice_of(Progress {
-            declared: true,
-            written: true,
-            right_restarted: true,
-            right_back: false,
-            left_pending: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("has not come back"), "{advice}");
-        assert!(advice.contains("left\nwas not touched"), "{advice}");
-        assert!(advice.contains("power-cycle"), "{advice}");
-        // And it is not the message for a right that did come back, which is a
-        // half-updated keyboard rather than a missing half.
-        let back = advice_of(Progress {
-            declared: true,
-            written: true,
-            right_restarted: true,
-            right_back: true,
-            left_pending: true,
-            ..Progress::default()
-        });
-        assert!(!back.contains("did not come back"), "{back}");
-        assert!(back.contains("different protocol versions"), "{back}");
-    }
-
-    #[test]
-    fn a_right_that_restarted_onto_a_left_already_carrying_its_image_is_not_a_mismatch() {
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_pending: false,
-            ..Progress::default()
-        });
-        assert!(!advice.contains("different protocol"), "{advice}");
-        assert!(advice.contains("same build"), "{advice}");
-        // Both halves are on the same build, and the right's image is still
-        // going: nothing but this run confirms it, and this run did not get
-        // there, so it says so flatly rather than leaving it open.
-        assert!(advice.contains("only once this has confirmed it"), "{advice}");
-        assert!(advice.contains("reverts on the next restart"), "{advice}");
-    }
-
-    #[test]
-    fn a_pair_put_back_the_way_it_was_says_the_keyboard_is_fine() {
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_restarted: true,
-            settled: true,
-            reverted: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("Nothing was kept"), "{advice}");
-        assert!(advice.contains("works\nexactly as it did"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-        // Not the alarming one, and not the confirm one either.
-        assert!(!advice.contains("Power-cycle"), "{advice}");
-        assert!(!advice.contains("half working"), "{advice}");
-    }
-
-    #[test]
-    fn a_pair_that_could_not_be_put_back_asks_for_a_power_cycle_first() {
-        // The worse ending: the revert was tried and at least one half was not
-        // seen back on its old image, so the two may be on different builds.
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_restarted: true,
-            settled: true,
-            mismatched: true,
-            revert_failed: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("could not put the keyboard back"), "{advice}");
-        assert!(advice.contains("different builds"), "{advice}");
-        assert!(advice.contains("Power-cycle"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-        // It outranks every other ending, including the mismatch it implies.
-        assert!(!advice.contains("Nothing was kept"), "{advice}");
-    }
-
-    #[test]
-    fn a_half_that_never_came_back_asks_for_a_power_cycle() {
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_restarted: true,
-            left_pending: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("did\nnot come back"), "{advice}");
-        assert!(advice.contains("Power-cycle"), "{advice}");
-    }
-
-    #[test]
-    fn a_failure_at_the_confirm_says_which_way_it_will_go_on_its_own() {
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_restarted: true,
-            left_pending: true,
-            settled: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("not confirmed"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-    }
-
-    #[test]
-    fn a_failure_after_the_declaration_but_before_any_write_says_nothing_is_pending() {
-        let advice = advice_of(Progress {
-            declared: true,
-            session_id: Some(3),
-            ..Progress::default()
-        });
-        assert!(advice.contains("nothing was written"), "{advice}");
-        assert!(advice.contains("dropped on"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-    }
-
-    #[test]
-    fn an_interrupted_write_says_an_expired_session_costs_nothing() {
-        let advice = advice_of(Progress {
-            declared: true,
-            written: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("session expired"), "{advice}");
-        assert!(advice.contains("picks up from what is already installed"), "{advice}");
-    }
-
-    #[test]
-    fn an_interrupted_write_with_the_right_still_pending_says_which_half_goes_first() {
-        // The refusal a left-half write hits when the right is not finished,
-        // told as a state of the keyboard rather than as an error code.
-        let advice = advice_of(Progress {
-            declared: true,
-            written: true,
-            right_pending: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("right half has to be updated first"), "{advice}");
-        // And a run whose right half was already done does not say it.
-        let done = advice_of(Progress {
-            declared: true,
-            written: true,
-            ..Progress::default()
-        });
-        assert!(!done.contains("has to be updated first"), "{done}");
     }
 
     /// A plan the way `run` builds one: the right first, then the left.
@@ -2030,24 +1566,6 @@ mod tests {
     }
 
     #[test]
-    fn a_keyboard_on_two_builds_gets_advice_about_the_two_builds() {
-        // Not the confirm advice: both halves may well be running the images
-        // they were given, and the problem is that they are different ones.
-        let advice = advice_of(Progress {
-            written: true,
-            right_restarted: true,
-            left_restarted: true,
-            settled: true,
-            mismatched: true,
-            ..Progress::default()
-        });
-        assert!(advice.contains("not on the same build"), "{advice}");
-        assert!(advice.contains("cannot talk to"), "{advice}");
-        assert!(advice.contains("zapp flash fw.zsab"), "{advice}");
-        assert!(!advice.contains("has not confirmed"), "{advice}");
-    }
-
-    #[test]
     fn the_hash_a_half_is_running_is_the_active_slots() {
         let slots = vec![
             ImageSlot {
@@ -2092,97 +1610,6 @@ mod tests {
     /// these are checking.
     fn flat(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    /// An error shaped the way one comes back from a board.
-    fn refused(group: u16, rc: i64) -> anyhow::Error {
-        anyhow::Error::from(SmpError::Remote {
-            group,
-            rc,
-            meaning: "test",
-        })
-        .context("The left half's upload failed")
-    }
-
-    #[test]
-    fn a_refusal_this_build_knows_gets_a_plain_paragraph() {
-        let advice = refusal_note(&refused(zsa_err::GROUP, 1), Battery::default(), false).unwrap();
-        assert!(flat(&advice).contains("battery is too low"), "{advice}");
-        assert!(flat(&advice).contains("Charge the keyboard"), "{advice}");
-        // Wrapped prose, not one long line, and no raw code in the text.
-        // Counted in characters, which is what `wrap` folds on.
-        assert!(advice.lines().count() > 1, "{advice}");
-        assert!(
-            advice.lines().all(|line| line.chars().count() <= 76),
-            "{advice}"
-        );
-        assert!(!advice.contains("rc "), "{advice}");
-    }
-
-    #[test]
-    fn the_three_refusals_a_user_acts_on_differently_read_differently() {
-        let note = |code| refusal_note(&refused(zsa_err::GROUP, code), Battery::default(), false);
-        let battery = note(2).unwrap();
-        let busy = note(6).unwrap();
-        let link = note(9).unwrap();
-        assert!(flat(&battery).contains("Charge"), "{battery}");
-        assert!(flat(&busy).contains("already talking"), "{busy}");
-        assert!(flat(&link).contains("never got to the right half"), "{link}");
-        assert_ne!(battery, busy);
-        assert_ne!(busy, link);
-    }
-
-    #[test]
-    fn a_code_from_a_newer_firmware_gets_no_paragraph_at_all() {
-        // The error itself still prints "(group 66, rc 99)", which is honest.
-        // Inventing a paragraph for it would not be.
-        let note = |err: anyhow::Error| refusal_note(&err, Battery::default(), false);
-        assert!(note(refused(zsa_err::GROUP, 99)).is_none());
-        assert!(note(refused(1, 9)).is_none());
-        assert!(note(anyhow::anyhow!("something else")).is_none());
-    }
-
-    #[test]
-    fn a_battery_refusal_quotes_the_measured_levels_and_the_threshold() {
-        let battery = Battery {
-            left: Level::Percent(0),
-            right: Level::Percent(27),
-            keyboard: Level::Percent(0),
-        };
-        let note = refusal_note(&refused(zsa_err::GROUP, 1), battery, false).unwrap();
-        assert!(flat(&note).contains("The left reads 0%"), "{note}");
-        assert!(flat(&note).contains("the right 27%"), "{note}");
-        assert!(flat(&note).contains("threshold is 30%"), "{note}");
-        assert!(flat(&note).contains("Charge the keyboard"), "{note}");
-    }
-
-    #[test]
-    fn a_battery_refusal_for_a_half_this_end_could_not_read_says_so() {
-        // The board refused on its own measurement. Printing "the right is at
-        // 0%" here would be a number nobody read.
-        let battery = Battery {
-            left: Level::Percent(64),
-            right: Level::Unknown,
-            keyboard: Level::Percent(64),
-        };
-        let note = refusal_note(&refused(zsa_err::GROUP, 2), battery, false).unwrap();
-        assert!(flat(&note).contains("could not read a level for it"), "{note}");
-        assert!(flat(&note).contains("the right would not say"), "{note}");
-        // No invented number for the half nobody here could read.
-        assert!(!flat(&note).contains("the right 0%"), "{note}");
-        assert!(!flat(&note).contains("the right reads"), "{note}");
-    }
-
-    #[test]
-    fn a_refusal_that_is_not_about_a_battery_carries_no_levels() {
-        let battery = Battery {
-            left: Level::Percent(0),
-            right: Level::Percent(27),
-            keyboard: Level::Percent(0),
-        };
-        let note = refusal_note(&refused(zsa_err::GROUP, 6), battery, false).unwrap();
-        assert!(!flat(&note).contains("0%"), "{note}");
-        assert!(flat(&note).contains("already talking"), "{note}");
     }
 
     #[test]

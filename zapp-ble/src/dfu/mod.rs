@@ -318,43 +318,6 @@ pub enum DfuError {
     ChunkTooSmall(usize),
 }
 
-impl DfuError {
-    /// The paragraph that says what to do about it, where there is one.
-    pub fn advice(&self) -> Option<&'static str> {
-        match self {
-            DfuError::Refused { fault, .. } => match fault {
-                Fault::Verify | Fault::Write => Some(
-                    "The STM32's flash has already been erased at this point, so the keyboard \
-                     stays in its bootloader until something writes an image it accepts. It is \
-                     not bricked: run the same command again, or flash it over USB.",
-                ),
-                Fault::Locked => Some(
-                    "The left half holds one update lock for every transport — Bluetooth, the \
-                     nRF's own SMP path, and the relay to the right half. Something else has \
-                     it. Wait for that update to finish; if nothing is updating, power-cycle \
-                     the keyboard, which clears the lock.",
-                ),
-                Fault::Enter => Some(BOOTLOADER_BY_HAND),
-                _ => None,
-            },
-            DfuError::NotReady { .. } => Some(BOOTLOADER_BY_HAND),
-            DfuError::Ble(BleError::NotBonded(_)) => Some(
-                "Pair the keyboard from your desktop's Bluetooth settings first: this tool \
-                 does not pair, and the update service is only offered over an encrypted link.",
-            ),
-            _ => None,
-        }
-    }
-}
-
-/// How to get an STM32 into the ignition bootloader without asking the nRF.
-const BOOTLOADER_BY_HAND: &str = "\
-Put the keyboard into its bootloader by hand and run this again — it starts \
-straight away when it finds it already there:
-
-  · press the reset button on the left half, or
-  · hold the top-left key while plugging the keyboard in.";
-
 /// Opens the update service on a bonded board.
 ///
 /// Three channels rather than one: the characteristics want three different
@@ -552,10 +515,6 @@ mod tests {
         assert!(refused(Fault::Verify).to_string().contains("corrupt"));
         assert!(refused(Fault::Locked).to_string().contains("in progress"));
         assert!(refused(Fault::BadLength).to_string().contains("larger"));
-        assert!(refused(Fault::Locked).advice().unwrap().contains("power-cycle"));
-        assert!(refused(Fault::Enter).advice().unwrap().contains("reset"));
-        // And a fault only the firmware knows about gets no invented advice.
-        assert!(refused(Fault::Unknown(9)).advice().is_none());
     }
 
     #[test]
@@ -575,7 +534,6 @@ mod tests {
         };
         let err = select(&[nearby], None).unwrap_err();
         assert!(matches!(err, DfuError::Ble(BleError::NotBonded(_))), "{err:?}");
-        assert!(err.advice().unwrap().contains("Pair"));
     }
 
     #[test]
