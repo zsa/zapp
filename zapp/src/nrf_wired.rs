@@ -77,6 +77,12 @@ const BEGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const BOND_ATTEMPTS: u32 = 4;
 const BOND_RETRY: Duration = Duration::from_millis(500);
 
+/// Whether a failed run should leave the keyboard exactly as it is, for
+/// reading a half's own counters over SWD before anything zeroes them.
+fn keep_state_on_failure() -> bool {
+    std::env::var("ZAPP_KEEP_STATE_ON_FAILURE").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 const SELECT_ATTEMPTS: u32 = 3;
 const SELECT_RETRY: Duration = Duration::from_millis(250);
 
@@ -233,6 +239,20 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // already marked for test reverts now instead of on the next
             // power cycle — either way both halves come back on the build
             // they ran. Best-effort: a half the bus lost cannot hear a reset.
+            //
+            // Unless someone is debugging: a reset zeroes the halves' own
+            // counters, which are the only record of what a failed exchange
+            // did. ZAPP_KEEP_STATE_ON_FAILURE=1 leaves everything as it is,
+            // bootloader included, so it can be read over SWD afterwards.
+            if keep_state_on_failure() {
+                println!();
+                println!(
+                    "ZAPP_KEEP_STATE_ON_FAILURE: both halves left in their bootloaders, \n\
+                     nothing reset. Read what you need, then unplug and replug to recover."
+                );
+                report_failure(err, notes);
+            }
+
             if let Err(err) = ignition.release_md() {
                 log::debug!("could not release MD after the failure: {err}");
             }
@@ -248,35 +268,40 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
                 log::debug!("the bootloader went down with the reset: {err}");
             }
 
-            // One line, plus whatever the thing that actually failed said.
-            // The middle of the chain names bridges, mailboxes and event
-            // codes, which is what this looks like from the inside and no help
-            // to someone holding a keyboard — that stays in the debug log. The
-            // far end of it is different: it is the board's own words, and
-            // leaving them out once cost a whole bench session spent guessing
-            // at a failure the board had already named.
-            log::debug!("failure detail: {err:#}");
-            let mut line = match root_cause(&err) {
-                Some(cause) => format!("Error: {err} ({cause})"),
-                None => format!("Error: {err}"),
-            };
-            if !line.ends_with('.') {
-                line.push('.');
-            }
-            // A note the error already carries, as with a session that
-            // recorded the fault it failed on, is not said twice.
-            for note in notes {
-                if line.contains(&note) {
-                    continue;
-                }
-                line.push(' ');
-                line.push_str(&note);
-            }
-            println!();
-            println!("{}", wrap(&line));
-            std::process::exit(1);
+            report_failure(err, notes);
         }
     }
+}
+
+/// Says what went wrong and stops.
+///
+/// One line, plus whatever the thing that actually failed said. The middle of
+/// the chain names bridges, mailboxes and event codes, which is what this
+/// looks like from the inside and no help to someone holding a keyboard —
+/// that stays in the debug log. The far end of it is different: it is the
+/// board's own words, and leaving them out once cost a whole bench session
+/// spent guessing at a failure the board had already named.
+fn report_failure(err: anyhow::Error, notes: Vec<String>) -> ! {
+    log::debug!("failure detail: {err:#}");
+    let mut line = match root_cause(&err) {
+        Some(cause) => format!("Error: {err} ({cause})"),
+        None => format!("Error: {err}"),
+    };
+    if !line.ends_with('.') {
+        line.push('.');
+    }
+    // A note the error already carries, as with a session that recorded the
+    // fault it failed on, is not said twice.
+    for note in notes {
+        if line.contains(&note) {
+            continue;
+        }
+        line.push(' ');
+        line.push_str(&note);
+    }
+    println!();
+    println!("{}", wrap(&line));
+    std::process::exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,11 +1989,12 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
 ///
 /// Generates a fresh key unless one is given as 60 hex characters. Both halves
 /// take a byte-identical bundle — there is no role field, and the pair links
-/// only when both carry the same one. Writing it is not the proof: a key
-/// mismatch is silent, the radio link simply never forms, with no state either
-/// half can report. So the run ends the way [`flash`] does, by watching the
-/// keyboard come back on USB with both halves reporting — which is the two
-/// applications having re-linked on the new key.
+/// only when both carry the same one. Each half's key is written and read back,
+/// then the run ends the way [`flash`] does, by watching the keyboard come back
+/// on USB with both halves answering — which shows both rebooted into their
+/// applications. It does not show the radio link: the left disables its ESB
+/// client while it has USB power, so on USB the right's telemetry comes over
+/// the TRRS cable.
 pub fn bond(key: Option<&str>) -> Result<()> {
     let config = match key {
         Some(text) => EsbConfig::parse_hex(text)
@@ -2087,18 +2113,10 @@ fn provision_half<L: IgnitionLink + 'static>(
 
     let mut client = connect(shared, half, status.payload_budget(), timeout);
 
-    let mut last_readback: Option<Vec<u8>> = None;
-    for attempt in 1..=BOND_ATTEMPTS {
-        // A dropped request or reply fails one exchange, not the command:
-        // writing the same key again is what the next attempt would do anyway,
-        // and a half left holding half a line is finished by the newline.
-        if attempt > 1 {
-            if let Err(err) = ignition.send(half.into(), b"\n") {
-                log::debug!("could not send the {half} half a resync newline: {err}");
-            }
-            std::thread::sleep(BOND_RETRY);
-        }
-
+    // The last attempt's read-back when it was a mismatch rather than a failed
+    // exchange, which is what decides how the run ends.
+    let mut mismatch: Option<Vec<u8>> = None;
+    let outcome = bond_attempts(ignition, half, |attempt| {
         let exchange = client
             .settings_write(settings::ESB_CONFIG_NAME, config.as_bytes())
             .with_context(|| format!("Could not write the {half} half's pairing key"))
@@ -2109,38 +2127,83 @@ fn provision_half<L: IgnitionLink + 'static>(
             });
         let readback = match exchange {
             Ok(readback) => readback,
-            Err(err) if attempt < BOND_ATTEMPTS => {
-                log::debug!("{half}: pairing-key exchange failed on attempt {attempt}: {err:#}");
-                continue;
+            Err(err) => {
+                mismatch = None;
+                return Attempt::Again(err);
             }
-            Err(err) => return Err(err),
         };
 
         if readback.as_slice() == config.as_bytes().as_slice() {
             log::debug!("{half}: wrote and read back the pairing key");
-            reboot_half(ignition, &mut client, half)?;
-            let label = format!("{} half", titled(half));
-            println!(
-                "  {label:<10}: wrote and read back {} bytes.",
-                settings::ESB_CONFIG_LEN
-            );
-            return Ok(readback);
+            return Attempt::Done(readback);
         }
         log::warn!(
             "{half}: read back {} not {}, on attempt {attempt}",
             settings::fingerprint_hex(&readback),
             settings::hex(&config.key_fingerprint())
         );
-        last_readback = Some(readback);
-    }
+        mismatch = Some(readback);
+        Attempt::Again(anyhow!("the {half} half read back a different pairing key"))
+    });
 
-    // Boot it out of recovery even on failure, then report.
-    let _ = reboot_half(ignition, &mut client, half);
-    bail!(
-        "the {half} half read back a different pairing key than was written, {BOND_ATTEMPTS} times (got {}). \
-         The write is not landing — check the cable between the halves and run bond again",
-        settings::fingerprint_hex(last_readback.as_deref().unwrap_or_default())
-    )
+    match (outcome, mismatch) {
+        (Ok(readback), _) => {
+            reboot_half(ignition, &mut client, half)?;
+            let label = format!("{} half", titled(half));
+            println!(
+                "  {label:<10}: wrote and read back {} bytes.",
+                settings::ESB_CONFIG_LEN
+            );
+            Ok(readback)
+        }
+        (Err(err), None) => Err(err),
+        (Err(_), Some(readback)) => {
+            // Boot it out of recovery even on failure, then report.
+            let _ = reboot_half(ignition, &mut client, half);
+            bail!(
+                "the {half} half read back a different pairing key than was written, {BOND_ATTEMPTS} times (got {}). \
+                 The write is not landing — check the cable between the halves and run bond again",
+                settings::fingerprint_hex(&readback)
+            )
+        }
+    }
+}
+
+/// One attempt's answer inside [`bond_attempts`].
+enum Attempt<T> {
+    Done(T),
+    Again(anyhow::Error),
+}
+
+/// Runs one exchange with a half up to [`BOND_ATTEMPTS`] times.
+///
+/// A dropped request or reply fails one exchange, not the command. Attempts
+/// after the first send the resync newline that finishes a line the half is
+/// still holding, then wait; the last attempt's error is returned. Late replies
+/// from an earlier attempt are dropped by the client, which only takes the
+/// sequence number it asked for.
+fn bond_attempts<L: IgnitionLink + 'static, T>(
+    ignition: &mut Ignition<Shared<L>>,
+    half: Half,
+    mut exchange: impl FnMut(u32) -> Attempt<T>,
+) -> Result<T> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=BOND_ATTEMPTS {
+        if attempt > 1 {
+            if let Err(err) = ignition.send(half.into(), b"\n") {
+                log::debug!("could not send the {half} half a resync newline: {err}");
+            }
+            std::thread::sleep(BOND_RETRY);
+        }
+        match exchange(attempt) {
+            Attempt::Done(value) => return Ok(value),
+            Attempt::Again(err) => {
+                log::debug!("{half}: bond exchange failed on attempt {attempt}: {err:#}");
+                last = Some(err);
+            }
+        }
+    }
+    Err(last.expect("BOND_ATTEMPTS is at least one"))
 }
 
 /// Reads both halves' pairing keys, writing nothing.
@@ -2161,11 +2224,20 @@ fn bond_show_run<L: IgnitionLink + 'static>(
         }
         let mut client = connect(shared, half, status.payload_budget(), timeout);
 
-        let key = match client.settings_read(settings::ESB_CONFIG_NAME) {
-            Ok(value) => HalfKey::Provisioned(value),
-            // ENOENT: the whitelisted setting was never written. Not a
-            // failure — a half running on the development fallback key.
-            Err(SmpError::Remote { rc: 5, .. }) => HalfKey::NotProvisioned,
+        // The left half intermittently drops the tail of the first frame after
+        // SELECT, so the read gets the same retry the write path has.
+        let read = bond_attempts(ignition, half, |_| {
+            match client.settings_read(settings::ESB_CONFIG_NAME) {
+                Ok(value) => Attempt::Done(HalfKey::Provisioned(value)),
+                // ENOENT: the whitelisted setting was never written. Not a
+                // failure — a half running on the development fallback key,
+                // and an answer, so it is not retried.
+                Err(SmpError::Remote { rc: 5, .. }) => Attempt::Done(HalfKey::NotProvisioned),
+                Err(err) => Attempt::Again(anyhow::Error::new(err)),
+            }
+        });
+        let key = match read {
+            Ok(key) => key,
             Err(err) => {
                 let _ = reboot_half(ignition, &mut client, half);
                 return Err(err)
@@ -2269,13 +2341,22 @@ fn describe_config(config: &EsbConfig) {
 /// What the restart check's answer means for a bond.
 ///
 /// The bytes are on both halves and read back before this runs, so nothing here
-/// undoes the provisioning. What it proves — or does not — is whether the pair
-/// re-linked, and a silent mismatch shows up exactly as a keyboard that does
-/// not come back. A run that cannot see the link exits non-zero, the way the
-/// flash's does, so a script can tell a proven pair from an unproven one.
+/// undoes the provisioning. What it shows is that both halves rebooted into
+/// their applications and answer, not that the radio link is up — that is only
+/// visible on battery with no cables. A run that does not see both halves come
+/// back exits non-zero, the way the flash's does.
 fn prove_bond(came_back: bool) {
     if came_back {
-        println!("The pair re-linked — both halves are talking on the new key.");
+        println!();
+        println!(
+            "{}",
+            wrap(
+                "The pairing key landed and was read back on both halves, and the keyboard came \
+                 back with both halves answering. To check the halves' radio link, unplug USB and \
+                 the TRRS cable and run `zapp devices`: it should show both halves' batteries \
+                 over Bluetooth."
+            )
+        );
     } else {
         println!();
         println!("{}", wrap(&unproven_bond()));
@@ -2283,13 +2364,11 @@ fn prove_bond(came_back: bool) {
     }
 }
 
-/// What a bond whose pair did not come back on USB says.
+/// What a bond whose halves did not come back on USB says.
 fn unproven_bond() -> String {
-    "the pairing key landed and was read back on both halves, but the pair has not proven its \
-     radio link yet: the keyboard did not come back on USB with both halves reporting. A key \
-     mismatch looks exactly like this, because a mismatched pair simply never links. Unplug the \
-     keyboard and plug it back in, check both halves report, and if it still does not come back, \
-     run bond again"
+    "the pairing key landed and was read back on both halves, but the keyboard did not come back \
+     on USB with both halves answering. Unplug the keyboard and plug it back in, check both \
+     halves report, and if it still does not come back, run bond again"
         .to_string()
 }
 
@@ -4057,6 +4136,23 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_show_read_is_retried_rather_than_failing_the_command() {
+        // The first read goes missing, the way a half that drops the tail of
+        // the frame after SELECT looks from here. The read is idempotent, so
+        // the next attempt should get the answer.
+        let bundle = a_config().as_bytes().to_vec();
+        let (result, _device) = show_loopback(|device| {
+            device.tweak(|fake| {
+                fake.esb_config = Some(bundle.clone());
+                fake.drop_first_settings_exchange = true;
+            })
+        });
+        let report = result.expect("a read-only look");
+        assert_eq!(report.right, HalfKey::Provisioned(bundle.clone()));
+        assert_eq!(report.left, HalfKey::Provisioned(bundle));
+    }
+
+    #[test]
     fn show_reads_both_halves_and_calls_a_matching_pair_paired() {
         let bundle = a_config().as_bytes().to_vec();
         let (result, _device) = show_loopback(|device| {
@@ -4123,10 +4219,10 @@ mod tests {
     }
 
     #[test]
-    fn the_unproven_message_names_the_silent_mismatch_and_what_to_do() {
+    fn the_unproven_message_says_what_did_not_happen_and_what_to_do() {
         let said = unproven_bond();
         assert!(said.contains("read back on both halves"), "{said}");
-        assert!(said.contains("mismatch"), "{said}");
+        assert!(said.contains("did not come back"), "{said}");
         assert!(said.contains("run bond again"), "{said}");
     }
 }

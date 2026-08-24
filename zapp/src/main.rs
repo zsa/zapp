@@ -103,9 +103,11 @@ enum Commands {
             and they link only when both carry the same 30-byte key. `zapp bond` \
             writes one fresh key to both halves through the bootloader, reads it \
             back off each, then reboots the keyboard and waits for both halves to \
-            report over USB — which is the pair having re-linked on the new key. A \
-            key mismatch is silent: the link just never forms, so that telemetry is \
-            the only real proof.\n\n\
+            report over USB — which shows both came back and answer, not that the \
+            radio link formed. On USB the left switches its radio off, so the link \
+            can only be checked with no cables: unplug USB and the cable between \
+            the halves and run `zapp devices`, which shows both halves' batteries \
+            over Bluetooth when they are linked.\n\n\
             Put the keyboard in its bootloader first (reset button on the left \
             half); bond waits for it and asks. Pass --key to write a specific key \
             instead of generating one, or --show to read what the two halves carry \

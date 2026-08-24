@@ -35,6 +35,31 @@ const MAX_STALLS: u32 = 3;
 /// Enough to walk a 2.4 KiB request back down to one write.
 const MAX_SHRINKS: u32 = 4;
 
+/// Bench knob: milliseconds to sleep after every acknowledged upload chunk.
+/// Unset, zero or unparsable means no pacing.
+fn upload_pace() -> Option<Duration> {
+    std::env::var("ZAPP_UPLOAD_PACE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// The smallest request the `ZAPP_REQUEST_LIMIT` knob may ask for. Below this
+/// a request cannot carry a chunk worth sending, and `img::chunk_size` returns
+/// 0 for a [`SmpError::ChunkTooSmall`].
+const MIN_REQUEST_LIMIT: usize = 64;
+
+/// Bench knob: an upper bound on the request size, in bytes. May go below the
+/// MTU, so one request becomes a short write. Unset, zero or unparsable leaves
+/// the negotiated limit alone.
+fn upload_request_limit() -> Option<usize> {
+    std::env::var("ZAPP_REQUEST_LIMIT")
+        .ok()
+        .and_then(|bytes| bytes.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+}
+
 /// What a device says about the buffers it reassembles requests into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McumgrParams {
@@ -349,6 +374,18 @@ impl SmpClient {
         }
         let sha = image::sha256(data);
 
+        let pace = upload_pace();
+        if let Some(pace) = pace {
+            log::debug!("pacing uploads by {} ms", pace.as_millis());
+        }
+        if let Some(limit) = upload_request_limit() {
+            let capped = self.request_limit.min(limit).max(MIN_REQUEST_LIMIT);
+            if capped != self.request_limit {
+                self.request_limit = capped;
+                log::debug!("request limit capped to {capped} bytes");
+            }
+        }
+
         let mut off = 0u32;
         let mut stalls = 0;
         let mut shrinks = 0;
@@ -415,6 +452,10 @@ impl SmpClient {
                 bytes_written: off as usize,
                 total_bytes: data.len(),
             });
+
+            if let Some(pace) = pace {
+                std::thread::sleep(pace);
+            }
         }
 
         on_progress(FlashProgress::Complete);
