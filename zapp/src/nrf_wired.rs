@@ -51,8 +51,8 @@ use zapp_smp::bundle::{self, Bundle};
 use zapp_smp::settings::{self, EsbConfig};
 use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError, TransportError};
 use zapp_wired::ignition::{
-    usb::UsbLink, ConfirmMode, ConfirmRc, ConfirmResult, ConfirmStatus, Halves, SessionState,
-    TargetState,
+    usb::UsbLink, ConfirmMode, ConfirmRc, ConfirmResult, ConfirmState, ConfirmStatus, Halves,
+    SessionState, TargetState,
 };
 use zapp_wired::{
     Ignition, IgnitionLink, LeftTransport, Retrying, RightTransport, Status, WiredError,
@@ -137,16 +137,40 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// only about not asking thousands of times over a wait of minutes.
 const SETTLE_POLL: Duration = Duration::from_secs(5);
 
-/// How long one queued confirm exchange may take before the host stops polling
-/// for it.
-///
-/// Ignition enforces its own 2 s and then reports a timeout, so this only has
-/// to outlast that: reaching it means the bootloader stopped answering, not
-/// that the half did.
-const EXCHANGE_LIMIT: Duration = Duration::from_secs(5);
+/// How a queued confirm exchange is followed: how often it is asked after, how
+/// long an idle answer is given before the request is sent again, and how long
+/// the whole thing may take.
+#[derive(Debug, Clone, Copy)]
+struct Exchange {
+    /// Between reads of ignition's confirm result block.
+    poll: Duration,
+    /// How long the block may stay idle after a CONFIRM before the host
+    /// concludes the request never took and sends it again.
+    ///
+    /// Long enough that a bootloader which queues in its main loop rather than
+    /// in the control callback has come round; the repeat is refused with a
+    /// stall if it had, and that is read as "held", so a short guess costs
+    /// nothing worse than a stalled transfer.
+    resend_after: Duration,
+    /// How many times a confirm that never took is sent again.
+    resends: u32,
+    /// How long ignition may report the exchange busy before the host gives up
+    /// on it, counted from the last time it was asked and not counting polls
+    /// the bus lost.
+    ///
+    /// Ignition enforces its own 2 s and then reports a timeout, so this only
+    /// has to outlast that. It is well past it because the bridge has been
+    /// seen to stop — no USB handshake for whole seconds, on a Mac — and come
+    /// back; reaching this means it never did.
+    limit: Duration,
+}
 
-/// Between reads of ignition's confirm result block.
-const EXCHANGE_POLL: Duration = Duration::from_millis(50);
+const EXCHANGE: Exchange = Exchange {
+    poll: Duration::from_millis(50),
+    resend_after: Duration::from_millis(250),
+    resends: 2,
+    limit: Duration::from_secs(10),
+};
 
 /// The image number a recovery upload names the spare slot by.
 ///
@@ -620,7 +644,7 @@ fn read_once<L: IgnitionLink>(ignition: &mut Ignition<L>, half: Half, wanted: &[
             why: format!("The {half} half could not be asked what it is running: {err}."),
         };
     }
-    match poll_confirm(ignition) {
+    match poll_confirm(ignition, half, ConfirmMode::Read, wanted, EXCHANGE) {
         Ok(result) => read_landed(result, half),
         Err(err) => Landed::Gone {
             why: format!("The {half} half's answer could not be read back: {err}."),
@@ -708,23 +732,91 @@ fn read_landed(result: ConfirmResult, half: Half) -> Landed {
 ///
 /// Ignition times the exchange out itself, at 2 s, so this only guards against
 /// a bootloader that stops moving the state on at all.
-fn poll_confirm<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Result<ConfirmResult, WiredError> {
-    let deadline = Instant::now() + EXCHANGE_LIMIT;
+/// Follows the confirm `ignition.confirm_start(half, mode, wanted)` just queued
+/// until ignition reports it done, sending it again if it never took.
+///
+/// The result block says one of three things and they are kept apart, because
+/// they call for different things: `Done` is the answer; `Busy` is the bridge
+/// working, to be waited on; `Idle` is the bridge holding no request at all,
+/// which after a CONFIRM the host saw acknowledged means the request was lost
+/// — and CONFIRM is queued rather than acted on, and refused unless idle, so it
+/// is safe to send again. A poll the bus loses says nothing about any of it
+/// and is not charged against the wait.
+fn poll_confirm<L: IgnitionLink>(
+    ignition: &mut Ignition<L>,
+    half: Half,
+    mode: ConfirmMode,
+    wanted: &[u8],
+    pacing: Exchange,
+) -> Result<ConfirmResult, WiredError> {
+    let mut asked = Instant::now();
+    let mut deadline = asked + pacing.limit;
+    let mut resent = 0;
+    let mut last = ConfirmState::Busy;
     loop {
-        let result = ignition.confirm_result()?;
-        if result.done() {
-            return Ok(result);
+        let polled = Instant::now();
+        match ignition.confirm_result() {
+            Ok(result) if result.done() => return Ok(result),
+            Ok(result) => {
+                last = result.state;
+                if result.state == ConfirmState::Idle
+                    && asked.elapsed() >= pacing.resend_after
+                    && resent < pacing.resends
+                {
+                    resent += 1;
+                    log::debug!(
+                        "CONFIRM {half} {mode:?} never took: the result block is still idle \
+                         {:?} after it was sent; sending it again ({resent} of {})",
+                        asked.elapsed(),
+                        pacing.resends
+                    );
+                    match ignition.confirm_start(half, mode, wanted) {
+                        Ok(()) => {}
+                        // Refused: ignition is holding the first one after
+                        // all, so there is nothing to do but keep watching.
+                        Err(WiredError::Stalled { .. }) => {
+                            log::debug!(
+                                "CONFIRM {half} {mode:?}: the repeat was refused, so the \
+                                 first one holds"
+                            );
+                        }
+                        Err(err) => return Err(err),
+                    }
+                    asked = Instant::now();
+                    deadline = asked + pacing.limit;
+                }
+            }
+            // No answer is not an answer: a poll the bus lost — even after the
+            // link's own retries — says nothing about the exchange, which is
+            // still running on the bridge. Ask again, and do not count the time
+            // it took against the exchange: the bridge was not answering
+            // anyone, so its own clock on the half was not running either. A
+            // stall is different: that is ignition refusing the poll, and
+            // stays an error.
+            Err(WiredError::Faulted { reason, .. }) => {
+                log::debug!("CONFIRM_RESULT poll lost on the bus, asking again: {reason}");
+                deadline += polled.elapsed();
+            }
+            Err(err) => return Err(err),
         }
         if Instant::now() >= deadline {
+            let reason = match last {
+                ConfirmState::Idle => format!(
+                    "the bootloader never took the confirm: sent {} times and its result \
+                     block stayed idle",
+                    resent + 1
+                ),
+                _ => format!(
+                    "the bootloader was still working on the confirm {} s after it was asked",
+                    pacing.limit.as_secs()
+                ),
+            };
             return Err(WiredError::Request {
                 request: zapp_wired::ignition::REQ_CONFIRM_RESULT,
-                reason: format!(
-                    "the bootloader was still working on the confirm {} s after it was asked",
-                    EXCHANGE_LIMIT.as_secs()
-                ),
+                reason,
             });
         }
-        std::thread::sleep(EXCHANGE_POLL);
+        std::thread::sleep(pacing.poll);
     }
 }
 
@@ -741,7 +833,7 @@ fn commit_once<L: IgnitionLink>(
     ignition
         .confirm_start(half, ConfirmMode::Commit, wanted)
         .map_err(|err| anyhow!("The {half} half could not be told to keep its image: {err}"))?;
-    let result = poll_confirm(ignition)
+    let result = poll_confirm(ignition, half, ConfirmMode::Commit, wanted, EXCHANGE)
         .map_err(|err| anyhow!("The {half} half's keep could not be read back: {err}"))?;
     commit_outcome(result, half)
 }
@@ -1115,6 +1207,13 @@ fn wait_active<L: IgnitionLink>(
     loop {
         let status = match ignition.status() {
             Ok(status) => status,
+            // The same as a poll that has not seen the state move yet: the
+            // bus lost this one, the entry sequence is still running, and the
+            // deadline below is what bounds the wait.
+            Err(WiredError::Faulted { reason, .. }) if started.elapsed() < BEGIN_TIMEOUT => {
+                log::debug!("STATUS poll lost on the bus, asking again: {reason}");
+                continue;
+            }
             Err(err) => {
                 return Err(NotOpened::fatal(
                     anyhow::Error::new(err).context("Could not read ignition's status"),
@@ -2242,6 +2341,177 @@ fn print_show(report: &ShowReport) {
 mod tests {
     use super::*;
     use crate::zsab::{decide, Decision};
+
+    // ---- The confirm poll ------------------------------------------------
+
+    /// A link whose CONFIRM_RESULT block is scripted: idle for the first
+    /// `idle_polls` polls and until `takes` CONFIRMs have been accepted, then
+    /// busy for `busy` polls, then done — or busy forever.
+    #[derive(Default)]
+    struct ScriptedConfirm {
+        takes: u32,
+        idle_polls: u32,
+        busy: u32,
+        busy_forever: bool,
+        /// Refuse any CONFIRM after the first with a stall, the way ignition
+        /// does while it holds one — and stop reading idle from then on.
+        refuses_repeats: bool,
+        /// Fault the first `faults` polls, the way a lost bus does.
+        faults: u32,
+        /// CONFIRMs sent, refused ones included.
+        starts: u32,
+        /// CONFIRMs accepted.
+        taken: u32,
+        polls: u32,
+        /// Busy polls still to answer once the idle stretch is over.
+        busy_left: Option<u32>,
+    }
+
+    impl IgnitionLink for ScriptedConfirm {
+        fn control_out(&mut self, _r: u8, _v: u16) -> std::result::Result<(), WiredError> {
+            Ok(())
+        }
+        fn control_out_data(
+            &mut self,
+            request: u8,
+            _v: u16,
+            _d: &[u8],
+        ) -> std::result::Result<(), WiredError> {
+            assert_eq!(request, ignition::REQ_CONFIRM);
+            self.starts += 1;
+            if self.refuses_repeats && self.starts > 1 {
+                // Refused because the bridge is holding the first one: from
+                // here the block reads busy, not idle.
+                self.idle_polls = 0;
+                return Err(WiredError::Stalled { request });
+            }
+            self.taken += 1;
+            Ok(())
+        }
+        fn control_in(
+            &mut self,
+            request: u8,
+            _v: u16,
+            length: usize,
+        ) -> std::result::Result<Vec<u8>, WiredError> {
+            assert_eq!(request, ignition::REQ_CONFIRM_RESULT);
+            if self.faults > 0 {
+                self.faults -= 1;
+                return Err(WiredError::Faulted {
+                    request,
+                    reason: "the device did not respond".into(),
+                });
+            }
+            self.polls += 1;
+            let mut block = vec![0u8; length];
+            block[3] = 1; // left
+            block[0] = if self.taken < self.takes || self.polls <= self.idle_polls {
+                0 // idle
+            } else {
+                self.busy_left = self.busy_left.or(Some(self.busy));
+                match self.busy_left {
+                    _ if self.busy_forever => 1, // busy
+                    Some(0) => 2,                // done
+                    Some(left) => {
+                        self.busy_left = Some(left - 1);
+                        1 // busy
+                    }
+                    None => unreachable!(),
+                }
+            };
+            Ok(block)
+        }
+        fn bulk_out(&mut self, _m: &[u8]) -> std::result::Result<(), WiredError> {
+            unreachable!("the confirm tunnel never touches the bulk pipe")
+        }
+        fn bulk_in(&mut self, _t: Duration) -> std::result::Result<Vec<u8>, WiredError> {
+            unreachable!("the confirm tunnel never touches the bulk pipe")
+        }
+    }
+
+    const FAST: Exchange = Exchange {
+        poll: Duration::from_millis(1),
+        resend_after: Duration::from_millis(20),
+        resends: 2,
+        limit: Duration::from_millis(200),
+    };
+
+    type Polled = (std::result::Result<ConfirmResult, WiredError>, ScriptedConfirm);
+
+    fn poll(link: ScriptedConfirm) -> Polled {
+        let mut ignition = Ignition::new(link);
+        ignition
+            .confirm_start(Half::Left, ConfirmMode::Commit, &[0x5a; 32])
+            .unwrap();
+        let result =
+            poll_confirm(&mut ignition, Half::Left, ConfirmMode::Commit, &[0x5a; 32], FAST);
+        (result, ignition.into_link())
+    }
+
+    #[test]
+    fn a_confirm_that_never_took_is_sent_again_and_then_answers() {
+        // The block stays idle after the first CONFIRM — the request was lost
+        // — and the second one takes.
+        let (result, link) = poll(ScriptedConfirm {
+            takes: 2,
+            ..ScriptedConfirm::default()
+        });
+        assert!(result.unwrap().done());
+        assert_eq!(link.starts, 2);
+    }
+
+    #[test]
+    fn a_repeat_ignition_refuses_means_the_first_one_holds() {
+        // The block read idle just before the bridge moved to busy: the repeat
+        // stalls, which is not an error, and the exchange is followed to its
+        // end.
+        let (result, link) = poll(ScriptedConfirm {
+            takes: 1,
+            idle_polls: u32::MAX,
+            refuses_repeats: true,
+            busy: 5,
+            ..ScriptedConfirm::default()
+        });
+        assert!(result.unwrap().done());
+        assert_eq!(link.starts, 2, "sent once, repeated once, and the repeat was refused");
+        assert_eq!(link.taken, 1);
+    }
+
+    #[test]
+    fn a_confirm_nothing_takes_says_so_once_the_repeats_are_spent() {
+        let (result, link) = poll(ScriptedConfirm {
+            takes: u32::MAX,
+            ..ScriptedConfirm::default()
+        });
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("never took"), "{err}");
+        assert_eq!(link.starts, 1 + FAST.resends);
+    }
+
+    #[test]
+    fn a_confirm_that_stays_busy_says_so_and_is_not_sent_again() {
+        let (result, link) = poll(ScriptedConfirm {
+            takes: 1,
+            busy_forever: true,
+            ..ScriptedConfirm::default()
+        });
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("still working"), "{err}");
+        assert_eq!(link.starts, 1, "a busy bridge holds the request; it is not repeated");
+    }
+
+    #[test]
+    fn polls_the_bus_loses_are_asked_again_and_the_exchange_still_lands() {
+        let (result, link) = poll(ScriptedConfirm {
+            takes: 1,
+            faults: 3,
+            busy: 2,
+            ..ScriptedConfirm::default()
+        });
+        assert!(result.unwrap().done());
+        assert_eq!(link.starts, 1);
+        assert_eq!(link.polls, 3);
+    }
     use zapp_core::device::BootloaderKind;
     use zapp_smp::fake::FakeSlot;
     use zapp_smp::{client, img};

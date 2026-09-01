@@ -631,6 +631,20 @@ pub const CONTROL_ATTEMPTS: u32 = 7;
 /// genuinely refused still fails in well under a fifth of a second.
 pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
 
+/// How many times a control *read* is tried before its fault is believed.
+///
+/// More than a stall gets, because the two mean different things. A stall is
+/// the bootloader answering — saying no — so the stall budget only has to
+/// outlast the one gap `BEGIN` opens, and past that a fast refusal is what a
+/// caller wants. A fault is no answer at all: the host controller gave up on
+/// a transaction the device never handshook, which is never how ignition says
+/// anything. Seen on a Mac (IOKit's `kIOReturnNotResponding`) on the
+/// CONFIRM_RESULT poll during a commit, seven times in a row inside the
+/// 126 ms the stall budget covers — so the fault budget keeps doubling to a
+/// little over a second. A read is free to repeat, and the caller's own
+/// deadline is still the real bound.
+pub const FAULT_ATTEMPTS: u32 = 10;
+
 /// A link that submits a stalled or faulted control transfer again.
 ///
 /// A host controller retries a NAK by itself and never a STALL, so a control
@@ -668,7 +682,10 @@ pub const CONTROL_RETRY: Duration = Duration::from_millis(2);
 ///   once the attempts are spent, not as a hang.
 pub struct Retrying<L> {
     inner: L,
+    /// Tries a stalled transfer gets, the first included.
     attempts: u32,
+    /// Tries a faulted read gets, the first included.
+    fault_attempts: u32,
     backoff: Duration,
 }
 
@@ -677,15 +694,28 @@ impl<L> Retrying<L> {
         Self {
             inner,
             attempts: CONTROL_ATTEMPTS,
+            fault_attempts: FAULT_ATTEMPTS,
             backoff: CONTROL_RETRY,
         }
     }
 
-    /// The same, with the policy spelled out. `attempts` counts the first try.
+    /// The same, with one policy spelled out for stalls and faults alike.
+    /// `attempts` counts the first try.
     pub fn with_policy(inner: L, attempts: u32, backoff: Duration) -> Self {
+        Self::with_policies(inner, attempts, attempts, backoff)
+    }
+
+    /// The same, with the stall and fault budgets set apart.
+    pub fn with_policies(
+        inner: L,
+        attempts: u32,
+        fault_attempts: u32,
+        backoff: Duration,
+    ) -> Self {
         Self {
             inner,
             attempts: attempts.max(1),
+            fault_attempts: fault_attempts.max(1),
             backoff,
         }
     }
@@ -705,17 +735,25 @@ impl<L: IgnitionLink> Retrying<L> {
         mut transfer: impl FnMut(&mut L) -> Result<T, WiredError>,
     ) -> Result<T, WiredError> {
         let mut backoff = self.backoff;
-        for attempt in 1..self.attempts {
+        let started = std::time::Instant::now();
+        // Each kind of failure has its own budget; the loop runs to the larger
+        // and the guards below hand back whichever runs out first.
+        let limit = self.attempts.max(self.fault_attempts);
+        for attempt in 1..limit {
             let settled = transfer(&mut self.inner);
-            let again = match &settled {
-                Err(WiredError::Stalled { .. }) => "stalled",
-                Err(WiredError::Faulted { .. }) if idempotent => "faulted",
+            let (again, budget) = match &settled {
+                Err(WiredError::Stalled { .. }) if attempt < self.attempts => {
+                    ("stalled", self.attempts)
+                }
+                Err(WiredError::Faulted { .. }) if idempotent && attempt < self.fault_attempts => {
+                    ("faulted", self.fault_attempts)
+                }
                 _ => return settled,
             };
             log::debug!(
-                "vendor request {request:#04x} {again} on attempt {attempt} of {}; \
-                 submitting it again in {backoff:?}",
-                self.attempts,
+                "vendor request {request:#04x} {again} on attempt {attempt} of {budget}, \
+                 {:?} after the first; submitting it again in {backoff:?}",
+                started.elapsed(),
             );
             // Not the kind of wait this crate got rid of: nothing is being
             // given time to happen, the bus is being let go of for long enough
@@ -1591,6 +1629,41 @@ mod tests {
                 .ends_with("failed: hardware fault or protocol violation"),
             "{err}"
         );
+        assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_read_that_faults_past_the_stall_budget_is_still_tried_within_the_fault_budget() {
+        // The Mac case: CONFIRM_RESULT faulted seven times running, which is
+        // every try a stall would get, and the read has to outlast that.
+        let mut ignition = Ignition::new(Retrying::with_policies(
+            Stalls {
+                faults: CONTROL_ATTEMPTS,
+                ..Stalls::default()
+            },
+            CONTROL_ATTEMPTS,
+            FAULT_ATTEMPTS,
+            Duration::ZERO,
+        ));
+        ignition.status().expect("the attempt after the stall budget");
+        assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS + 1);
+    }
+
+    #[test]
+    fn a_stall_is_not_given_the_fault_budget() {
+        // A refusal still has to come back fast, however long a fault is
+        // waited out for.
+        let mut ignition = Ignition::new(Retrying::with_policies(
+            Stalls {
+                always: true,
+                ..Stalls::default()
+            },
+            CONTROL_ATTEMPTS,
+            FAULT_ATTEMPTS,
+            Duration::ZERO,
+        ));
+        let err = ignition.status().unwrap_err();
+        assert!(matches!(err, WiredError::Stalled { .. }), "{err:?}");
         assert_eq!(spent(ignition).controls, CONTROL_ATTEMPTS);
     }
 
