@@ -869,6 +869,16 @@ pub mod usb {
         }
     }
 
+    /// IOKit's `kIOReturnNotResponding`: the device did not answer a
+    /// transaction the host controller retried, which is the same bus condition
+    /// usbfs reports as EPROTO and this file already treats as a fault. `nusb`'s
+    /// macOS backend leaves it as [`nusb::transfer::TransferError::Unknown`],
+    /// so without the mapping below the one STATUS poll that lands in
+    /// ignition's entry sequence ends a run with `unknown (error 0xe00002ed)`
+    /// on a Mac while the same poll is quietly retried on Linux.
+    #[cfg(target_os = "macos")]
+    const IOKIT_NOT_RESPONDING: u32 = 0xe000_02ed;
+
     /// A failed control transfer, with a stall and a bus fault kept apart from
     /// the rest.
     ///
@@ -876,7 +886,8 @@ pub mod usb {
     /// and a fault again on a read, so a timeout or a disconnect has to stay a
     /// [`WiredError::Request`] or it would be tried six more times for nothing.
     /// `Fault` is what the usbfs backend maps EPROTO, EILSEQ, EOVERFLOW, ECOMM
-    /// and ETIME to.
+    /// and ETIME to; IOKit has no such variant, so its one equivalent code is
+    /// picked out of `Unknown` here.
     fn control_error(request: u8, err: nusb::transfer::TransferError) -> WiredError {
         match err {
             nusb::transfer::TransferError::Stall => WiredError::Stalled { request },
@@ -884,6 +895,13 @@ pub mod usb {
                 request,
                 reason: fault.to_string(),
             },
+            #[cfg(target_os = "macos")]
+            fault @ nusb::transfer::TransferError::Unknown(IOKIT_NOT_RESPONDING) => {
+                WiredError::Faulted {
+                    request,
+                    reason: format!("the device did not respond ({fault})"),
+                }
+            }
             other => WiredError::Request {
                 request,
                 reason: other.to_string(),
@@ -968,6 +986,33 @@ pub mod usb {
                 Err(nusb::transfer::TransferError::Cancelled) => Ok(completion.buffer.to_vec()),
                 Err(err) => Err(WiredError::Usb(err.to_string())),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use nusb::transfer::TransferError;
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn iokit_not_responding_is_a_fault() {
+            // The code a Mac reports for a device that missed a transaction,
+            // which the retry layer has to see as the fault it is.
+            let err = control_error(super::super::REQ_STATUS, TransferError::Unknown(0xe00002ed));
+            assert!(
+                matches!(err, WiredError::Faulted { request: super::super::REQ_STATUS, .. }),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn any_other_os_code_is_not_a_fault() {
+            // kIOReturnTimeout, for one: not a bus fault, and not to be retried.
+            let err = control_error(super::super::REQ_STATUS, TransferError::Unknown(0xe00002d6));
+            assert!(matches!(err, WiredError::Request { .. }), "{err:?}");
+            let err = control_error(super::super::REQ_STATUS, TransferError::Disconnected);
+            assert!(matches!(err, WiredError::Request { .. }), "{err:?}");
         }
     }
 }
