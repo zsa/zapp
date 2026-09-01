@@ -260,7 +260,7 @@ fn group_meaning(group: u16, rc: i64) -> &'static str {
         (super::img::GROUP, 9) => "image too large for the slot",
         (super::img::GROUP, 13) => "image already pending",
         (super::img::GROUP, 24) => "image is not confirmable",
-        (super::zsa_err::GROUP, _) => "a reason this version of zapp does not know",
+        (super::zsa_err::GROUP, _) => "an unrecognised reason",
         _ => "group-specific error",
     }
 }

@@ -272,7 +272,7 @@ impl SmpClient {
                     );
                 } else {
                     log::warn!(
-                        "the board claims a {}-byte buffer, which is not one; keeping {}",
+                        "the board claims a {}-byte buffer; keeping {}",
                         params.buf_size,
                         self.request_limit
                     );

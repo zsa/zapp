@@ -141,9 +141,7 @@ pub fn load_raw_image(file_data: &[u8]) -> Result<RawImage<'_>, ZappError> {
     }
     if file_data[0] == b':' {
         return Err(ZappError::InvalidFirmware(
-            "this is an Intel HEX file, and this path writes a raw image: \
-             build or download a .bin instead"
-                .into(),
+            "this is an Intel HEX file; this path writes a raw .bin".into(),
         ));
     }
 

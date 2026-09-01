@@ -151,31 +151,18 @@ impl Fault {
     pub fn meaning(self) -> &'static str {
         match self {
             Fault::None => "no fault",
-            Fault::Erase => {
-                "the keyboard could not erase the STM32's flash. Nothing was written, so \
-                 it is still running the firmware it was"
-            }
+            Fault::Erase => "the STM32's flash could not be erased",
             Fault::Write => {
-                "the image stopped reaching the STM32 part-way. The old firmware is \
-                 already erased, so flash it again — over Bluetooth or over USB"
+                "the image stopped reaching the STM32 part-way; the old firmware is erased"
             }
-            Fault::Locked => {
-                "another update is already in progress. Wait for it to finish, or \
-                 power-cycle the keyboard if nothing is updating"
-            }
+            Fault::Locked => "another update is in progress",
             Fault::BadLength => {
                 "the keyboard refused the image's length: it is empty, or larger than the \
                  STM32's application region"
             }
-            Fault::Verify => {
-                "the image arrived corrupt — the STM32 checked it against the CRC and \
-                 refused to boot it. Nothing was started, so try again"
-            }
-            Fault::Enter => {
-                "the STM32 did not reach its bootloader. Reset the keyboard by hand and \
-                 try again"
-            }
-            Fault::Unknown(_) => "a fault this zapp does not know",
+            Fault::Verify => "the image failed its CRC check",
+            Fault::Enter => "the STM32 did not reach its bootloader",
+            Fault::Unknown(_) => "an unrecognised fault",
         }
     }
 }
@@ -285,7 +272,7 @@ pub enum DfuError {
     })]
     NoBoard(Option<String>),
 
-    #[error("more than one board matches: {}; name one with --device", .0.join(", "))]
+    #[error("more than one board matches: {}", .0.join(", "))]
     Ambiguous(Vec<String>),
 
     #[error("{0}")]
@@ -468,7 +455,13 @@ mod tests {
         assert_eq!(report.status, Status::Error);
         assert_eq!(report.fault, Fault::Verify);
         assert!(report.refused());
-        assert!(report.check().unwrap_err().to_string().contains("corrupt"));
+        assert!(
+            report
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("failed its CRC check")
+        );
     }
 
     #[test]
@@ -507,12 +500,12 @@ mod tests {
     }
 
     #[test]
-    fn the_faults_a_person_has_to_act_on_say_what_to_do() {
+    fn the_faults_a_person_has_to_act_on_say_what_happened() {
         let refused = |fault| DfuError::Refused {
             status: Status::Error,
             fault,
         };
-        assert!(refused(Fault::Verify).to_string().contains("corrupt"));
+        assert!(refused(Fault::Verify).to_string().contains("CRC check"));
         assert!(refused(Fault::Locked).to_string().contains("in progress"));
         assert!(refused(Fault::BadLength).to_string().contains("larger"));
     }
@@ -542,6 +535,7 @@ mod tests {
         assert_eq!(select(&boards, Some("bench")).unwrap().key, "dev_B");
         let err = select(&boards, None).unwrap_err();
         assert!(matches!(err, DfuError::Ambiguous(ref names) if names.len() == 2), "{err:?}");
-        assert!(err.to_string().contains("--device"));
+        assert!(err.to_string().contains("more than one board matches"));
+        assert!(!err.to_string().contains("--device"));
     }
 }

@@ -37,20 +37,11 @@ enum Commands {
     #[command(
         long_about = "Flash firmware from a local file or Oryx URL.\n\n\
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
-            bundles carrying both wireless halves, and Oryx layout URLs. When \
-            given a URL, the firmware is downloaded and flashed directly.\n\n\
-            A .zsab bundle and a Voyager 2 keyboard image both go over \
-            whichever way the keyboard is reachable: the cable if it is on \
-            USB, Bluetooth otherwise. Over Bluetooth the STM32 is rebooted \
-            into its bootloader on the way, and one already sitting there is \
-            written straight away. Any other keyboard's firmware goes over the \
-            cable, and this waits for the bootloader to appear rather than \
-            expecting it to be there already — press the reset button on the \
-            left half when asked.\n\n\
-            A bundle carries both halves and they are always written together, \
-            the right one first. Over the cable, a right half that does not \
-            answer is waited for: make sure the TRRS cable between the halves \
-            is properly seated while it asks.",
+            bundles carrying both wireless halves, and Oryx layout URLs. A \
+            .zsab bundle and a Voyager 2 keyboard image go over the cable when \
+            the keyboard is on USB and over Bluetooth otherwise; any other \
+            keyboard's firmware goes over the cable. A bundle's two halves are \
+            written together, the right one first.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash .build/zsa_voyager_tng_default.bin\n  \
@@ -65,32 +56,27 @@ enum Commands {
         /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
         firmware: String,
         /// Write a half even if it already carries the image, or the bundle is
-        /// older than what is installed. Only means anything for .zsab bundles:
-        /// a keyboard image is always written.
+        /// older than what is installed. Applies to .zsab bundles only.
         #[arg(long)]
         force: bool,
-        /// Which board, by advertised name or by the handle `zapp devices`
-        /// shows. Only means anything over Bluetooth, where more than one
-        /// bonded board can answer; over the cable there is only ever one.
+        /// Which board, by advertised name or by the handle the device list
+        /// shows. Applies over Bluetooth only.
         #[arg(long, short = 'd')]
         device: Option<String>,
     },
     /// Check Oryx for updates on your layout and flash if available
     #[command(
         long_about = "Check Oryx for updates on your layout and flash if available.\n\n\
-            Detects a connected ZSA keyboard, reads its layout and revision from the \
-            USB serial number, and checks Oryx for a newer firmware revision. If an \
-            update is available, it is downloaded and flashed automatically. \n\
-            Note: This only works if your keyboard is currently flashed with a firmware \
-            coming from Oryx and is not currently in bootloader mode."
+            Reads a connected ZSA keyboard's layout and revision from its USB serial \
+            number, and downloads and flashes the newest revision Oryx has for it."
     )]
     Update,
     /// List the ZSA keyboards this machine can see, wired and wireless
     #[command(long_about = "List the ZSA keyboards this machine can see.\n\n\
             Wired boards are read straight from USB. Bluetooth boards are listed \
             when they are connected to this machine, bonded to it, or advertising \
-            in range. A board that has never been paired only advertises, so pass \
-            --scan to hold a discovery window open long enough to catch one.")]
+            in range, and --scan holds a discovery window open for boards that have \
+            never been paired.")]
     Devices {
         /// Scan for boards that have never been paired to this machine
         #[arg(long)]
@@ -99,19 +85,10 @@ enum Commands {
     /// Pair the two halves by provisioning their shared ESB key over the cable
     #[command(
         long_about = "Provision the ESB pairing key onto both halves over the cable.\n\n\
-            A Voyager 2's two halves talk to each other over a private radio link, \
-            and they link only when both carry the same 30-byte key. `zapp bond` \
-            writes one fresh key to both halves through the bootloader, reads it \
-            back off each, then reboots the keyboard and waits for both halves to \
-            report over USB — which shows both came back and answer, not that the \
-            radio link formed. On USB the left switches its radio off, so the link \
-            can only be checked with no cables: unplug USB and the cable between \
-            the halves and run `zapp devices`, which shows both halves' batteries \
-            over Bluetooth when they are linked.\n\n\
-            Put the keyboard in its bootloader first (reset button on the left \
-            half); bond waits for it and asks. Pass --key to write a specific key \
-            instead of generating one, or --show to read what the two halves carry \
-            without writing anything.",
+            Writes one fresh 30-byte key to both halves through the bootloader, reads \
+            it back off each, then reboots the keyboard and waits for both halves to \
+            report over USB. --key writes a specific key instead of generating one, \
+            and --show reads what the two halves carry without writing anything.",
         after_long_help = "Examples:\n  \
             zapp bond\n  \
             zapp bond --show\n  \
@@ -198,7 +175,7 @@ fn dispatch(command: Commands) -> Result<()> {
         Commands::Bond { key, show } => {
             if show {
                 if key.is_some() {
-                    anyhow::bail!("--show reads what the halves carry; it takes no --key");
+                    anyhow::bail!("--show and --key cannot be combined.");
                 }
                 nrf_wired::bond_show()
             } else {
@@ -247,9 +224,6 @@ fn cmd_devices(scan: bool) -> Result<()> {
     let boards = monitor.snapshot();
     if boards.is_empty() {
         println!("  none");
-        if !scan {
-            println!("  (pass --scan to look for boards that have never been paired)");
-        }
     }
     for board in boards {
         let name = board
@@ -458,7 +432,7 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
         // Said rather than ignored: a keyboard image is always written, so the
         // flag is not doing anything here and silently accepting it would
         // suggest otherwise.
-        println!("--force only applies to .zsab bundles; a keyboard image is always written.");
+        println!("--force is ignored for a keyboard image.");
     }
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
@@ -475,10 +449,7 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
     print_firmware_info(&fw, Transport::Usb);
 
     if device.is_some() {
-        println!(
-            "--device only applies to firmware going over Bluetooth: .zsab bundles \
-             and Voyager 2 keyboard images."
-        );
+        println!("--device is ignored over the cable.");
     }
     wait_and_flash(&fw)
 }
@@ -527,19 +498,7 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
         return wait_and_flash(fw);
     }
 
-    let result = flash_over_ble(data, named);
-    if let Err(err) = &result {
-        // Not for a keyboard that refused the image: the cable changes nothing
-        // about a signature its bootloader does not trust.
-        if err.downcast_ref::<zsab::RightRejected>().is_none() {
-            println!();
-            println!(
-                "If you meant to update over the cable, press the reset button on \
-                 the left half to put the keyboard in its bootloader and run this again."
-            );
-        }
-    }
-    result
+    flash_over_ble(data, named)
 }
 
 /// A bundle, over whichever way the keyboard is reachable.
@@ -567,17 +526,7 @@ fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
         device: named.map(str::to_string),
         ..LinkArgs::default()
     };
-    let result = zsab::update(path, force, &link);
-    if let Err(err) = &result {
-        if err.downcast_ref::<zsab::RightRejected>().is_none() {
-            println!();
-            println!(
-                "If you meant to update over the cable, press the reset button on \
-                 the left half to put the keyboard in its bootloader and run this again."
-            );
-        }
-    }
-    result
+    zsab::update(path, force, &link)
 }
 
 /// Whether the file leads with the .zsab magic.
@@ -622,15 +571,11 @@ fn cmd_update() -> Result<()> {
 
     // Parse serial number as "layoutId/revisionId"
     let Some((layout_id, revision_id)) = connected.serial.split_once('/') else {
-        bail!(
-            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
-        );
+        bail!("The keyboard is not running an Oryx firmware.");
     };
 
     if layout_id.is_empty() || revision_id.is_empty() {
-        bail!(
-            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
-        );
+        bail!("The keyboard is not running an Oryx firmware.");
     }
 
     println!("Layout: {layout_id}, revision: {revision_id}");
@@ -756,10 +701,7 @@ pub fn smp_connect_quiet(args: &LinkArgs, half: Half) -> Result<SmpClient> {
 
     let mut client = client.with_context(|| match half {
         Half::Left => "Could not reach the board over Bluetooth".to_string(),
-        Half::Right => "Could not reach the right half over Bluetooth. It is reached \
-                        through the left, so the left must be running firmware with the \
-                        relay in it, and the halves' radio link must be up."
-            .to_string(),
+        Half::Right => "Could not reach the right half over Bluetooth".to_string(),
     })?;
     if let Some(mtu) = args.mtu {
         client = client.with_mtu(mtu);
@@ -831,12 +773,9 @@ fn flash_over_ble(image: &[u8], device: Option<&str>) -> Result<()> {
     // says what to do about it.
     if image.len() > dfu::MAX_IMAGE {
         bail!(
-            "This image is {} bytes, and the STM32's application region holds {} ({} KiB). \
-             This is a firmware built for another keyboard, or one built to run \
-             without the ignition bootloader under it.",
+            "The image is {} bytes; the STM32's application region holds {} bytes.",
             image.len(),
-            dfu::MAX_IMAGE,
-            dfu::MAX_IMAGE / 1024
+            dfu::MAX_IMAGE
         );
     }
 
@@ -847,7 +786,7 @@ fn flash_over_ble(image: &[u8], device: Option<&str>) -> Result<()> {
     let spinner = new_spinner("Waiting for keyboard in bootloader mode...");
     let ready = client.make_ready(BLE_BOOTLOADER_WAIT, &report_wait);
     spinner.finish_and_clear();
-    ready.context("The STM32 is not in its bootloader, so nothing was written")?;
+    ready.context("The STM32 is not in its bootloader")?;
 
     let pb = flash_bar(100, "");
     let started = Instant::now();

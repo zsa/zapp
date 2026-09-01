@@ -81,7 +81,7 @@ pub enum SmpError {
     })]
     NoBoard(Option<String>),
 
-    #[error("more than one board matches: {}; name one with --device", .0.join(", "))]
+    #[error("more than one board matches: {}", .0.join(", "))]
     Ambiguous(Vec<String>),
 
     #[error("a header needs 8 bytes, got {0}")]

@@ -59,7 +59,7 @@ use zapp_wired::{
 };
 
 use crate::new_spinner;
-use crate::zsab::{named, short, sizes, wrap, Landed};
+use crate::zsab::{named, short, sizes, Landed};
 
 /// How long to give ignition's entry sequence.
 ///
@@ -228,8 +228,8 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             if keep_state_on_failure() {
                 println!();
                 println!(
-                    "ZAPP_KEEP_STATE_ON_FAILURE: both halves left in their bootloaders, \n\
-                     nothing reset. Read what you need, then unplug and replug to recover."
+                    "ZAPP_KEEP_STATE_ON_FAILURE: both halves left in their bootloaders, \
+                     nothing reset."
                 );
                 report_failure(err);
             }
@@ -458,7 +458,7 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
         println!();
         println!("Putting both halves back on the firmware they were running");
         for reason in &reasons {
-            println!("  {}", wrap(reason).replace('\n', "\n  "));
+            println!("  {reason}");
         }
         for (half, verdict) in &landed {
             log::debug!("{half}: {}", verdict.why(*half));
@@ -467,10 +467,8 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
         let summary = reasons.join(" ");
         if let Err(err) = self.reboot_both() {
             return err.context(format!(
-                "The update did not work out and the halves could not be put back: they are \
-                 still on the images that were written, unconfirmed, so an ordinary restart \
-                 reverts them. Power-cycle the keyboard and run the same command again. \
-                 {summary}"
+                "The update failed and the halves could not be reverted; both still carry the \
+                 unconfirmed images. {summary}"
             ));
         }
 
@@ -493,17 +491,14 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
             let back = read_settle(self.ignition, half, &was, started, self.settle);
             let ok = matches!(&back, Landed::Ok { active, .. } if *active == was);
             if !ok {
-                println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
+                println!("  {}", back.why(half));
             }
             restored.push((half, ok));
         }
 
         if restored.iter().all(|(_, back)| *back) {
             return anyhow!(
-                "The update did not work out, so both halves were put back on the firmware they \
-                 were running before it, and both were seen back on it. Nothing was kept and the \
-                 halves work as they did — unplug the keyboard and plug it back in to take the \
-                 STM32 out of its bootloader too. {summary}"
+                "The update failed; both halves are back on their previous firmware. {summary}"
             );
         }
 
@@ -515,9 +510,7 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
             })
             .collect();
         anyhow!(
-            "The update did not work out, and putting both halves back did not finish either: {}. \
-             The keyboard may be on two different builds, in which case the halves cannot talk over \
-             the wire between them. Power-cycle it and run the same command again. {summary}",
+            "The update failed and the revert did not finish: {}. {summary}",
             where_each.join(", ")
         )
     }
@@ -640,15 +633,13 @@ fn read_once<L: IgnitionLink>(ignition: &mut Ignition<L>, half: Half, wanted: &[
 fn exchange_failed(result: &ConfirmResult, half: Half) -> Option<Landed> {
     let why = match result.rc {
         ConfirmRc::Ok => return None,
-        ConfirmRc::Timeout => format!(
-            "The {half} half did not answer the bootloader within its 2 s, so it is not \
-             running firmware that can be asked."
-        ),
+        ConfirmRc::Timeout => {
+            format!("The {half} half did not answer the bootloader within 2 s.")
+        }
         ConfirmRc::Transport => format!("The {half} half could not be reached to ask it anything."),
-        ConfirmRc::BadReply => format!(
-            "The {half} half answered with something this build cannot read; it and this zapp \
-             are not from the same release."
-        ),
+        ConfirmRc::BadReply => {
+            format!("The {half} half answered with something this build cannot read.")
+        }
         ConfirmRc::Unrecognised(code) => format!(
             "The bootloader ended the {half} half's exchange with code {code}, which this \
              build does not know."
@@ -670,10 +661,7 @@ fn read_landed(result: ConfirmResult, half: Half) -> Landed {
     // not an answer about this half either.
     if result.target != Some(half) {
         return Landed::Gone {
-            why: format!(
-                "The {half} half's read came back naming another half, so nothing was learned \
-                 about it."
-            ),
+            why: format!("The {half} half's read came back naming another half."),
         };
     }
     if let Some(gone) = exchange_failed(&result, half) {
@@ -705,15 +693,12 @@ fn read_landed(result: ConfirmResult, half: Half) -> Landed {
             version: String::new(),
         },
         ConfirmStatus::WriteFail => Landed::Gone {
-            why: format!(
-                "The {half} half answered a read with a write-failure status, which a read \
-                 should not produce; it and this zapp are not from the same release."
-            ),
+            why: format!("The {half} half answered a read with a write-failure status."),
         },
         ConfirmStatus::Unrecognised(code) => Landed::Gone {
             why: format!(
                 "The {half} half answered its read with status {code:#04x}, which this build \
-                 does not know; it and this zapp are not from the same release."
+                 does not know."
             ),
         },
     }
@@ -734,8 +719,7 @@ fn poll_confirm<L: IgnitionLink>(ignition: &mut Ignition<L>) -> Result<ConfirmRe
             return Err(WiredError::Request {
                 request: zapp_wired::ignition::REQ_CONFIRM_RESULT,
                 reason: format!(
-                    "the bootloader was still working on the confirm {} s after it was asked, \
-                     which is past its own timeout",
+                    "the bootloader was still working on the confirm {} s after it was asked",
                     EXCHANGE_LIMIT.as_secs()
                 ),
             });
@@ -768,7 +752,7 @@ fn commit_once<L: IgnitionLink>(
 /// there is nothing more to do but say so.
 fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
     if result.target != Some(half) {
-        bail!("The {half} half's keep came back naming another half, so it cannot be trusted.");
+        bail!("The {half} half's keep came back naming another half.");
     }
     if let Some(gone) = exchange_failed(&result, half) {
         bail!("{}", gone.why(half));
@@ -777,25 +761,22 @@ fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
     match result.status {
         // Kept: this query wrote the trailer, or an earlier one already had.
         ConfirmStatus::Ok | ConfirmStatus::Already => Ok(()),
-        ConfirmStatus::Mismatch => bail!(
-            "The {half} half is no longer running the image that was written, so it was not \
-             kept."
-        ),
-        ConfirmStatus::Unreadable => bail!(
-            "The {half} half could not read the hash of what it is running, so it could not \
-             keep it."
-        ),
+        ConfirmStatus::Mismatch => {
+            bail!("The {half} half is no longer running the image that was written.")
+        }
+        ConfirmStatus::Unreadable => {
+            bail!("The {half} half could not read the hash of what it is running.")
+        }
         ConfirmStatus::WriteFail => bail!(
             "The {half} half is running the image that was written and could not keep it: \
              writing its trailer failed."
         ),
         ConfirmStatus::Running => bail!(
-            "The {half} half reported it is only running its image, not keeping it, which the \
-             keeping step should not answer."
+            "The {half} half reported it is only running its image, not keeping it."
         ),
         ConfirmStatus::Unrecognised(code) => bail!(
             "The {half} half answered its keep with status {code:#04x}, which this build does \
-             not know; it and this zapp are not from the same release."
+             not know."
         ),
     }
 }
@@ -867,9 +848,7 @@ impl Waiting {
     /// Puts the line up, if it is not up already.
     fn show(&mut self) {
         self.spinner.get_or_insert_with(|| {
-            new_spinner(
-                "Waiting for the right half, make sure the TRRS cable is properly seated...",
-            )
+            new_spinner("Waiting for the right half...")
         });
     }
 
@@ -1155,8 +1134,7 @@ fn wait_active<L: IgnitionLink>(
             }
             SessionState::Idle => {
                 return Err(NotOpened::fatal(anyhow!(
-                    "The bootloader says no session is open, having just been asked to open \
-                     one. It is running a build that does not carry the wired update path."
+                    "The bootloader reports no session open after BEGIN."
                 )));
             }
             SessionState::Pending => {
@@ -1168,16 +1146,13 @@ fn wait_active<L: IgnitionLink>(
             }
             SessionState::Unrecognised(code) => {
                 return Err(NotOpened::fatal(anyhow!(
-                    "The bootloader reports session state {code}, which this build does not \
-                     know. It and this zapp are not from the same release."
+                    "The bootloader reports session state {code}, which this build does not know."
                 )));
             }
         }
         if started.elapsed() >= BEGIN_TIMEOUT {
             return Err(NotOpened::fatal(anyhow!(
-                "The bootloader was still opening the session {} s after it was asked to. \
-                 Its own entry sequence gives up well inside that, so it is stuck rather \
-                 than slow.",
+                "The bootloader was still opening the session {} s after BEGIN.",
                 BEGIN_TIMEOUT.as_secs()
             )));
         }
@@ -1271,10 +1246,7 @@ fn going_backwards(slots: &[ImageSlot], image: &[u8], half: Half) -> Option<Stri
     let (a, b, c) = installed;
     Some(format!(
         "The bundle's {half} image is v{offered_text}, older than the v{a}.{b}.{c} that half \
-         is already carrying. Writing it would leave the halves on different builds, which is \
-         a keyboard whose halves cannot talk to each other over the wire between them — the \
-         usual cause is a bundle built from a directory that was rebuilt afterwards, so check \
-         the bundle is the one you meant. Pass --force if the downgrade is deliberate."
+         carries."
     ))
 }
 
@@ -1305,8 +1277,7 @@ fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
     let lead = format!("The {half} half took the whole image and then reported");
     // A slot MCUboot cannot validate is left out of its listing (or listed
     // without a hash): the whole image arrived and the bootloader refused it.
-    let rejected = "the firmware file was not signed properly or is corrupt. Your keyboard \
-                    keeps its old firmware.";
+    let rejected = format!("the {half} half rejected the image: bad signature or corrupt file");
     let Some(slot) = secondary(slots) else {
         bail!("{rejected}");
     };
@@ -1315,8 +1286,7 @@ fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
     }
     if slot.hash != wanted {
         bail!(
-            "{lead} {} in its spare slot, not the {} that was sent. The upload did not land \
-             where it was meant to.",
+            "{lead} {} in its spare slot, not the {} that was sent.",
             short(&slot.hash),
             short(wanted),
         );
@@ -1447,9 +1417,7 @@ fn agreed(bundle: &Bundle, carried: &[Carried]) -> Result<()> {
 
     found.push(format!("the bundle is {}", named(&wanted)));
     Err(Mismatched(format!(
-        "The keyboard did not come out of this on one build: {}. Both halves have to be on \
-         the same build or they cannot talk over the wire between them. Run the same command \
-         again; if it says the same thing, the bundle is not the one you meant.",
+        "The halves are on different builds: {}.",
         found.join(", ")
     ))
     .into())
@@ -1525,11 +1493,8 @@ fn finish(outcome: Outcome, look: impl FnOnce() -> bool) -> Result<()> {
 /// keyboard works, and the difference matters to someone deciding what to do
 /// about it.
 fn unproven() -> String {
-    "both halves took the update and are keeping it, but the keyboard has not come back on USB \
-     with both halves reporting. The images are installed — this is the keyboard not running \
-     them where this could see it. Unplug it and plug it back in, check the cable between the \
-     halves is properly seated, and if it still does not come back, run the same command again \
-     to read both halves and see where it stopped"
+    "Both halves kept the update but the keyboard did not come back on USB with both halves \
+     reporting."
         .to_string()
 }
 
@@ -1772,11 +1737,7 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
             }
             Err(WiredError::NoBootloader) => {
                 spinner.finish_and_clear();
-                bail!(
-                    "no bootloader appeared in {} seconds. Press the reset button on the left \
-                     half; `zapp devices` lists what is plugged in",
-                    limit.as_secs()
-                )
+                bail!("No bootloader appeared in {} seconds.", limit.as_secs())
             }
             Err(err) => {
                 spinner.finish_and_clear();
@@ -1936,8 +1897,7 @@ fn bond_run<L: IgnitionLink + 'static>(
     let left = &readbacks[1].1;
     if !keys_agree(left, right) {
         bail!(
-            "the two halves read back different pairing keys (left {}, right {}); they would \
-             not pair. Run bond again",
+            "The two halves read back different pairing keys (left {}, right {}).",
             settings::fingerprint_hex(left),
             settings::fingerprint_hex(right)
         );
@@ -2018,8 +1978,8 @@ fn provision_half<L: IgnitionLink + 'static>(
             // Boot it out of recovery even on failure, then report.
             let _ = reboot_half(ignition, &mut client, half);
             bail!(
-                "the {half} half read back a different pairing key than was written, {BOND_ATTEMPTS} times (got {}). \
-                 The write is not landing — check the cable between the halves and run bond again",
+                "The {half} half read back a different pairing key than was written, \
+                 {BOND_ATTEMPTS} times (got {}).",
                 settings::fingerprint_hex(&readback)
             )
         }
@@ -2194,26 +2154,20 @@ fn prove_bond(came_back: bool) {
     if came_back {
         println!();
         println!(
-            "{}",
-            wrap(
-                "The pairing key landed and was read back on both halves, and the keyboard came \
-                 back with both halves answering. To check the halves' radio link, unplug USB and \
-                 the TRRS cable and run `zapp devices`: it should show both halves' batteries \
-                 over Bluetooth."
-            )
+            "The pairing key was written and read back on both halves; both halves answered \
+             after the restart."
         );
     } else {
         println!();
-        println!("{}", wrap(&unproven_bond()));
+        println!("{}", unproven_bond());
         std::process::exit(1);
     }
 }
 
 /// What a bond whose halves did not come back on USB says.
 fn unproven_bond() -> String {
-    "the pairing key landed and was read back on both halves, but the keyboard did not come back \
-     on USB with both halves answering. Unplug the keyboard and plug it back in, check both \
-     halves report, and if it still does not come back, run bond again"
+    "The pairing key was written and read back on both halves, but the keyboard did not come \
+     back on USB with both halves answering."
         .to_string()
 }
 
@@ -2265,32 +2219,23 @@ fn show_line(name: &str, key: &HalfKey) -> String {
         HalfKey::Provisioned(bytes) => {
             format!("  {label:<10}: {}", settings::fingerprint_hex(bytes))
         }
-        HalfKey::NotProvisioned => format!(
-            "  {label:<10}: not provisioned — running on the development fallback key if the \
-             app build has it enabled"
-        ),
+        HalfKey::NotProvisioned => format!("  {label:<10}: not provisioned"),
     }
 }
 
 /// The verdict line, from whether the two halves' keys agree.
 fn show_verdict(state: MatchState) -> String {
     match state {
-        MatchState::Paired => {
-            "The two halves carry the same pairing key — they are paired.".to_string()
-        }
-        MatchState::Mismatched => "The two halves carry different pairing keys — they are NOT \
-             paired. Run `zapp bond` to pair them."
-            .to_string(),
-        MatchState::Incomplete => "At least one half is not provisioned, so there is no pair to \
-             check. Run `zapp bond` to provision both."
-            .to_string(),
+        MatchState::Paired => "The two halves carry the same pairing key.".to_string(),
+        MatchState::Mismatched => "The two halves carry different pairing keys.".to_string(),
+        MatchState::Incomplete => "At least one half is not provisioned.".to_string(),
     }
 }
 
 fn print_show(report: &ShowReport) {
     println!("{}", show_line("Left", &report.left));
     println!("{}", show_line("Right", &report.right));
-    println!("{}", wrap(&show_verdict(report.match_state())));
+    println!("{}", show_verdict(report.match_state()));
 }
 
 #[cfg(test)]
@@ -2569,7 +2514,7 @@ mod tests {
 
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("in its spare slot"), "{err}");
-        assert!(err.contains("did not land"), "{err}");
+        assert!(err.contains("not the"), "{err}");
     }
 
     #[test]
@@ -2740,8 +2685,8 @@ mod tests {
         });
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("did not work out"), "{err}");
-        assert!(err.contains("did not come out of this on one build"), "{err}");
+        assert!(err.contains("The update failed"), "{err}");
+        assert!(err.contains("The halves are on different builds"), "{err}");
         // Nothing was kept: the left came back wrong, so the pair reverts and no
         // commit is ever sent — not even to the right, which read back fine.
         assert!(device.commits().is_empty(), "a half was committed: {:?}", device.commits());
@@ -2956,8 +2901,7 @@ mod tests {
         let (result, _control, device) = flash_loopback(&blob);
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("older"), "{err}");
-        assert!(err.contains("--force"), "{err}");
+        assert!(err.contains("older than the v9.9.9"), "{err}");
         assert_eq!(
             count(&device, (img::GROUP, img::CMD_UPLOAD)),
             0,
@@ -3310,19 +3254,19 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(wrong.contains("right"), "{wrong}");
-        assert!(wrong.contains("did not land"), "{wrong}");
+        assert!(wrong.contains("not the"), "{wrong}");
 
         // A slot MCUboot could not verify reports no hash at all (or is left
         // out of the listing): the bootloader rejected what arrived.
         let empty = landed(&[slot(1, &[])], &wanted, Half::Left)
             .unwrap_err()
             .to_string();
-        assert!(empty.contains("not signed properly or is corrupt"), "{empty}");
+        assert!(empty.contains("bad signature or corrupt file"), "{empty}");
 
         let missing = landed(&[], &wanted, Half::Left)
             .unwrap_err()
             .to_string();
-        assert!(missing.contains("not signed properly or is corrupt"), "{missing}");
+        assert!(missing.contains("bad signature or corrupt file"), "{missing}");
     }
 
     #[test]
@@ -3459,9 +3403,9 @@ mod tests {
         let err = format!("{:#}", result.unwrap_err());
         // A mismatch is a revert case like any other: two halves on two builds
         // cannot talk to each other, so neither is kept.
-        assert!(err.contains("did not work out"), "{err}");
+        assert!(err.contains("The update failed"), "{err}");
         assert!(
-            err.contains("did not come out of this on one build"),
+            err.contains("The halves are on different builds"),
             "{err}"
         );
         assert!(err.contains("the left half is on 9.9.9"), "{err}");
@@ -3542,13 +3486,9 @@ mod tests {
 
         let err = agreed(&bundle, &split).unwrap_err();
         let text = err.to_string();
-        assert!(
-            text.contains("did not come out of this on one build"),
-            "{text}"
-        );
+        assert!(text.contains("The halves are on different builds"), "{text}");
         assert!(text.contains("the right half is carrying"), "{text}");
         assert!(!text.contains("the left half"), "{text}");
-        assert!(text.contains("cannot talk over the wire"), "{text}");
         // And it is still the type the failure epilogue tells apart.
         assert!(err.chain().any(|cause| cause.is::<Mismatched>()));
     }
@@ -3578,13 +3518,11 @@ mod tests {
         let err = finish(Outcome::Flashed, || false)
             .expect_err("a keyboard that never came back is not a finished update");
         let said = format!("{err}");
-        assert!(said.contains("has not come back on USB"), "{said}");
-        // And it says the images are installed rather than about to disappear:
-        // over the cable nothing reverts, so sending someone to power-cycle in
-        // the hope of getting the old firmware back would be a lie.
-        assert!(said.contains("The images are installed"), "{said}");
+        assert!(said.contains("did not come back on USB"), "{said}");
+        // And it says the images were kept rather than about to disappear:
+        // over the cable nothing reverts.
+        assert!(said.contains("kept the update"), "{said}");
         assert!(!said.contains("old firmware back"), "{said}");
-        assert!(said.contains("cable between the halves"), "{said}");
     }
 
     #[test]
@@ -3961,7 +3899,7 @@ mod tests {
     }
 
     #[test]
-    fn the_match_verdict_reads_a_mismatch_as_not_paired() {
+    fn the_match_verdict_says_whether_the_two_keys_agree() {
         // Two halves cannot disagree over the single in-memory device, so the
         // verdict is checked on the values directly.
         let mismatched = ShowReport {
@@ -3969,8 +3907,8 @@ mod tests {
             right: HalfKey::Provisioned(vec![0x02; settings::ESB_CONFIG_LEN]),
         };
         assert_eq!(mismatched.match_state(), MatchState::Mismatched);
-        assert!(show_verdict(MatchState::Mismatched).contains("NOT"));
-        assert!(show_verdict(MatchState::Paired).contains("paired"));
+        assert!(show_verdict(MatchState::Mismatched).contains("different pairing keys"));
+        assert!(show_verdict(MatchState::Paired).contains("same pairing key"));
         assert!(show_verdict(MatchState::Incomplete).contains("not provisioned"));
     }
 
@@ -3995,10 +3933,10 @@ mod tests {
     }
 
     #[test]
-    fn the_unproven_message_says_what_did_not_happen_and_what_to_do() {
+    fn the_unproven_bond_message_says_what_did_not_happen() {
         let said = unproven_bond();
         assert!(said.contains("read back on both halves"), "{said}");
         assert!(said.contains("did not come back"), "{said}");
-        assert!(said.contains("run bond again"), "{said}");
+        assert!(!said.contains("run bond again"), "{said}");
     }
 }

@@ -73,7 +73,7 @@ pub enum WiredError {
 
     #[error(
         "this build reads version {expected} of ignition's status and the board sent \
-         version {got}; the bootloader and zapp are not from the same release",
+         version {got}",
         expected = ignition::STATUS_VERSION
     )]
     StatusVersion { got: u8 },

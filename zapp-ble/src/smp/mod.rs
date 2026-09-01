@@ -256,7 +256,8 @@ mod tests {
         let boards = vec![board("dev_A", "Voyager"), board("dev_B", "Bench unit")];
         let err = select(&boards, None).unwrap_err();
         assert!(matches!(err, SmpError::Ambiguous(ref names) if names.len() == 2), "{err:?}");
-        assert!(err.to_string().contains("--device"));
+        assert!(err.to_string().contains("more than one board matches"));
+        assert!(!err.to_string().contains("--device"));
     }
 
     #[test]
@@ -282,7 +283,7 @@ mod tests {
     #[test]
     fn a_board_that_was_never_bonded_is_refused_with_a_reason() {
         // Advertising in range, never paired: pairing is the desktop's job,
-        // not this tool's, so the message has to say so rather than time out
+        // not this tool's, so the message names that rather than timing out
         // somewhere inside BlueZ.
         let nearby = BleSighting {
             paired: false,
@@ -294,7 +295,7 @@ mod tests {
             matches!(err, SmpError::Transport(TransportError::Io(_))),
             "{err:?}"
         );
-        assert!(err.to_string().contains("pair it first"), "{err}");
+        assert!(err.to_string().contains("is not bonded to this machine"), "{err}");
     }
 
     #[test]

@@ -659,7 +659,7 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert!(err.to_string().contains("corrupt"));
+        assert!(err.to_string().contains("failed its CRC check"));
     }
 
     #[test]

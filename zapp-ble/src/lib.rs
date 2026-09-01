@@ -33,7 +33,7 @@ pub enum BleError {
     #[error("{0}")]
     NotFound(String),
     /// Reachable, but not bonded — and an SMP link needs an encrypted one.
-    #[error("{0} is not bonded to this machine; pair it first")]
+    #[error("{0} is not bonded to this machine")]
     NotBonded(String),
     #[error("{0}")]
     Platform(String),

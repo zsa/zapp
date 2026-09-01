@@ -87,7 +87,7 @@ pub fn flash_dfu(
         }
         Firmware::IntelHex { .. } => {
             return Err(ZappError::InvalidFirmware(
-                "cannot flash Intel HEX via DFU; expected a .bin file".into(),
+                "Intel HEX cannot be flashed via DFU".into(),
             ));
         }
     };
@@ -117,7 +117,7 @@ pub fn flash_dfu(
 
         if status.b_status == DFU_ERROR {
             return Err(ZappError::Dfu(
-                "failed to clear error status — try unplugging and replugging the device".into(),
+                "failed to clear error status".into(),
             ));
         }
     }

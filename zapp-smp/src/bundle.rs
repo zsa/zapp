@@ -55,7 +55,7 @@ pub enum BundleError {
 
     #[error(
         "the bundle puts its {half} image at {offset} + {size} bytes, past the end of a \
-         {len}-byte file — it is truncated"
+         {len}-byte file; the file is truncated"
     )]
     Overrun {
         half: Half,
@@ -69,7 +69,7 @@ pub enum BundleError {
 
     #[error(
         "the bundle says it was built with key {header:08x} but its {half} image carries \
-         {image:08x} — the two halves would not be able to talk"
+         {image:08x}"
     )]
     KeyMismatch { half: Half, header: u32, image: u32 },
 }

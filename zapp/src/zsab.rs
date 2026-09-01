@@ -51,8 +51,7 @@ const NOTE_EVERY: Duration = Duration::from_secs(15);
 
 /// A keyboard that already carries the bundle, said the same way whichever way
 /// the bundle was going to travel.
-pub(crate) const UP_TO_DATE: &str =
-    "The keyboard is up to date, skipping the flash. Pass --force to write it anyway.";
+pub(crate) const UP_TO_DATE: &str = "The keyboard is up to date, skipping the flash.";
 
 /// Updates both halves from a bundle.
 pub fn update(path: &Path, force: bool, link: &LinkArgs) -> Result<()> {
@@ -109,11 +108,8 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
     // radio-link fault — so the check that can actually name the battery has
     // to run first.
     check_battery(battery, charging)?;
-    let right_slots = read_state(link, Half::Right, Connect::Announced).context(
-        "The right half is reached through the left, over the halves' own radio link, and \
-         that link has to be up before anything is written — updating the left first would \
-         cut off the only route to the right. Check both halves are powered and linked",
-    )?;
+    let right_slots = read_state(link, Half::Right, Connect::Announced)
+        .context("The halves' radio link is down")?;
 
     // What each half would need if nobody had asked for a rewrite. Kept even
     // under --force, because a half that is already running the bundle's image
@@ -442,16 +438,9 @@ fn right_ready(link: &LinkArgs, declaration: &Declaration) -> Result<()> {
         return Err(anyhow::Error::new(RightRejected));
     }
     if seen {
-        bail!(
-            "The right half is back but never settled on the written image within \
-             {waited} s. The left was not touched, so the keyboard still runs what it ran."
-        );
+        bail!("The right half did not settle on the written image within {waited} s.");
     }
-    bail!(
-        "The right half did not come back within {waited} s of its restart. The left was \
-         not touched and is still running the firmware it was. Check the right half is \
-         switched on, charged and near the left."
-    )
+    bail!("The right half did not come back within {waited} s of its restart.")
 }
 
 /// The right half's bootloader refused the written image and booted the old
@@ -461,10 +450,7 @@ pub struct RightRejected;
 
 impl std::fmt::Display for RightRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "the firmware file was not signed properly or is corrupt. Your keyboard \
-             rebooted on the old firmware.",
-        )
+        formatter.write_str("the right half rejected the image: bad signature or corrupt file")
     }
 }
 
@@ -560,8 +546,7 @@ fn cross_check(plan: &[(Half, Step)], next: Next) -> Option<String> {
         return None;
     }
     Some(format!(
-        "  this run planned {} first, which is not what the board says.\n  \
-         The board's own view is what it enforces, so it is the one to follow.",
+        "this run planned {} first; the board says otherwise.",
         match expected {
             Next::Right => "the right half",
             Next::Left => "the left half",
@@ -691,10 +676,7 @@ fn both_on_the_bundle(bundle: &Bundle, running: &[(Half, Vec<u8>)]) -> Result<()
     }
 
     bail!(
-        "The keyboard did not come out of this on one build: {}, and the bundle is {}. Both \
-         halves have to be on the same build or they cannot talk to each other — in that \
-         state the keyboard is half working. Run the same command again to put both halves \
-         on the bundle's build.",
+        "The halves are on different builds: {}; the bundle is {}.",
         wrong.join(", "),
         named(&bundle.header.build_version)
     )
@@ -727,8 +709,7 @@ impl Landed {
                 format!("The {half} half came back but reports nothing running.")
             }
             Landed::Wrong { active, version } => format!(
-                "The {half} half came back running {} ({}), not the image that was written. \
-                 MCUboot put the old image back, which means the new one did not boot.",
+                "The {half} half came back running {} ({}), not the image that was written.",
                 short(active),
                 named(version)
             ),
@@ -923,7 +904,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
         println!();
         println!("Putting both halves back on the firmware they were running");
         for reason in &reasons {
-            println!("  {}", wrap(reason).replace('\n', "\n  "));
+            println!("  {reason}");
         }
 
         // Right then left, the same order everything else touches them in, with
@@ -933,11 +914,11 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
                 continue;
             };
             if matches!(verdict, Landed::Gone { .. }) {
-                println!("  {half:<5}: cannot be reached, so it cannot be reset from here");
+                println!("  {half:<5}: cannot be reached");
                 continue;
             }
             match self.revert(half) {
-                Ok(()) => println!("  {half:<5}: restarting, which puts its old firmware back"),
+                Ok(()) => println!("  {half:<5}: restarting"),
                 Err(err) => println!("  {half:<5}: could not be restarted ({err:#})"),
             }
             if half == Half::Right {
@@ -964,7 +945,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             let back = wait_for_boot(self.link, half, &was);
             self.clear();
             if !matches!(back, Landed::Ok { .. }) {
-                println!("  {}", wrap(&back.why(half)).replace('\n', "\n  "));
+                println!("  {}", back.why(half));
             }
             restored.push((half, matches!(back, Landed::Ok { .. })));
         }
@@ -972,9 +953,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
         let summary = reasons.join(" ");
         if restored.iter().all(|(_, back)| *back) {
             return anyhow::anyhow!(
-                "The update did not work out, so both halves were put back on the firmware they \
-                 were running before it. The keyboard is working and is exactly as it was; \
-                 nothing was kept. {summary}"
+                "The update failed; both halves are back on their previous firmware. {summary}"
             );
         }
 
@@ -986,9 +965,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             })
             .collect();
         anyhow::anyhow!(
-            "The update did not work out, and putting both halves back did not finish either: {}. \
-             The keyboard may be on two different builds, in which case the halves cannot talk to \
-             each other. {summary}",
+            "The update failed and the revert did not finish: {}. {summary}",
             where_each.join(", ")
         )
     }
@@ -1050,69 +1027,23 @@ fn read_state(link: &LinkArgs, half: Half, saying: Connect) -> Result<Vec<ImageS
 ///
 /// A level nobody can read is allowed, deliberately: see `bundle::battery_allows`.
 fn check_battery(battery: Battery, charging: bool) -> Result<()> {
-    let halves = [
-        ("left", battery.left.percent()),
-        ("right", battery.right.percent()),
+    // Left, right, and the combined pack.
+    let levels = [
+        battery.left.percent(),
+        battery.right.percent(),
+        battery.keyboard.percent(),
     ];
-    let mut low: Vec<String> = halves
+    if levels
         .iter()
-        .filter(|(_, level)| !bundle::battery_allows(*level, charging))
-        .map(|(half, level)| format!("the {half} at {}%", level.unwrap_or(0)))
-        .collect();
-    // The combined instance is the lower of the two halves, so naming it as
-    // well would report the same flat pack twice. It is only worth naming on
-    // its own — which is what a board with one battery publishes.
-    if low.is_empty() && !bundle::battery_allows(battery.keyboard.percent(), charging) {
-        low.push(format!(
-            "the keyboard at {}%",
-            battery.keyboard.percent().unwrap_or(0)
-        ));
-    }
-    if low.is_empty() {
+        .all(|level| bundle::battery_allows(*level, charging))
+    {
         return Ok(());
     }
 
     bail!(
-        "{} — under the {}% an update needs.\n\n{}",
-        sentence(&low),
-        bundle::MIN_SOC_PERCENT,
-        wrap(
-            "An update is minutes of radio and a reboot in which the firmware is rewritten, \
-             and a half that runs out part-way has to be recovered over a cable. Charge the \
-             keyboard, or plug it in and try again — on the charger this check does not \
-             apply."
-        )
+        "Batteries low, please charge both halves to at least {}% to flash over Bluetooth.",
+        bundle::MIN_SOC_PERCENT
     );
-}
-
-/// "the left at 0%" / "the left at 0% and the keyboard at 0%" / a comma list.
-fn sentence(parts: &[String]) -> String {
-    match parts {
-        [] => String::new(),
-        [only] => format!("The battery is low: {only}"),
-        [first, second] => format!("The batteries are low: {first} and {second}"),
-        [rest @ .., last] => format!("The batteries are low: {} and {last}", rest.join(", ")),
-    }
-}
-
-/// Folds a paragraph to the width the rest of this file is written at.
-pub(crate) fn wrap(text: &str) -> String {
-    const WIDTH: usize = 76;
-
-    let mut out = String::new();
-    let mut line = 0;
-    for word in text.split_whitespace() {
-        if line > 0 && line + 1 + word.chars().count() > WIDTH {
-            out.push('\n');
-            line = 0;
-        } else if line > 0 {
-            out.push(' ');
-            line += 1;
-        }
-        out.push_str(word);
-        line += word.chars().count();
-    }
-    out
 }
 
 /// Whether the pack is on the charger.
@@ -1415,7 +1346,10 @@ mod tests {
         };
         assert!(reasons[0].contains("The left half came back running"), "{reasons:?}");
         assert!(reasons[0].contains("0.1.9"), "{reasons:?}");
-        assert!(reasons[0].contains("did not boot"), "{reasons:?}");
+        assert!(
+            reasons[0].contains("not the image that was written"),
+            "{reasons:?}"
+        );
 
         // A half reporting nothing at all is named as that rather than given an
         // empty hash to print.
@@ -1454,12 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn a_board_that_disagrees_with_the_plan_says_so_and_defers_to_the_board() {
+    fn a_board_that_disagrees_with_the_plan_says_so() {
         // What a right half this end read as up to date but the board can see
         // has not confirmed looks like.
         let note = cross_check(&plan(Step::Installed, Step::Upload), Next::Right).unwrap();
         assert!(note.contains("the left half"), "{note}");
-        assert!(flat(&note).contains("what it enforces"), "{note}");
+        assert!(note.contains("the board says otherwise"), "{note}");
 
         // And a step from a firmware newer than this build is a disagreement
         // like any other rather than something to guess at.
@@ -1547,11 +1481,11 @@ mod tests {
 
         let err = both_on_the_bundle(&bundle, &running).unwrap_err().to_string();
         let err = flat(&err);
-        assert!(err.contains("did not come out of this on one build"), "{err}");
+        assert!(err.contains("The halves are on different builds"), "{err}");
         assert!(err.contains("the right half is carrying"), "{err}");
         assert!(!err.contains("the left half"), "{err}");
-        assert!(err.contains("cannot talk to each other"), "{err}");
-        assert!(err.contains("Run the same command again"), "{err}");
+        assert!(err.contains("1.2.3-test"), "{err}");
+        assert!(!err.contains("Run the same command again"), "{err}");
     }
 
     #[test]
@@ -1613,45 +1547,30 @@ mod tests {
     }
 
     #[test]
-    fn the_battery_gate_names_the_halves_rather_than_the_pack_twice() {
-        // left and keyboard both read 0, and they are the same cell.
+    fn the_battery_gate_is_one_line_naming_no_level() {
         let battery = Battery {
             left: Level::Percent(0),
             right: Level::Percent(27),
             keyboard: Level::Percent(0),
         };
         let err = check_battery(battery, false).unwrap_err().to_string();
-        assert!(flat(&err).contains("the left at 0%"), "{err}");
-        assert!(flat(&err).contains("the right at 27%"), "{err}");
-        assert!(!flat(&err).contains("keyboard at"), "{err}");
-        assert!(flat(&err).contains("under the 30%"), "{err}");
-        assert!(flat(&err).contains("Charge the keyboard"), "{err}");
+        assert_eq!(
+            err,
+            "Batteries low, please charge both halves to at least 30% to flash over Bluetooth."
+        );
     }
 
     #[test]
-    fn a_board_with_one_battery_is_still_named() {
+    fn a_board_with_one_battery_is_still_caught() {
         let battery = Battery {
             left: Level::Absent,
             right: Level::Absent,
             keyboard: Level::Percent(4),
         };
         let err = check_battery(battery, false).unwrap_err().to_string();
-        assert!(flat(&err).contains("the keyboard at 4%"), "{err}");
-        // No half is named, because this board publishes none.
-        assert!(!flat(&err).contains("the left"), "{err}");
-        assert!(!flat(&err).contains("the right"), "{err}");
-    }
-
-    #[test]
-    fn a_paragraph_is_folded_without_losing_or_breaking_a_word() {
-        let text = "one two three four five six seven eight nine ten eleven twelve \
-                    thirteen fourteen fifteen sixteen seventeen eighteen";
-        let wrapped = wrap(text);
-        assert!(wrapped.lines().count() > 1);
-        assert!(wrapped.lines().all(|line| line.len() <= 76), "{wrapped}");
         assert_eq!(
-            wrapped.split_whitespace().collect::<Vec<_>>(),
-            text.split_whitespace().collect::<Vec<_>>()
+            err,
+            "Batteries low, please charge both halves to at least 30% to flash over Bluetooth."
         );
     }
 
