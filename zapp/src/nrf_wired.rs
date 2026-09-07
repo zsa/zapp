@@ -463,7 +463,7 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
         self.saying("Confirming both halves...");
     }
 
-    /// Resets both halves onto the firmware they were running, and says so.
+    /// Resets both halves onto the firmware they were running.
     ///
     /// Every image this run wrote was marked for test and only a commit keeps
     /// one, so a reset is the whole of the revert: MCUboot puts the old image
@@ -475,25 +475,19 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
     /// Both halves are pulled back into their bootloaders to do it. The left
     /// could be reset on its own, but the right has no reset line the STM32 can
     /// reach, so the session is re-opened and each half is taken out of it the
-    /// same way `write_half` does — the boot MCUboot reverts on.
+    /// same way `write_half` does — the boot MCUboot reverts on. Whatever went
+    /// wrong ends up in the error this returns; nothing here is printed on the
+    /// way, so the caller's one line is the whole story.
     fn revert_pair(&mut self, landed: Vec<(Half, Landed)>, reasons: Vec<String>) -> anyhow::Error {
-        // Nothing below shares a line with a spinner.
         self.clear();
-        println!();
-        println!("Putting both halves back on the firmware they were running");
-        for reason in &reasons {
-            println!("  {reason}");
-        }
         for (half, verdict) in &landed {
             log::debug!("{half}: {}", verdict.why(*half));
         }
 
         let summary = reasons.join(" ");
         if let Err(err) = self.reboot_both() {
-            return err.context(format!(
-                "The update failed and the halves could not be reverted; both still carry the \
-                 unconfirmed images. {summary}"
-            ));
+            log::debug!("could not reopen a session to revert: {err:#}");
+            return anyhow!("Flashing failed, the right side did not confirm.");
         }
 
         let mut restored: Vec<(Half, bool)> = Vec::new();
@@ -514,28 +508,21 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
             // trailer. It is back where it was only if it is now running `was`.
             let back = read_settle(self.ignition, half, &was, started, self.settle);
             let ok = matches!(&back, Landed::Ok { active, .. } if *active == was);
-            if !ok {
-                println!("  {}", back.why(half));
-            }
             restored.push((half, ok));
         }
 
         if restored.iter().all(|(_, back)| *back) {
-            return anyhow!(
-                "The update failed; both halves are back on their previous firmware. {summary}"
-            );
+            return anyhow!("Flashing failed and reverted to the previous firmware; {summary}");
         }
 
-        let where_each: Vec<String> = restored
+        let unrestored: Vec<String> = restored
             .iter()
-            .map(|(half, back)| match back {
-                true => format!("the {half} half is back on the firmware it had"),
-                false => format!("the {half} half could not be seen back on it"),
-            })
+            .filter(|(_, back)| !back)
+            .map(|(half, _)| half.to_string())
             .collect();
         anyhow!(
-            "The update failed and the revert did not finish: {}. {summary}",
-            where_each.join(", ")
+            "Flashing failed, the {} side did not revert; {summary}",
+            unrestored.join(" and ")
         )
     }
 }
@@ -2955,7 +2942,7 @@ mod tests {
         });
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("The update failed"), "{err}");
+        assert!(err.contains("Flashing failed"), "{err}");
         assert!(err.contains("The halves are on different builds"), "{err}");
         // Nothing was kept: the left came back wrong, so the pair reverts and no
         // commit is ever sent — not even to the right, which read back fine.
@@ -3673,7 +3660,7 @@ mod tests {
         let err = format!("{:#}", result.unwrap_err());
         // A mismatch is a revert case like any other: two halves on two builds
         // cannot talk to each other, so neither is kept.
-        assert!(err.contains("The update failed"), "{err}");
+        assert!(err.contains("Flashing failed"), "{err}");
         assert!(
             err.contains("The halves are on different builds"),
             "{err}"

@@ -20,7 +20,7 @@ use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
-    BatteryReading, CMD_GET_TELEMETRY, HidConnection, HidEvent, Nav, Source, Telemetry,
+    BatteryReading, CMD_GET_TELEMETRY, HidConnection, HidEvent, Nav, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 
@@ -311,41 +311,18 @@ fn charge_speed(budget_ma: Option<u16>) -> Option<&'static str> {
     }
 }
 
-/// One half's level, what it is doing, and which path the number took. The
-/// path is worth the words: a relayed level keeps its last value when the link
-/// carrying it stops, so it reads as current long after it stopped being so.
+/// One half's level and, if it is charging, how fast.
 fn read_as(reading: BatteryReading, speed: Option<&str>) -> String {
     let level = match reading.level {
         Some(level) => format!("{level}%"),
         None => "unknown".to_string(),
     };
-    let doing = match (reading.charging, reading.usb) {
-        (Some(true), _) => match speed {
-            Some(speed) => format!(" {speed} charging"),
-            None => " charging".to_string(),
+    match reading.charging {
+        Some(true) => match speed {
+            Some(speed) => format!("{level} {speed} charging"),
+            None => format!("{level} charging"),
         },
-        (Some(false), Some(true)) => " on USB".to_string(),
-        _ => String::new(),
-    };
-    match reading.source.filter(|_| reading.level.is_some()).and_then(came_from) {
-        Some(from) => format!("{level}{doing} ({from})"),
-        None => format!("{level}{doing}"),
-    }
-}
-
-/// Where a reading came from, when that tells the reader something.
-///
-/// A half reporting its own cell and a half read over the cable are both the
-/// ordinary case here and saying so is noise. The rest earn their words: over
-/// the radio may be a moment old, and a source this build does not know should
-/// not be dressed up as one it does.
-fn came_from(source: Source) -> Option<&'static str> {
-    match source {
-        Source::Nrf => None,
-        Source::Wired => None,
-        Source::Esb => Some("relayed over the radio"),
-        Source::Unknown => Some("no source"),
-        Source::Other(_) => Some("a source this zapp does not know"),
+        _ => level,
     }
 }
 
@@ -885,7 +862,7 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zapp_core::hid::Charging;
+    use zapp_core::hid::{Charging, Source};
 
     #[test]
     fn both_halves_of_a_split_board_are_named() {
@@ -980,17 +957,6 @@ mod tests {
         assert_eq!(charge_speed(Some(500)), Some("slow"));
         assert_eq!(charge_speed(Some(0)), None);
         assert_eq!(charge_speed(None), None);
-    }
-
-    #[test]
-    fn a_relayed_level_is_not_dressed_up_as_a_live_one() {
-        // The distinction this whole payload exists for: same number, and the
-        // line has to say which of the two it is.
-        assert_eq!(read_as(reading(Some(64), Source::Wired), None), "64%");
-        assert_eq!(
-            read_as(reading(Some(64), Source::Esb), None),
-            "64% (relayed over the radio)"
-        );
     }
 
     #[test]

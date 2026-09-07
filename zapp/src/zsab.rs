@@ -899,13 +899,7 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             return anyhow::anyhow!("{}", reasons.join(" "));
         }
 
-        // Nothing below shares a line with a spinner.
         self.clear();
-        println!();
-        println!("Putting both halves back on the firmware they were running");
-        for reason in &reasons {
-            println!("  {reason}");
-        }
 
         // Right then left, the same order everything else touches them in, with
         // the relay's lock given time to lapse between the two.
@@ -944,29 +938,24 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
             self.saying("Waiting for the halves to restart...");
             let back = wait_for_boot(self.link, half, &was);
             self.clear();
-            if !matches!(back, Landed::Ok { .. }) {
-                println!("  {}", back.why(half));
-            }
             restored.push((half, matches!(back, Landed::Ok { .. })));
         }
 
         let summary = reasons.join(" ");
         if restored.iter().all(|(_, back)| *back) {
             return anyhow::anyhow!(
-                "The update failed; both halves are back on their previous firmware. {summary}"
+                "Flashing failed and reverted to the previous firmware; {summary}"
             );
         }
 
-        let where_each: Vec<String> = restored
+        let unrestored: Vec<String> = restored
             .iter()
-            .map(|(half, back)| match back {
-                true => format!("the {half} half is back on the firmware it had"),
-                false => format!("the {half} half could not be seen back on it"),
-            })
+            .filter(|(_, back)| !back)
+            .map(|(half, _)| half.to_string())
             .collect();
         anyhow::anyhow!(
-            "The update failed and the revert did not finish: {}. {summary}",
-            where_each.join(", ")
+            "Flashing failed, the {} side did not revert; {summary}",
+            unrestored.join(" and ")
         )
     }
 }
