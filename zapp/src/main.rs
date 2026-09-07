@@ -247,8 +247,12 @@ fn cmd_devices(scan: bool) -> Result<()> {
 /// read both halves directly, and the Bluetooth view of a wired board is
 /// whatever the radio last carried. Firmware without the command simply never
 /// answers, so an empty result here is the normal old-firmware case and says
-/// nothing.
+/// nothing. Only Voyager 2 has a battery or pointing-device header to report
+/// on; the rest have neither, so there is nothing worth asking them.
 fn wired_report(device: &UsbDevice) -> Vec<String> {
+    if device.keyboard != Some(ids::Keyboard::Voyager2) {
+        return Vec::new();
+    }
     match usb_telemetry(device) {
         Some(telemetry) => describe_telemetry(&telemetry),
         None => Vec::new(),
@@ -1037,6 +1041,20 @@ mod tests {
             features(None, Some(ball), None),
             "Trackball (not supported), Trackpad (not supported)"
         );
+    }
+
+    #[test]
+    fn a_board_that_is_not_a_voyager_2_is_never_asked_for_telemetry() {
+        // The original Voyager has no battery and no nav header at all, so
+        // there is nothing to report and nothing worth asking it for.
+        let device = UsbDevice {
+            keyboard: Some(ids::Keyboard::Voyager),
+            bootloader: None,
+            serial: None,
+            vid: 0,
+            pid: 0,
+        };
+        assert_eq!(wired_report(&device), Vec::<String>::new());
     }
 
     #[test]
