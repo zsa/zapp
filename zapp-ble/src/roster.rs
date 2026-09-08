@@ -69,6 +69,7 @@ mod tests {
         BleBoard {
             key: "dev_E8_6B_FC_47_E2_64".into(),
             name: Some("Voyager".into()),
+            address: Some("E8:6B:FC:47:E2:64".into()),
             keyboard: Some(Keyboard::Voyager2),
             presence,
             battery: crate::Battery::default(),
@@ -130,6 +131,7 @@ mod tests {
         let mut roster = Roster::default();
         let other = BleBoard {
             key: "dev_F8_DE_F9_BF_5F_5F".into(),
+            address: Some("F8:DE:F9:BF:5F:5F".into()),
             ..board(Presence::Paired)
         };
         let events = roster.reconcile(vec![board(Presence::Connected), other.clone()]);

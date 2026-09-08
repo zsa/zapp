@@ -15,7 +15,8 @@ pub mod pick;
 mod roster;
 pub mod smp;
 
-pub use battery::{Battery, Half, Level};
+pub use backend::read_charge_detail;
+pub use battery::{Battery, ChargeDetail, Half, Level};
 pub use board::{BleBoard, BleEvent, BleSighting, Presence};
 pub use monitor::BleMonitor;
 pub use roster::Roster;

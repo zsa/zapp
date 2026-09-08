@@ -16,7 +16,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::MatchRule;
 
 use super::{bluez_gatt, Backend, GattChannel, Usage};
-use crate::battery::{self, Battery};
+use crate::battery::{self, Battery, ChargeDetail};
 use crate::{identity, BleError, BleSighting};
 
 pub(super) const BLUEZ: &str = "org.bluez";
@@ -31,6 +31,10 @@ const DESCRIPTOR: &str = "org.bluez.GattDescriptor1";
 const BATTERY_SERVICE: u128 = 0x0000180f_0000_1000_8000_00805f9b34fb;
 const BATTERY_LEVEL: u128 = 0x00002a19_0000_1000_8000_00805f9b34fb;
 const PRESENTATION_FORMAT: u128 = 0x00002904_0000_1000_8000_00805f9b34fb;
+
+/// The left half's battery telemetry service, read-only characteristic: what
+/// the two halves' gauges and chargers read, built on demand.
+const CHARGE_DETAIL: u128 = 0x12345678_1234_5678_1234_56789abcdef2;
 
 /// How long each discovery window stays open, and how often one opens.
 ///
@@ -331,6 +335,37 @@ impl Bluez {
             }
         }
     }
+}
+
+/// What one board's charge-detail characteristic says, read now.
+///
+/// A one-shot on a connection of its own rather than something the monitor
+/// keeps fresh: nothing asks for it until a user does, and the answer costs a
+/// round trip to the board. `key` is the object path a sighting carries.
+///
+/// `None` covers every way this comes to nothing — no bus, a board that is not
+/// connected, firmware without the characteristic, a read that failed — because
+/// none of them is worth a line under a board in a listing. A value that
+/// arrives short is not nothing: what it did not reach is left unknown.
+pub(super) fn read_charge_detail(key: &str) -> Option<ChargeDetail> {
+    let connection = Connection::system().ok()?;
+    let objects = ObjectManagerProxy::new(&connection, BLUEZ, "/").ok()?;
+    let objects = objects.get_managed_objects().ok()?;
+
+    let path = objects
+        .iter()
+        .filter(|(path, _)| path.as_str().starts_with(key))
+        .find_map(|(path, ifaces)| {
+            let characteristic = properties(ifaces, CHARACTERISTIC)?;
+            let uuid = identity::parse_uuid(&get::<String>(characteristic, "UUID")?)?;
+            (uuid == CHARGE_DETAIL).then(|| path.to_string())
+        });
+
+    let Some(path) = path else {
+        log::debug!("{key} publishes no charge detail characteristic");
+        return None;
+    };
+    ChargeDetail::decode(&read(&connection, &path, CHARACTERISTIC)?)
 }
 
 /// What one battery level characteristic needs before its value can be

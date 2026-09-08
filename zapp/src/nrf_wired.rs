@@ -1637,7 +1637,7 @@ fn both_halves_report() -> bool {
         return false;
     };
 
-    let Some(telemetry) = crate::usb_telemetry(keyboard) else {
+    let Some((telemetry, _, _)) = crate::usb_telemetry(keyboard, false) else {
         log::debug!("the keyboard is back but has not answered yet");
         return false;
     };

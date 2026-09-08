@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::battery::ChargeDetail;
 use crate::{BleError, BleSighting};
 
 #[cfg(target_os = "linux")]
@@ -125,6 +126,24 @@ pub trait Backend: Send {
     ) -> Result<Box<dyn GattChannel>, BleError> {
         let _ = (key, service, characteristic, usage);
         Err(BleError::Unsupported("GATT"))
+    }
+}
+
+/// What a connected board's cells and chargers are doing, read once.
+///
+/// `key` is the handle a sighting carries. Outside a board that is connected
+/// and carries the characteristic there is nothing to read, and on a platform
+/// without a GATT backend there is nowhere to read it from: all of those are
+/// `None`, which a caller shows by saying nothing.
+pub fn read_charge_detail(key: &str) -> Option<ChargeDetail> {
+    #[cfg(target_os = "linux")]
+    {
+        bluez::read_charge_detail(key)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = key;
+        None
     }
 }
 

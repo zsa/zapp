@@ -22,6 +22,10 @@ pub struct BleBoard {
     /// identifier, a WinRT device id. Not stable across a re-bond.
     pub key: String,
     pub name: Option<String>,
+    /// The Bluetooth address of the identity this machine is bonded to, when
+    /// the platform handle carries one. `None` off Linux, and for any handle
+    /// that is not a BlueZ device path.
+    pub address: Option<String>,
     /// `None` when nothing the platform offered names the product.
     pub keyboard: Option<Keyboard>,
     pub presence: Presence,
@@ -83,11 +87,30 @@ impl BleBoard {
         Some(Self {
             key: sighting.key.clone(),
             name: sighting.name.clone(),
+            address: address_from_key(&sighting.key),
             keyboard: identity::keyboard_for(sighting),
             presence: sighting.presence()?,
             battery: sighting.battery,
         })
     }
+}
+
+/// The Bluetooth address a platform handle spells out, or `None`.
+///
+/// BlueZ names a device by the address it is bonded to — `dev_FE_DB_E9_A8_B1_36`
+/// at the end of the object path — so the handle already carries the identity
+/// and no round trip to the board is needed for it. Handles of any other shape,
+/// which is every other platform's, carry no address to read.
+fn address_from_key(key: &str) -> Option<String> {
+    let tail = key.rsplit('/').next()?.strip_prefix("dev_")?;
+
+    let octets: Vec<String> = tail.split('_').map(|o| o.to_ascii_uppercase()).collect();
+    let well_formed = octets.len() == 6
+        && octets
+            .iter()
+            .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    well_formed.then(|| octets.join(":"))
 }
 
 #[cfg(test)]
@@ -136,6 +159,45 @@ mod tests {
         assert_eq!(board.keyboard, Some(Keyboard::Voyager2));
         assert_eq!(board.presence, Presence::Paired);
         assert_eq!(board.name.as_deref(), Some("Voyager"));
+    }
+
+    #[test]
+    fn a_board_carries_the_address_out_of_its_object_path() {
+        let sighting = BleSighting {
+            key: "/org/bluez/hci0/dev_FE_DB_E9_A8_B1_36".into(),
+            ..bonded()
+        };
+        let board = BleBoard::from_sighting(&sighting).expect("a bonded ZSA board");
+        assert_eq!(board.address.as_deref(), Some("FE:DB:E9:A8:B1:36"));
+    }
+
+    #[test]
+    fn a_bluez_address_is_read_off_the_path_tail() {
+        assert_eq!(
+            address_from_key("/org/bluez/hci0/dev_FE_DB_E9_A8_B1_36").as_deref(),
+            Some("FE:DB:E9:A8:B1:36")
+        );
+        // Lower case is BlueZ's business; the address we print is not.
+        assert_eq!(
+            address_from_key("dev_fe_db_e9_a8_b1_36").as_deref(),
+            Some("FE:DB:E9:A8:B1:36")
+        );
+    }
+
+    #[test]
+    fn a_handle_that_is_not_a_bluez_device_path_has_no_address() {
+        // Another platform's handle, a BlueZ adapter rather than a device, and
+        // device paths whose tail is the wrong length or not hex.
+        for key in [
+            "8D2F1C4A-0B33-4E7A-9F21-6C5D0E3B7A18",
+            "/org/bluez/hci0",
+            "/org/bluez/hci0/dev_FE_DB_E9_A8_B1",
+            "/org/bluez/hci0/dev_FE_DB_E9_A8_B1_36_7C",
+            "/org/bluez/hci0/dev_FE_DB_E9_A8_B1_3G",
+            "/org/bluez/hci0/dev_FEDBE9A8B136",
+        ] {
+            assert_eq!(address_from_key(key), None, "{key}");
+        }
     }
 
     #[test]

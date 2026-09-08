@@ -33,6 +33,14 @@ pub const CMD_STATUS_LED_CONTROL: u8 = 0x0A;
 /// Ask the board about itself: battery per half, what it can drive, what is
 /// plugged in. Answered with `EVT_TELEMETRY`.
 pub const CMD_GET_TELEMETRY: u8 = 0x0D;
+/// Ask the board what the charger and the fuel gauges read, per half: the
+/// volts, milliamps and degrees behind the percentage `CMD_GET_TELEMETRY`
+/// answers with. Answered with `EVT_CHARGE_TELEMETRY`.
+pub const CMD_GET_CHARGE_TELEMETRY: u8 = 0x0E;
+/// Ask the board what each half's PMIC reads on its input and system rails,
+/// and what its input regulator and charger are set to. Answered with
+/// `EVT_PMIC_RAILS`.
+pub const CMD_GET_PMIC_RAILS: u8 = 0x0F;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -51,6 +59,12 @@ pub const EVT_TRIGGER_SMARTLAYER: u8 = 0x0A;
 /// Answer to `CMD_GET_TELEMETRY`. Its payload is binary and fills the report,
 /// so it carries no STOP_BIT: a 0xFE inside it is data.
 pub const EVT_TELEMETRY: u8 = 0x0D;
+/// Answer to `CMD_GET_CHARGE_TELEMETRY`. Binary and STOP_BIT-free for the same
+/// reason as `EVT_TELEMETRY`: it fills the report and a 0xFE in it is data.
+pub const EVT_CHARGE_TELEMETRY: u8 = 0x0E;
+/// Answer to `CMD_GET_PMIC_RAILS`. Binary and STOP_BIT-free for the same
+/// reason as `EVT_TELEMETRY`: a 0xFE among the millivolts is a value.
+pub const EVT_PMIC_RAILS: u8 = 0x0F;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
@@ -82,7 +96,21 @@ mod telemetry_offset {
     pub const CHARGE_LIMIT_MA: usize = 13;
     pub const CHARGE_CURRENT_MA: usize = 15;
     pub const CHARGE_STATE: usize = 17;
+    pub const BLE_ADDR_TYPE: usize = 18;
+    /// Six bytes, `bt_addr_t` order — least significant first.
+    pub const BLE_ADDR: usize = 19;
+    pub const BLE_SLOT: usize = 25;
+    pub const BLE_SLOT_COUNT: usize = 26;
 }
+
+/// Bytes in the address the identity block carries.
+const BLE_ADDR_LEN: usize = 6;
+
+/// The board has no Bluetooth identity in the active slot yet, so the address
+/// beside it is meaningless rather than zero.
+const TELEMETRY_BLE_ADDR_UNKNOWN: u8 = 0xFF;
+/// `addr_type` for an identity whose address is a random one.
+const TELEMETRY_BLE_ADDR_RANDOM: u8 = 0x01;
 
 /// A battery level the firmware could not read. Never 0: that is a flat one.
 const TELEMETRY_LEVEL_UNKNOWN: u8 = 0xFF;
@@ -100,6 +128,103 @@ const TELEMETRY_BAT_KNOWN: u8 = 0x80;
 const TELEMETRY_CURRENT_UNKNOWN: u16 = 0;
 /// The board has nothing to say about what its charging policy is doing.
 const TELEMETRY_CHG_UNKNOWN: u8 = 0xFF;
+
+/// Charge-telemetry format this host understands, and refused whole when it is
+/// anything else — same rule, and for the same reason, as [`TELEMETRY_VERSION`].
+pub const CHARGE_TELEMETRY_VERSION: u8 = 1;
+
+/// Byte offsets inside the charge-telemetry payload, the bytes after the
+/// `EVT_CHARGE_TELEMETRY` opcode. Same header as the telemetry payload:
+/// `version` and `len` first, and `len` counts the defined bytes after itself.
+mod charge_offset {
+    pub const VERSION: usize = 0;
+    pub const LEN: usize = 1;
+    pub const LEFT_SOURCE: usize = 2;
+    /// The left half's 13-byte detail block — see [`super::detail_offset`].
+    pub const LEFT: usize = 3;
+    pub const RIGHT_SOURCE: usize = 16;
+    pub const RIGHT: usize = 17;
+}
+
+/// Byte offsets inside one detail block, which is the same 13 bytes wherever it
+/// travels: inside a HID report, and inside the board's Bluetooth read.
+mod detail_offset {
+    pub const VOLTAGE_MV: usize = 0;
+    pub const CURRENT_MA: usize = 2;
+    pub const TEMP_CDEG: usize = 4;
+    pub const TTE_MIN: usize = 6;
+    pub const TTF_MIN: usize = 8;
+    pub const CHG_STATUS: usize = 10;
+    pub const CHG_ERROR: usize = 11;
+    pub const CHG_SENSOR: usize = 12;
+}
+
+/// Bytes in one detail block.
+pub const BATTERY_DETAIL_SIZE: usize = 13;
+
+/// Byte offsets inside one PMIC rails block.
+mod rails_offset {
+    pub const FLAGS: usize = 0;
+    pub const VBUS_MV: usize = 1;
+    pub const VSYS_MV: usize = 3;
+    pub const VBUSIN_STATUS: usize = 5;
+    pub const CHG_ENABLE: usize = 6;
+}
+
+/// Bytes in one PMIC rails block.
+pub const PMIC_RAILS_SIZE: usize = 7;
+
+/// Rails-report format this host understands, and refused whole when it is
+/// anything else — same rule, and for the same reason, as [`TELEMETRY_VERSION`].
+pub const PMIC_RAILS_REPORT_VERSION: u8 = 1;
+
+/// Byte offsets inside the rails payload, the bytes after the `EVT_PMIC_RAILS`
+/// opcode. Same header as the other payloads: `version` and `len` first, and
+/// `len` counts the defined bytes after itself.
+mod rails_report_offset {
+    pub const VERSION: usize = 0;
+    pub const LEN: usize = 1;
+    /// The left half's 7-byte rails block — see [`super::rails_offset`].
+    pub const LEFT: usize = 2;
+    pub const RIGHT: usize = 9;
+}
+
+/// `flags` bit 0: the block carries a reading. Clear means the half has not
+/// taken one yet, and the millivolts beside it are zeroes rather than volts.
+const PMIC_RAILS_PRESENT: u8 = 0x01;
+
+/// `flags` bit 1: the boost bit beside it is meaningful. Clear on firmware that
+/// does not report the boost converter at all.
+const PMIC_RAILS_BOOST_KNOWN: u8 = 0x02;
+
+/// `flags` bit 2: the firmware is holding the boost converter off. Only worth
+/// reading while [`PMIC_RAILS_BOOST_KNOWN`] is set.
+const PMIC_RAILS_BOOST_OFF: u8 = 0x04;
+
+/// `flags` bit 3: the half is holding its charge current below the rate it was
+/// commanded, because the charger kept restarting its cycle at that rate.
+const PMIC_RAILS_CHARGE_REDUCED: u8 = 0x08;
+
+/// A PMIC register the firmware did not read this tick. Not zero: every bit
+/// clear is a real register value.
+const PMIC_REG_UNKNOWN: u8 = 0xFF;
+
+/// A cell voltage the board could not read. Zero, because a cell at zero volts
+/// is not a cell anything could have reported it from.
+const DETAIL_MV_UNKNOWN: u16 = 0;
+/// A current or a temperature the board could not read. The one value of the
+/// range that is not a plausible reading, since zero is a real one for both.
+const DETAIL_I16_UNKNOWN: i16 = i16::MIN;
+/// An estimate the fuel gauge would not make. Not zero: zero minutes left is a
+/// real, and rather important, answer.
+const DETAIL_MIN_UNKNOWN: u16 = 0xFFFF;
+/// The top of the minutes field, where the firmware saturates: an estimate this
+/// long is the cap rather than a reading, and carries no information. Unknown
+/// too, so nothing renders a board as having 45 days left.
+const DETAIL_MIN_SATURATED: u16 = 0xFFFE;
+/// A charger register that was not read this tick. Not zero: zero means every
+/// bit clear, which is a charger sitting idle with nothing wrong.
+const DETAIL_REG_UNKNOWN: u8 = 0xFF;
 
 /// Where a battery reading came from. Worth surfacing rather than folding
 /// away: a relayed level keeps its last value when the link carrying it stops,
@@ -210,8 +335,28 @@ pub struct Charging {
     pub state: Option<ChargeState>,
 }
 
+/// The Bluetooth identity the board is using right now: the one the current
+/// connection is on, or the one it would advertise as next.
+///
+/// A board keeps several, one per host it pairs with, and each has an address
+/// of its own — so the address alone does not name the board, and the slot it
+/// sits in is part of the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BleIdentity {
+    /// `FE:DB:E9:A8:B1:36` — most significant byte first, the way an address is
+    /// written everywhere a person reads one, though it travels the other way.
+    pub address: String,
+    /// A random address rather than a public one, which is what a board that
+    /// was never assigned an address block uses.
+    pub random: bool,
+    /// Which host slot this identity is, counted from zero.
+    pub slot: u8,
+    /// How many slots the board keeps. Zero when the firmware did not say.
+    pub slot_count: u8,
+}
+
 /// What a board says about itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Telemetry {
     pub version: u8,
     pub left: BatteryReading,
@@ -222,6 +367,351 @@ pub struct Telemetry {
     pub nav_build: Option<Nav>,
     pub nav_left: Option<Nav>,
     pub nav_right: Option<Nav>,
+    /// `None` from a firmware that predates the field, and from a board that
+    /// has no identity in its active slot yet.
+    pub ble: Option<BleIdentity>,
+}
+
+/// What the charger is doing, out of the nPM1300's `BCHGCHARGESTATUS`.
+///
+/// Every bit stands on its own: `battery_detected` and `supplement` say nothing
+/// about which phase the charge is in, and more than one phase bit at a time is
+/// the register's business rather than something to resolve here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChargerStatus {
+    pub battery_detected: bool,
+    /// Charged, and the charger has terminated.
+    pub complete: bool,
+    /// Below the trickle threshold: filling slowly until the cell is fit for
+    /// the full rate.
+    pub trickle: bool,
+    pub constant_current: bool,
+    pub constant_voltage: bool,
+    /// Fell back under the recharge threshold after completing.
+    pub recharge: bool,
+    /// Stopped because the die is too hot; resumes on its own.
+    pub paused_die_temp: bool,
+    /// The cell is helping the source carry the load.
+    pub supplement: bool,
+}
+
+impl ChargerStatus {
+    pub fn from_bits(raw: u8) -> Self {
+        Self {
+            battery_detected: raw & 0x01 != 0,
+            complete: raw & 0x02 != 0,
+            trickle: raw & 0x04 != 0,
+            constant_current: raw & 0x08 != 0,
+            constant_voltage: raw & 0x10 != 0,
+            recharge: raw & 0x20 != 0,
+            paused_die_temp: raw & 0x40 != 0,
+            supplement: raw & 0x80 != 0,
+        }
+    }
+
+    /// Whether the charger is in no phase at all: nothing to charge, nothing
+    /// attached, or done long enough ago that even `complete` has been cleared.
+    pub fn is_idle(&self) -> bool {
+        !(self.complete
+            || self.trickle
+            || self.constant_current
+            || self.constant_voltage
+            || self.recharge
+            || self.paused_die_temp)
+    }
+}
+
+/// Why the charger stopped, and what the sensors read when it did:
+/// `BCHGERRREASON` and `BCHGERRSENSOR`, raw.
+///
+/// Latched by the hardware until something clears it, so a fault reported here
+/// is one that happened at some point in this session rather than one happening
+/// now — the firmware clears these when a source is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChargerFault {
+    pub reason: u8,
+    pub sensor: u8,
+}
+
+/// `BCHGERRREASON` bits, in register order.
+const FAULT_REASONS: [(u8, &str); 7] = [
+    (0x01, "NTC sensor error"),
+    (0x02, "VBAT sensor error"),
+    (0x04, "VBAT low"),
+    (0x08, "trickle voltage"),
+    (0x10, "measurement timeout"),
+    (0x20, "charge timeout"),
+    (0x40, "trickle timeout"),
+];
+
+/// `BCHGERRSENSOR` bits, in register order.
+const FAULT_SENSORS: [(u8, &str); 8] = [
+    (0x01, "NTC cold"),
+    (0x02, "NTC cool"),
+    (0x04, "NTC warm"),
+    (0x08, "NTC hot"),
+    (0x10, "Vterm"),
+    (0x20, "recharge"),
+    (0x40, "Vtrickle"),
+    (0x80, "VBAT low"),
+];
+
+fn bit_names(bits: u8, table: &[(u8, &'static str)]) -> Vec<&'static str> {
+    table
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+impl ChargerFault {
+    /// Nothing has latched. The usual answer, and not the same as never having
+    /// looked — that is a `None` where this sits.
+    pub fn is_clear(&self) -> bool {
+        self.reason == 0
+    }
+
+    pub fn ntc_sensor_error(&self) -> bool {
+        self.reason & 0x01 != 0
+    }
+    pub fn vbat_sensor_error(&self) -> bool {
+        self.reason & 0x02 != 0
+    }
+    pub fn vbat_low(&self) -> bool {
+        self.reason & 0x04 != 0
+    }
+    pub fn trickle_voltage(&self) -> bool {
+        self.reason & 0x08 != 0
+    }
+    pub fn measurement_timeout(&self) -> bool {
+        self.reason & 0x10 != 0
+    }
+    pub fn charge_timeout(&self) -> bool {
+        self.reason & 0x20 != 0
+    }
+    pub fn trickle_timeout(&self) -> bool {
+        self.reason & 0x40 != 0
+    }
+
+    // The sensor register names the state the hardware was in, not a reason, so
+    // its bits carry the prefix — two of them share a name with a reason bit.
+    pub fn sensor_ntc_cold(&self) -> bool {
+        self.sensor & 0x01 != 0
+    }
+    pub fn sensor_ntc_cool(&self) -> bool {
+        self.sensor & 0x02 != 0
+    }
+    pub fn sensor_ntc_warm(&self) -> bool {
+        self.sensor & 0x04 != 0
+    }
+    pub fn sensor_ntc_hot(&self) -> bool {
+        self.sensor & 0x08 != 0
+    }
+    pub fn sensor_vterm(&self) -> bool {
+        self.sensor & 0x10 != 0
+    }
+    pub fn sensor_recharge(&self) -> bool {
+        self.sensor & 0x20 != 0
+    }
+    pub fn sensor_vtrickle(&self) -> bool {
+        self.sensor & 0x40 != 0
+    }
+    pub fn sensor_vbat_low(&self) -> bool {
+        self.sensor & 0x80 != 0
+    }
+
+    /// The reason bits that are set, named.
+    pub fn reasons(&self) -> Vec<&'static str> {
+        bit_names(self.reason, &FAULT_REASONS)
+    }
+
+    /// What the sensors read when it latched, named.
+    pub fn sensors(&self) -> Vec<&'static str> {
+        bit_names(self.sensor, &FAULT_SENSORS)
+    }
+}
+
+/// One half's cell, in detail: what the gauge and the charger read rather than
+/// the percentage they come to.
+///
+/// Optional throughout, as everywhere else here, because the board sends an
+/// explicit "did not read it" for each field and none of them can be told from
+/// a real reading by its value: 0 mA is a cell at rest, 0 minutes left is a
+/// cell about to go flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BatteryDetail {
+    /// Cell voltage, millivolts.
+    pub voltage_mv: Option<u16>,
+    /// Milliamps, positive into the cell and negative out of it.
+    pub current_ma: Option<i16>,
+    /// What the NTC beside the cell reads, hundredths of a degree Celsius.
+    pub temp_cdeg: Option<i16>,
+    /// Minutes the fuel gauge thinks are left at the present draw.
+    pub tte_min: Option<u16>,
+    /// Minutes the fuel gauge thinks are left until full.
+    pub ttf_min: Option<u16>,
+    pub charger: Option<ChargerStatus>,
+    pub fault: Option<ChargerFault>,
+}
+
+/// What the nPM1300's `VBUSIN.VBUSINSTATUS` says about the input: whether
+/// there is one, and what the input regulator is doing with it.
+///
+/// Every bit stands on its own, as in the charger's status register, so the raw
+/// byte comes along: a firmware newer than this host can set a bit it has no
+/// name for and the number still says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VbusInStatus {
+    pub raw: u8,
+    /// An input is attached.
+    pub present: bool,
+    /// The input regulator is holding at its current limit.
+    pub current_limit: bool,
+    /// The input is above the overvoltage threshold and is being ignored.
+    pub overvoltage: bool,
+    /// The input is below the undervoltage threshold.
+    pub undervoltage: bool,
+    /// The input is suspended: attached and deliberately not drawn from.
+    pub suspended: bool,
+    /// The PMIC is feeding its VBUS output.
+    pub out_active: bool,
+}
+
+/// `VBUSINSTATUS` bits, in register order.
+const VBUSIN_BITS: [(u8, &str); 6] = [
+    (0x01, "present"),
+    (0x02, "current limit"),
+    (0x04, "overvoltage"),
+    (0x08, "undervoltage"),
+    (0x10, "suspended"),
+    (0x20, "out active"),
+];
+
+impl VbusInStatus {
+    pub fn from_bits(raw: u8) -> Self {
+        Self {
+            raw,
+            present: raw & 0x01 != 0,
+            current_limit: raw & 0x02 != 0,
+            overvoltage: raw & 0x04 != 0,
+            undervoltage: raw & 0x08 != 0,
+            suspended: raw & 0x10 != 0,
+            out_active: raw & 0x20 != 0,
+        }
+    }
+
+    /// The bits that are set, named, in register order. Empty is a real
+    /// answer: nothing attached and the output off.
+    pub fn names(&self) -> Vec<&'static str> {
+        bit_names(self.raw, &VBUSIN_BITS)
+    }
+}
+
+/// One half's PMIC rails: what the input and the system rail measure, and what
+/// the input regulator and the charger are set to.
+///
+/// A whole block or nothing — see [`decode_pmic_rails`] — because the flag that
+/// says the half took a reading sits inside it, so a partial one cannot be told
+/// from a half that has not measured yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmicRails {
+    /// The input rail, millivolts, as the PMIC's ADC read it.
+    pub vbus_mv: u16,
+    /// The system rail, millivolts.
+    pub vsys_mv: u16,
+    pub vbusin: VbusInStatus,
+    /// Whether the charger is switched on at all, read back out of
+    /// `BCHGENABLESET`. `None` when the firmware did not read the register —
+    /// which is not the same as a charger that is off.
+    pub charger_enabled: Option<bool>,
+    /// Whether the firmware is holding the boost converter off. `None` on
+    /// firmware that does not report the boost at all.
+    pub boost_off: Option<bool>,
+    /// Whether the half is holding its charge current below the rate it was
+    /// commanded, because the charger kept restarting its cycle at that rate.
+    pub charge_reduced: bool,
+}
+
+/// Decode one PMIC rails block: 7 bytes, all of them there and the block
+/// marked as carrying a reading.
+///
+/// `None` for anything else, the two cases being a board whose firmware
+/// predates the block (so the bytes are absent or zeroed) and one that has not
+/// run a measurement tick yet. Neither has rails to report.
+pub fn decode_pmic_rails(bytes: &[u8]) -> Option<PmicRails> {
+    use rails_offset as offset;
+
+    if bytes.len() != PMIC_RAILS_SIZE || bytes[offset::FLAGS] & PMIC_RAILS_PRESENT == 0 {
+        return None;
+    }
+    let le16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+
+    Some(PmicRails {
+        vbus_mv: le16(offset::VBUS_MV),
+        vsys_mv: le16(offset::VSYS_MV),
+        vbusin: VbusInStatus::from_bits(bytes[offset::VBUSIN_STATUS]),
+        charger_enabled: match bytes[offset::CHG_ENABLE] {
+            PMIC_REG_UNKNOWN => None,
+            raw => Some(raw & 0x01 != 0),
+        },
+        boost_off: (bytes[offset::FLAGS] & PMIC_RAILS_BOOST_KNOWN != 0)
+            .then_some(bytes[offset::FLAGS] & PMIC_RAILS_BOOST_OFF != 0),
+        charge_reduced: bytes[offset::FLAGS] & PMIC_RAILS_CHARGE_REDUCED != 0,
+    })
+}
+
+/// What a board says both its PMICs are seeing.
+///
+/// A half is `None` when it has no rails to report, which covers the three
+/// cases that look alike from here: firmware that predates the block, a half
+/// that has not measured yet, and a right half the left could not reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmicRailsReport {
+    pub version: u8,
+    pub left: Option<PmicRails>,
+    pub right: Option<PmicRails>,
+}
+
+/// Decode a rails payload, the bytes after the `EVT_PMIC_RAILS` opcode.
+///
+/// Same two rules as [`parse_telemetry`]: a format version this host was not
+/// written against is refused whole, and the `len` byte decides the rest. A
+/// block is whole or it is nothing — see [`decode_pmic_rails`].
+pub fn parse_pmic_rails_report(params: &[u8]) -> Option<PmicRailsReport> {
+    use rails_report_offset as at;
+
+    let version = *params.get(at::VERSION)?;
+    if version != PMIC_RAILS_REPORT_VERSION {
+        return None;
+    }
+    let len = *params.get(at::LEN)? as usize;
+    let block = |at: usize| {
+        (at + PMIC_RAILS_SIZE <= len + 2)
+            .then(|| params.get(at..at + PMIC_RAILS_SIZE))
+            .flatten()
+            .and_then(decode_pmic_rails)
+    };
+
+    Some(PmicRailsReport {
+        version,
+        left: block(at::LEFT),
+        right: block(at::RIGHT),
+    })
+}
+
+/// One half's detail and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HalfDetail {
+    pub source: Option<Source>,
+    pub detail: BatteryDetail,
+}
+
+/// What a board says its cells and chargers are doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChargeTelemetry {
+    pub version: u8,
+    pub left: HalfDetail,
+    pub right: HalfDetail,
 }
 
 /// Events from a connected keyboard's raw HID interface.
@@ -254,6 +744,10 @@ pub enum HidEvent {
     TriggerSmartLayer,
     /// The board answered `CMD_GET_TELEMETRY`.
     Telemetry(Telemetry),
+    /// The board answered `CMD_GET_CHARGE_TELEMETRY`.
+    ChargeTelemetry(ChargeTelemetry),
+    /// The board answered `CMD_GET_PMIC_RAILS`.
+    PmicRails(PmicRailsReport),
     /// The read loop ended (device unplugged or errored).
     Disconnected,
 }
@@ -278,7 +772,7 @@ pub fn parse_packet(data: &[u8]) -> Option<(u8, &[u8])> {
     if cmd == STOP_BIT {
         return Some((EVT_GET_PROTOCOL_VERSION, &data[1..data.len().min(2)]));
     }
-    if cmd == EVT_TELEMETRY {
+    if cmd == EVT_TELEMETRY || cmd == EVT_CHARGE_TELEMETRY || cmd == EVT_PMIC_RAILS {
         // Binary payload carrying its own length: 0xFE in it is a value, not
         // a terminator, and truncating there would eat a 254% battery or a
         // reserved byte the board deliberately set.
@@ -322,6 +816,38 @@ fn telemetry_charging(params: &[u8]) -> Charging {
             .filter(|&ma| ma != TELEMETRY_CURRENT_UNKNOWN),
         state: telemetry_field(params, at::CHARGE_STATE).and_then(ChargeState::from_raw),
     }
+}
+
+/// The active Bluetooth identity, or `None`.
+///
+/// All nine bytes or nothing, for the same reason half a `u16` is nothing: an
+/// address missing its last byte is a different address, not a shorter one.
+fn telemetry_ble(params: &[u8]) -> Option<BleIdentity> {
+    use telemetry_offset as at;
+
+    let addr_type = telemetry_field(params, at::BLE_ADDR_TYPE)?;
+    let mut addr = [0u8; BLE_ADDR_LEN];
+    for (i, byte) in addr.iter_mut().enumerate() {
+        *byte = telemetry_field(params, at::BLE_ADDR + i)?;
+    }
+    let slot = telemetry_field(params, at::BLE_SLOT)?;
+    let slot_count = telemetry_field(params, at::BLE_SLOT_COUNT)?;
+
+    if addr_type == TELEMETRY_BLE_ADDR_UNKNOWN {
+        return None;
+    }
+
+    Some(BleIdentity {
+        address: addr
+            .iter()
+            .rev()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+        random: addr_type == TELEMETRY_BLE_ADDR_RANDOM,
+        slot,
+        slot_count,
+    })
 }
 
 fn telemetry_battery(params: &[u8], level: usize, flags: usize, source: usize) -> BatteryReading {
@@ -369,6 +895,85 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
         nav_build: telemetry_field(params, at::NAV_BUILD).and_then(Nav::from_mask),
         nav_left: telemetry_field(params, at::NAV_LEFT).and_then(Nav::from_mask),
         nav_right: telemetry_field(params, at::NAV_RIGHT).and_then(Nav::from_mask),
+        ble: telemetry_ble(params),
+    })
+}
+
+/// Decode one 13-byte detail block, reading it through `field`.
+///
+/// The block travels two ways — inside a HID payload, where a board's `len` may
+/// stop part way through it, and as raw bytes over Bluetooth, where it is
+/// either all there or not there at all — so what a byte's absence means is the
+/// caller's to define and this only says whether it got one.
+/// Whether a minutes field says anything: neither the "no estimate" sentinel
+/// nor the saturation cap does.
+fn known_minutes(minutes: &u16) -> bool {
+    !matches!(*minutes, DETAIL_MIN_UNKNOWN | DETAIL_MIN_SATURATED)
+}
+
+fn battery_detail(field: impl Fn(usize) -> Option<u8>) -> BatteryDetail {
+    use detail_offset as offset;
+
+    // Both bytes or neither, as everywhere else: half a number is a wrong one.
+    let le16 =
+        |at: usize| -> Option<u16> { Some(u16::from_le_bytes([field(at)?, field(at + 1)?])) };
+    let reg = |at: usize| field(at).filter(|&raw| raw != DETAIL_REG_UNKNOWN);
+
+    BatteryDetail {
+        voltage_mv: le16(offset::VOLTAGE_MV).filter(|&mv| mv != DETAIL_MV_UNKNOWN),
+        current_ma: le16(offset::CURRENT_MA)
+            .map(|raw| raw as i16)
+            .filter(|&ma| ma != DETAIL_I16_UNKNOWN),
+        temp_cdeg: le16(offset::TEMP_CDEG)
+            .map(|raw| raw as i16)
+            .filter(|&cdeg| cdeg != DETAIL_I16_UNKNOWN),
+        tte_min: le16(offset::TTE_MIN).filter(known_minutes),
+        ttf_min: le16(offset::TTF_MIN).filter(known_minutes),
+        charger: reg(offset::CHG_STATUS).map(ChargerStatus::from_bits),
+        // A fault is what latched; the sensor register only qualifies it, so a
+        // sensor byte that did not arrive leaves the fault itself standing.
+        fault: reg(offset::CHG_ERROR).map(|reason| ChargerFault {
+            reason,
+            sensor: reg(offset::CHG_SENSOR).unwrap_or(0),
+        }),
+    }
+}
+
+/// Decode a bare detail block: 13 bytes, all of them there.
+///
+/// What the board's Bluetooth read carries, twice over. A short slice leaves
+/// the fields it does not reach unknown rather than inventing them.
+pub fn decode_battery_detail(bytes: &[u8]) -> BatteryDetail {
+    battery_detail(|offset| bytes.get(offset).copied())
+}
+
+fn half_detail(params: &[u8], source: usize, block: usize) -> HalfDetail {
+    HalfDetail {
+        source: telemetry_field(params, source).map(Source::from_raw),
+        detail: battery_detail(|offset| telemetry_field(params, block + offset)),
+    }
+}
+
+/// Decode a charge-telemetry payload, the bytes after the
+/// `EVT_CHARGE_TELEMETRY` opcode.
+///
+/// Same two rules as [`parse_telemetry`]: a format version this host was not
+/// written against is refused whole, and everything else is the `len` byte's
+/// business — a board that stops short of a field has not sent it, and this
+/// says unknown rather than reading whatever happens to be at that offset.
+pub fn parse_charge_telemetry(params: &[u8]) -> Option<ChargeTelemetry> {
+    use charge_offset as at;
+
+    let version = *params.get(at::VERSION)?;
+    if version != CHARGE_TELEMETRY_VERSION {
+        return None;
+    }
+    params.get(at::LEN)?;
+
+    Some(ChargeTelemetry {
+        version,
+        left: half_detail(params, at::LEFT_SOURCE, at::LEFT),
+        right: half_detail(params, at::RIGHT_SOURCE, at::RIGHT),
     })
 }
 
@@ -426,6 +1031,14 @@ pub fn process_packet(data: &[u8]) -> (Option<HidEvent>, Vec<Packet>) {
         EVT_TRIGGER_SMARTLAYER => HidEvent::TriggerSmartLayer,
         EVT_TELEMETRY => match parse_telemetry(params) {
             Some(telemetry) => HidEvent::Telemetry(telemetry),
+            None => return (None, Vec::new()),
+        },
+        EVT_CHARGE_TELEMETRY => match parse_charge_telemetry(params) {
+            Some(telemetry) => HidEvent::ChargeTelemetry(telemetry),
+            None => return (None, Vec::new()),
+        },
+        EVT_PMIC_RAILS => match parse_pmic_rails_report(params) {
+            Some(report) => HidEvent::PmicRails(report),
             None => return (None, Vec::new()),
         },
         EVT_GET_PROTOCOL_VERSION => match params.first() {
@@ -837,6 +1450,61 @@ mod tests {
         assert_eq!(telemetry.charging.state, Some(ChargeState::Charging));
     }
 
+    /// The same, grown by the nine bytes of the active Bluetooth identity. The
+    /// address travels least significant byte first.
+    fn telemetry_payload_with_ble(addr_type: u8) -> Vec<u8> {
+        let mut payload = telemetry_payload_with_charging();
+        payload[1] = 25;
+        payload.push(addr_type);
+        payload.extend_from_slice(&[0x36, 0xB1, 0xA8, 0xE9, 0xDB, 0xFE]);
+        payload.push(2); // third host slot, counted from zero
+        payload.push(6);
+        payload
+    }
+
+    #[test]
+    fn the_active_bluetooth_identity_is_read_back_the_way_it_is_written() {
+        let telemetry = parse_telemetry(&telemetry_payload_with_ble(1)).unwrap();
+        let ble = telemetry.ble.expect("an identity");
+
+        assert_eq!(ble.address, "FE:DB:E9:A8:B1:36");
+        assert!(ble.random);
+        assert_eq!(ble.slot, 2);
+        assert_eq!(ble.slot_count, 6);
+    }
+
+    #[test]
+    fn a_public_address_is_not_a_random_one() {
+        let ble = parse_telemetry(&telemetry_payload_with_ble(0))
+            .unwrap()
+            .ble
+            .expect("an identity");
+        assert!(!ble.random);
+    }
+
+    #[test]
+    fn a_board_with_no_identity_in_the_active_slot_reports_none() {
+        let telemetry = parse_telemetry(&telemetry_payload_with_ble(0xFF)).unwrap();
+        assert_eq!(telemetry.ble, None);
+    }
+
+    #[test]
+    fn an_identity_the_firmware_stops_short_of_is_not_half_read() {
+        // Everything up to the address, and one byte of it missing: nothing to
+        // read, rather than an address five bytes long.
+        let mut payload = telemetry_payload_with_ble(1);
+        payload[1] = 23;
+        assert_eq!(parse_telemetry(&payload).unwrap().ble, None);
+
+        // A firmware that predates the field entirely.
+        assert_eq!(
+            parse_telemetry(&telemetry_payload_with_charging())
+                .unwrap()
+                .ble,
+            None
+        );
+    }
+
     #[test]
     fn a_currentless_reading_is_unknown_not_zero() {
         // The board has not commanded a rate yet. Zero is not a rate any of
@@ -890,6 +1558,251 @@ mod tests {
         );
     }
 
+    /// One detail block as a board fills it in.
+    fn detail_block(voltage_mv: u16, current_ma: i16, ttf_min: u16, status: u8) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(&voltage_mv.to_le_bytes());
+        block.extend_from_slice(&current_ma.to_le_bytes());
+        block.extend_from_slice(&2850i16.to_le_bytes()); // 28.50 °C
+        block.extend_from_slice(&DETAIL_MIN_UNKNOWN.to_le_bytes()); // charging: no tte
+        block.extend_from_slice(&ttf_min.to_le_bytes());
+        block.extend_from_slice(&[status, 0, 0]); // nothing latched
+        assert_eq!(block.len(), BATTERY_DETAIL_SIZE);
+        block
+    }
+
+    /// A charger detecting a cell and pushing it at the full rate.
+    const CHARGING_CC: u8 = 0x01 | 0x08;
+
+    /// A board on a charger: both halves filling, the left over the nRF wire
+    /// and the right over the cable between the halves.
+    fn charge_payload() -> Vec<u8> {
+        let mut payload = vec![CHARGE_TELEMETRY_VERSION, 28];
+        payload.push(1); // left source: Nrf
+        payload.extend_from_slice(&detail_block(4020, 512, 80, CHARGING_CC));
+        payload.push(3); // right source: Wired
+        payload.extend_from_slice(&detail_block(3980, 298, 125, CHARGING_CC));
+        payload.push(0); // reserved
+        assert_eq!(payload.len(), 31);
+        payload
+    }
+
+    #[test]
+    fn parse_charge_telemetry_reads_both_halves() {
+        let telemetry = parse_charge_telemetry(&charge_payload()).unwrap();
+
+        assert_eq!(telemetry.version, CHARGE_TELEMETRY_VERSION);
+        assert_eq!(telemetry.left.source, Some(Source::Nrf));
+        assert_eq!(telemetry.left.detail.voltage_mv, Some(4020));
+        assert_eq!(telemetry.left.detail.current_ma, Some(512));
+        assert_eq!(telemetry.left.detail.temp_cdeg, Some(2850));
+        assert_eq!(telemetry.left.detail.tte_min, None);
+        assert_eq!(telemetry.left.detail.ttf_min, Some(80));
+        assert!(telemetry.left.detail.charger.unwrap().constant_current);
+        assert!(telemetry.left.detail.fault.unwrap().is_clear());
+
+        assert_eq!(telemetry.right.source, Some(Source::Wired));
+        assert_eq!(telemetry.right.detail.voltage_mv, Some(3980));
+        assert_eq!(telemetry.right.detail.ttf_min, Some(125));
+    }
+
+    #[test]
+    fn charge_telemetry_rides_a_report_with_no_stop_bit() {
+        // 0xFE is data here too: an unknown estimate is 0xFFFF, whose bytes
+        // would otherwise be read as the end of the params.
+        let payload = charge_payload();
+        let mut data = [0u8; REPORT_SIZE];
+        data[0] = EVT_CHARGE_TELEMETRY;
+        data[1..1 + payload.len()].copy_from_slice(&payload);
+
+        let (evt, params) = parse_packet(&data).unwrap();
+        assert_eq!(evt, EVT_CHARGE_TELEMETRY);
+        assert_eq!(params.len(), REPORT_SIZE - 1);
+
+        let (event, replies) = process_packet(&data);
+        assert!(replies.is_empty());
+        let HidEvent::ChargeTelemetry(telemetry) = event.unwrap() else {
+            panic!("expected charge telemetry");
+        };
+        assert_eq!(telemetry.left.detail.voltage_mv, Some(4020));
+    }
+
+    #[test]
+    fn a_reading_the_board_did_not_take_is_not_a_zero_one() {
+        let mut payload = charge_payload();
+        // Every sentinel at once, on the left half.
+        payload[3..5].copy_from_slice(&DETAIL_MV_UNKNOWN.to_le_bytes());
+        payload[5..7].copy_from_slice(&DETAIL_I16_UNKNOWN.to_le_bytes());
+        payload[7..9].copy_from_slice(&DETAIL_I16_UNKNOWN.to_le_bytes());
+        payload[9..11].copy_from_slice(&DETAIL_MIN_UNKNOWN.to_le_bytes());
+        payload[11..13].copy_from_slice(&DETAIL_MIN_UNKNOWN.to_le_bytes());
+        payload[13] = DETAIL_REG_UNKNOWN;
+        payload[14] = DETAIL_REG_UNKNOWN;
+        payload[15] = DETAIL_REG_UNKNOWN;
+
+        let telemetry = parse_charge_telemetry(&payload).unwrap();
+        assert_eq!(telemetry.left.detail, BatteryDetail::default());
+        // A half the board did read is untouched by the one it did not.
+        assert_eq!(telemetry.right.detail.voltage_mv, Some(3980));
+    }
+
+    #[test]
+    fn a_cell_at_rest_reads_zero_rather_than_unknown() {
+        // The one reading of each pair that a sentinel must not be able to
+        // stand in for: no current, and no time left.
+        let mut payload = charge_payload();
+        payload[5..7].copy_from_slice(&0i16.to_le_bytes());
+        payload[7..9].copy_from_slice(&0i16.to_le_bytes());
+        payload[9..11].copy_from_slice(&0u16.to_le_bytes());
+        payload[13] = 0;
+        payload[14] = 0;
+
+        let detail = parse_charge_telemetry(&payload).unwrap().left.detail;
+        assert_eq!(detail.current_ma, Some(0));
+        assert_eq!(detail.temp_cdeg, Some(0));
+        assert_eq!(detail.tte_min, Some(0));
+        assert!(detail.charger.unwrap().is_idle());
+        assert!(detail.fault.unwrap().is_clear());
+    }
+
+    #[test]
+    fn an_estimate_at_the_cap_is_no_estimate() {
+        // The firmware saturates the minutes field, so the top value is where
+        // an estimate stopped counting rather than one it made.
+        let mut block = detail_block(4020, -45, 80, CHARGING_CC);
+        block[6..8].copy_from_slice(&DETAIL_MIN_SATURATED.to_le_bytes());
+        block[8..10].copy_from_slice(&DETAIL_MIN_SATURATED.to_le_bytes());
+
+        let detail = decode_battery_detail(&block);
+        assert_eq!(detail.tte_min, None);
+        assert_eq!(detail.ttf_min, None);
+
+        // One minute under the cap is still a reading.
+        block[6..8].copy_from_slice(&(DETAIL_MIN_SATURATED - 1).to_le_bytes());
+        assert_eq!(decode_battery_detail(&block).tte_min, Some(0xFFFD));
+    }
+
+    #[test]
+    fn a_discharging_half_reads_negative() {
+        let mut payload = charge_payload();
+        payload[5..7].copy_from_slice(&(-45i16).to_le_bytes());
+        payload[7..9].copy_from_slice(&(-320i16).to_le_bytes()); // a cold room
+        payload[13] = 0x01; // a cell, and no phase
+
+        let detail = parse_charge_telemetry(&payload).unwrap().left.detail;
+        assert_eq!(detail.current_ma, Some(-45));
+        assert_eq!(detail.temp_cdeg, Some(-320));
+        assert!(detail.charger.unwrap().battery_detected);
+        assert!(detail.charger.unwrap().is_idle());
+    }
+
+    #[test]
+    fn a_board_that_stops_part_way_leaves_the_rest_unknown() {
+        // len covers the left half's voltage, current and temperature, and
+        // stops between the two bytes of its time-to-empty.
+        let mut payload = charge_payload();
+        payload[1] = 8;
+
+        let telemetry = parse_charge_telemetry(&payload).unwrap();
+        assert_eq!(telemetry.left.source, Some(Source::Nrf));
+        assert_eq!(telemetry.left.detail.voltage_mv, Some(4020));
+        assert_eq!(telemetry.left.detail.current_ma, Some(512));
+        assert_eq!(telemetry.left.detail.temp_cdeg, Some(2850));
+        assert_eq!(telemetry.left.detail.tte_min, None, "one byte of two");
+        assert_eq!(telemetry.left.detail.ttf_min, None);
+        assert_eq!(telemetry.left.detail.charger, None);
+        assert_eq!(telemetry.left.detail.fault, None);
+        // Nothing of the right half was sent at all, source included.
+        assert_eq!(telemetry.right, HalfDetail::default());
+    }
+
+    #[test]
+    fn a_charge_version_this_host_does_not_know_is_refused_whole() {
+        let mut payload = charge_payload();
+        payload[0] = CHARGE_TELEMETRY_VERSION + 1;
+        assert_eq!(parse_charge_telemetry(&payload), None);
+
+        let mut data = [0u8; REPORT_SIZE];
+        data[0] = EVT_CHARGE_TELEMETRY;
+        data[1..1 + payload.len()].copy_from_slice(&payload);
+        assert_eq!(process_packet(&data), (None, Vec::new()));
+
+        // And a payload with no header at all is not a payload.
+        assert_eq!(parse_charge_telemetry(&[]), None);
+        assert_eq!(parse_charge_telemetry(&[CHARGE_TELEMETRY_VERSION]), None);
+    }
+
+    #[test]
+    fn a_bare_block_is_read_as_far_as_it_goes() {
+        let block = detail_block(4020, -45, 80, CHARGING_CC);
+        let detail = decode_battery_detail(&block);
+        assert_eq!(detail.voltage_mv, Some(4020));
+        assert_eq!(detail.current_ma, Some(-45));
+
+        // Three bytes: a whole voltage and half a current.
+        let short = decode_battery_detail(&block[..3]);
+        assert_eq!(short.voltage_mv, Some(4020));
+        assert_eq!(short.current_ma, None);
+        assert_eq!(decode_battery_detail(&[]), BatteryDetail::default());
+    }
+
+    #[test]
+    fn the_charger_phases_are_read_apart() {
+        let cases = [
+            (0x02, "complete"),
+            (0x04, "trickle"),
+            (0x08, "constant current"),
+            (0x10, "constant voltage"),
+            (0x20, "recharge"),
+            (0x40, "paused"),
+        ];
+        for (raw, what) in cases {
+            let status = ChargerStatus::from_bits(raw | 0x01);
+            assert!(status.battery_detected);
+            assert!(!status.is_idle(), "{what} is a phase");
+        }
+        // A cell being helped along is not a phase either way round.
+        assert!(ChargerStatus::from_bits(0x81).supplement);
+        assert!(ChargerStatus::from_bits(0x81).is_idle());
+        assert!(ChargerStatus::from_bits(0).is_idle());
+    }
+
+    #[test]
+    fn a_latched_fault_names_its_bits() {
+        let fault = ChargerFault {
+            reason: 0x40 | 0x08,
+            sensor: 0x08,
+        };
+        assert!(!fault.is_clear());
+        assert!(fault.trickle_timeout());
+        assert!(fault.trickle_voltage());
+        assert!(!fault.charge_timeout());
+        assert!(fault.sensor_ntc_hot());
+        assert_eq!(fault.reasons(), vec!["trickle voltage", "trickle timeout"]);
+        assert_eq!(fault.sensors(), vec!["NTC hot"]);
+
+        let clear = ChargerFault::default();
+        assert!(clear.is_clear());
+        assert!(clear.reasons().is_empty());
+    }
+
+    #[test]
+    fn a_fault_whose_sensor_byte_is_missing_still_stands() {
+        let mut payload = charge_payload();
+        payload[14] = 0x20; // charge timeout
+        payload[15] = DETAIL_REG_UNKNOWN;
+
+        let fault = parse_charge_telemetry(&payload).unwrap().left.detail.fault;
+        assert_eq!(
+            fault,
+            Some(ChargerFault {
+                reason: 0x20,
+                sensor: 0
+            })
+        );
+        assert!(fault.unwrap().sensors().is_empty());
+    }
+
     #[test]
     fn a_truncated_telemetry_report_is_not_invented() {
         // The board claims nine bytes but only three arrived.
@@ -902,5 +1815,195 @@ mod tests {
 
         assert_eq!(parse_telemetry(&[]), None);
         assert_eq!(parse_telemetry(&[TELEMETRY_VERSION]), None);
+    }
+
+    /// One rails block as a half on the cable fills it in.
+    fn rails_block(vbus_mv: u16, vsys_mv: u16, vbusin: u8, chg_enable: u8) -> Vec<u8> {
+        let mut block = vec![PMIC_RAILS_PRESENT];
+        block.extend_from_slice(&vbus_mv.to_le_bytes());
+        block.extend_from_slice(&vsys_mv.to_le_bytes());
+        block.push(vbusin);
+        block.push(chg_enable);
+        block
+    }
+
+    #[test]
+    fn a_rails_block_says_what_the_two_rails_measure() {
+        let rails = decode_pmic_rails(&rails_block(4620, 4550, 0x21, 0x01)).unwrap();
+        assert_eq!(rails.vbus_mv, 4620);
+        assert_eq!(rails.vsys_mv, 4550);
+        assert_eq!(rails.charger_enabled, Some(true));
+        assert!(rails.vbusin.present);
+        assert!(rails.vbusin.out_active);
+        assert!(!rails.vbusin.current_limit);
+        assert_eq!(rails.vbusin.raw, 0x21);
+        assert_eq!(rails.vbusin.names(), vec!["present", "out active"]);
+    }
+
+    #[test]
+    fn every_vbusin_bit_has_a_name_in_register_order() {
+        let all = VbusInStatus::from_bits(0x3F);
+        assert!(
+            all.present
+                && all.current_limit
+                && all.overvoltage
+                && all.undervoltage
+                && all.suspended
+                && all.out_active
+        );
+        assert_eq!(
+            all.names(),
+            vec![
+                "present",
+                "current limit",
+                "overvoltage",
+                "undervoltage",
+                "suspended",
+                "out active"
+            ]
+        );
+
+        // Nothing attached and the output off is a reading, not an absence.
+        let none = VbusInStatus::from_bits(0);
+        assert!(none.names().is_empty());
+        assert_eq!(none, VbusInStatus::default());
+    }
+
+    #[test]
+    fn a_half_that_has_not_measured_yet_has_no_rails() {
+        let mut block = rails_block(4620, 4550, 0x21, 0x01);
+        block[0] = 0;
+        assert_eq!(decode_pmic_rails(&block), None);
+    }
+
+    #[test]
+    fn a_rails_block_is_whole_or_it_is_nothing() {
+        let block = rails_block(4620, 4550, 0x21, 0x01);
+        assert_eq!(decode_pmic_rails(&block[..6]), None);
+        assert_eq!(decode_pmic_rails(&[]), None);
+        // Longer is no more readable than shorter: it is not this block.
+        assert_eq!(decode_pmic_rails(&[block.as_slice(), &[0]].concat()), None);
+    }
+
+    #[test]
+    fn a_charger_register_that_was_not_read_is_not_a_charger_that_is_off() {
+        let unread = decode_pmic_rails(&rails_block(4620, 4550, 0x21, PMIC_REG_UNKNOWN)).unwrap();
+        assert_eq!(unread.charger_enabled, None);
+
+        let off = decode_pmic_rails(&rails_block(4620, 4550, 0x21, 0x00)).unwrap();
+        assert_eq!(off.charger_enabled, Some(false));
+    }
+
+    #[test]
+    fn a_boost_state_is_only_read_when_the_half_says_it_knows_it() {
+        // Firmware that does not report the boost leaves both flag bits clear.
+        let silent = decode_pmic_rails(&rails_block(4620, 4550, 0x21, 0x01)).unwrap();
+        assert_eq!(silent.boost_off, None);
+
+        let mut block = rails_block(4620, 4550, 0x21, 0x01);
+        block[0] |= PMIC_RAILS_BOOST_KNOWN;
+        assert_eq!(decode_pmic_rails(&block).unwrap().boost_off, Some(false));
+
+        block[0] |= PMIC_RAILS_BOOST_OFF;
+        assert_eq!(decode_pmic_rails(&block).unwrap().boost_off, Some(true));
+
+        // The off bit on its own is a claim the sender did not make.
+        let mut lone = rails_block(4620, 4550, 0x21, 0x01);
+        lone[0] |= PMIC_RAILS_BOOST_OFF;
+        assert_eq!(decode_pmic_rails(&lone).unwrap().boost_off, None);
+    }
+
+    #[test]
+    fn a_held_back_charge_current_is_read_from_the_flag() {
+        // A half charging at the rate it was told reports nothing.
+        let full = decode_pmic_rails(&rails_block(4620, 4550, 0x21, 0x01)).unwrap();
+        assert!(!full.charge_reduced);
+
+        let mut block = rails_block(4620, 4550, 0x21, 0x01);
+        block[0] |= PMIC_RAILS_CHARGE_REDUCED;
+        assert!(decode_pmic_rails(&block).unwrap().charge_reduced);
+    }
+
+    /// A board on a charger answering the rails command: both halves measured.
+    fn rails_payload() -> Vec<u8> {
+        let mut payload = vec![PMIC_RAILS_REPORT_VERSION, 14];
+        payload.extend_from_slice(&rails_block(4620, 4550, 0x21, 0x01));
+        payload.extend_from_slice(&rails_block(4580, 4510, 0x01, 0x01));
+        payload
+    }
+
+    #[test]
+    fn parse_pmic_rails_report_reads_both_halves() {
+        let report = parse_pmic_rails_report(&rails_payload()).unwrap();
+
+        assert_eq!(report.version, PMIC_RAILS_REPORT_VERSION);
+        let left = report.left.unwrap();
+        assert_eq!(left.vbus_mv, 4620);
+        assert_eq!(left.vsys_mv, 4550);
+        assert_eq!(left.charger_enabled, Some(true));
+        assert!(left.vbusin.present && left.vbusin.out_active);
+
+        let right = report.right.unwrap();
+        assert_eq!(right.vbus_mv, 4580);
+        assert_eq!(right.vsys_mv, 4510);
+        assert!(right.vbusin.present && !right.vbusin.out_active);
+    }
+
+    #[test]
+    fn a_rails_report_rides_a_report_with_no_stop_bit() {
+        // 0xFE is data here too: 4606 mV is 0xFE 0x11 on the wire, and
+        // truncating there would drop the rest of the half's block.
+        let mut payload = vec![PMIC_RAILS_REPORT_VERSION, 14];
+        payload.extend_from_slice(&rails_block(4606, 4550, 0x21, 0x01));
+        payload.extend_from_slice(&rails_block(4580, 4510, 0x01, 0x01));
+        let mut data = [0u8; REPORT_SIZE];
+        data[0] = EVT_PMIC_RAILS;
+        data[1..1 + payload.len()].copy_from_slice(&payload);
+
+        let (evt, params) = parse_packet(&data).unwrap();
+        assert_eq!(evt, EVT_PMIC_RAILS);
+        assert_eq!(params.len(), REPORT_SIZE - 1);
+
+        let (event, replies) = process_packet(&data);
+        assert!(replies.is_empty());
+        let HidEvent::PmicRails(report) = event.unwrap() else {
+            panic!("expected a rails report");
+        };
+        assert_eq!(report.left.unwrap().vbus_mv, 4606);
+        assert_eq!(report.right.unwrap().vbus_mv, 4580);
+    }
+
+    #[test]
+    fn a_firmware_that_predates_the_rails_has_none_to_report() {
+        // The bytes are in the report, but the board's own len says it never
+        // wrote them, so they are padding rather than a reading of zero.
+        let mut payload = rails_payload();
+        payload[1] = 0;
+        let report = parse_pmic_rails_report(&payload).unwrap();
+        assert_eq!(report.left, None);
+        assert_eq!(report.right, None);
+
+        // A len stopping inside the left block leaves it unread too.
+        payload[1] = 6;
+        assert_eq!(parse_pmic_rails_report(&payload).unwrap().left, None);
+
+        // A format this host was not written against is refused whole.
+        payload[0] = PMIC_RAILS_REPORT_VERSION + 1;
+        assert_eq!(parse_pmic_rails_report(&payload), None);
+
+        assert_eq!(parse_pmic_rails_report(&[]), None);
+        assert_eq!(parse_pmic_rails_report(&[PMIC_RAILS_REPORT_VERSION]), None);
+    }
+
+    #[test]
+    fn a_left_that_has_not_measured_does_not_hide_the_right() {
+        // Each block carries its own present flag, so a half still waiting on
+        // its first tick says nothing while the other one reports.
+        let mut payload = rails_payload();
+        payload[rails_report_offset::LEFT] = 0;
+
+        let report = parse_pmic_rails_report(&payload).unwrap();
+        assert_eq!(report.left, None);
+        assert_eq!(report.right.unwrap().vbus_mv, 4580);
     }
 }
