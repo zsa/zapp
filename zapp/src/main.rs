@@ -213,8 +213,8 @@ fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
         Ok(devices) if devices.is_empty() => println!("  none"),
         Ok(devices) => {
             for device in devices {
-                println!("  {}", describe_usb(device));
                 let report = wired_report(device, verbose);
+                println!("  {}{}", describe_usb(device), report.charge);
                 for line in &report.lines {
                     println!("    {line}");
                 }
@@ -279,20 +279,27 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
         return WiredReport::default();
     };
 
-    let mut lines = describe_telemetry(&telemetry, detail.as_ref());
-    if let Some(detail) = detail {
-        lines.extend(describe_charge(&telemetry, &detail, rails));
+    let mut lines = Vec::new();
+    if verbose {
+        lines.extend(describe_telemetry(&telemetry));
+        if let Some(detail) = &detail {
+            lines.extend(describe_charge(&telemetry, detail, rails));
+        }
     }
     WiredReport {
+        charge: wired_charge(&telemetry, detail.as_ref()),
         lines,
         ble_address: telemetry.ble.map(|ble| ble.address),
     }
 }
 
-/// What a wired board answered: the lines to print under it, and the Bluetooth
-/// address it is using, which the roster matches its bonded entries against.
+/// What a wired board answered: what its halves have left, which goes on the
+/// board's own line; the lines to print under it, which only `--verbose` asks
+/// for; and the Bluetooth address it is using, which the roster matches its
+/// bonded entries against.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WiredReport {
+    charge: String,
     lines: Vec<String>,
     ble_address: Option<String>,
 }
@@ -302,7 +309,7 @@ struct WiredReport {
 /// any of these commands never answers it, which is why each wait can elapse.
 type UsbTelemetry = (Telemetry, Option<ChargeTelemetry>, Option<PmicRailsReport>);
 
-fn usb_telemetry(device: &UsbDevice, detail: bool) -> Option<UsbTelemetry> {
+fn usb_telemetry(device: &UsbDevice, rails: bool) -> Option<UsbTelemetry> {
     if device.bootloader.is_some() {
         return None; // a board in its bootloader runs no keyboard firmware
     }
@@ -312,15 +319,13 @@ fn usb_telemetry(device: &UsbDevice, detail: bool) -> Option<UsbTelemetry> {
         HidEvent::Telemetry(telemetry) => Some(telemetry),
         _ => None,
     })?;
-    let charge = detail
-        .then(|| {
-            ask(&conn, CMD_GET_CHARGE_TELEMETRY, |event| match event {
-                HidEvent::ChargeTelemetry(telemetry) => Some(telemetry),
-                _ => None,
-            })
-        })
-        .flatten();
-    let rails = detail
+    // Asked for every listing, verbose or not: the charger phase words the
+    // board's own line, and the two wordings must not differ.
+    let charge = ask(&conn, CMD_GET_CHARGE_TELEMETRY, |event| match event {
+        HidEvent::ChargeTelemetry(telemetry) => Some(telemetry),
+        _ => None,
+    });
+    let rails = rails
         .then(|| {
             ask(&conn, CMD_GET_PMIC_RAILS, |event| match event {
                 HidEvent::PmicRails(report) => Some(report),
@@ -353,13 +358,13 @@ fn ask<T>(conn: &HidConnection, cmd: u8, take: impl Fn(HidEvent) -> Option<T>) -
     }
 }
 
-/// The lines under a wired board: what each half has left and how fast it is
-/// filling, and which pointing devices the build carries and answer.
+/// What each half of a wired board has left, in the shape and the wording the
+/// Bluetooth roster line uses, ready to append to the board's own line.
 ///
 /// The charger phase from the detail read words each half when it arrived, so
-/// this line and the one under it say the same thing; the summary's charging
-/// flag words it only when no detail came.
-fn describe_telemetry(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> Vec<String> {
+/// this and the table under it say the same thing; the summary's charging flag
+/// words it only for firmware that answers no detail at all.
+fn wired_charge(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> String {
     let speed = charge_speed(telemetry.charging.budget_ma);
     let halves: Vec<String> = [
         (
@@ -383,7 +388,14 @@ fn describe_telemetry(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -
     })
     .collect();
 
-    let mut lines = vec![format!("{:<8} · {}", "battery", halves.join(" · "))];
+    format!(" · {}", halves.join(" · "))
+}
+
+/// The lines under a wired board that stand on their own: the Bluetooth
+/// identity it is using, and which pointing devices the build carries and
+/// which of them answer. Only `--verbose` asks for these.
+fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(ble) = &telemetry.ble {
         lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
     }
@@ -1383,14 +1395,16 @@ mod tests {
             },
             ble: None,
         };
-        // No detail read, so the summary's own charging flag words it. The
-        // board named no Bluetooth identity, so nothing is said about one.
+        // Firmware that answers no detail at all, so the summary's own
+        // charging flag words the board's line.
         assert_eq!(
-            describe_telemetry(&telemetry, None),
-            vec![
-                "battery  · left 87% · right 64% fast charging",
-                "features · Trackball (connected), Trackpad (not supported)",
-            ]
+            wired_charge(&telemetry, None),
+            " · left 87% · right 64% fast charging"
+        );
+        // The board named no Bluetooth identity, so nothing is said about one.
+        assert_eq!(
+            describe_telemetry(&telemetry),
+            vec!["features · Trackball (connected), Trackpad (not supported)"]
         );
     }
 
@@ -1406,10 +1420,10 @@ mod tests {
             }),
             ..Telemetry::default()
         };
-        // Between the battery and the features, and the address alone: the
-        // slot the board named is not printed.
+        // Above the features, and the address alone: the slot the board named
+        // is not printed.
         assert_eq!(
-            describe_telemetry(&telemetry, None)[1],
+            describe_telemetry(&telemetry)[0],
             "bluetooth · FE:DB:E9:A8:B1:36"
         );
     }
@@ -1427,7 +1441,7 @@ mod tests {
             ..Telemetry::default()
         };
         assert_eq!(
-            describe_telemetry(&telemetry, None)[1],
+            describe_telemetry(&telemetry)[0],
             "bluetooth · FE:DB:E9:A8:B1:36"
         );
     }
@@ -1454,8 +1468,8 @@ mod tests {
         };
 
         assert_eq!(
-            describe_telemetry(&telemetry, Some(&detail))[0],
-            "battery  · left 57% trickle charging · right 99% full"
+            wired_charge(&telemetry, Some(&detail)),
+            " · left 57% trickle charging · right 99% full"
         );
     }
 
@@ -1478,8 +1492,8 @@ mod tests {
         };
 
         assert_eq!(
-            describe_telemetry(&telemetry, Some(&detail))[0],
-            "battery  · left 99% topping up · right 56% fast charging"
+            wired_charge(&telemetry, Some(&detail)),
+            " · left 99% topping up · right 56% fast charging"
         );
     }
 
@@ -1699,6 +1713,16 @@ mod tests {
             pid: 0,
         };
         assert_eq!(wired_report(&device, true), WiredReport::default());
+    }
+
+    #[test]
+    fn a_board_with_nothing_to_report_keeps_its_single_line() {
+        // Nothing to append and nothing to print under it, so the board keeps
+        // the one line `describe_usb` gives it, verbose or not.
+        let report = WiredReport::default();
+        assert_eq!(report.charge, "");
+        assert!(report.lines.is_empty());
+        assert_eq!(report.ble_address, None);
     }
 
     /// One half filling on the cable, with nothing latched.
