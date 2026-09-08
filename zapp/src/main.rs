@@ -14,15 +14,15 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::dfu::{self, DfuClient, Wait};
 use zapp_ble::smp::{self, Half, SmpClient};
-use zapp_ble::{Battery, BleMonitor, Level, Presence};
+use zapp_ble::{Battery, BleMonitor, ChargeDetail, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
     BatteryDetail, BatteryReading, BleIdentity, CMD_GET_CHARGE_TELEMETRY, CMD_GET_PMIC_RAILS,
-    CMD_GET_TELEMETRY, ChargeTelemetry, ChargerFault, ChargerStatus, Charging, HidConnection,
-    HidEvent, Nav, PmicRails, PmicRailsReport, Telemetry,
+    CMD_GET_TELEMETRY, ChargeTelemetry, ChargerFault, ChargerStatus, HidConnection, HidEvent, Nav,
+    PmicRails, PmicRailsReport, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 
@@ -204,15 +204,21 @@ const TELEMETRY_WAIT: Duration = Duration::from_millis(500);
 fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
     let wired = device::list_devices();
 
+    // The Bluetooth identities the boards on the cable named, which the roster
+    // below matches its bonded entries against.
+    let mut on_usb: Vec<String> = Vec::new();
+
     println!("USB");
     match &wired {
         Ok(devices) if devices.is_empty() => println!("  none"),
         Ok(devices) => {
             for device in devices {
                 println!("  {}", describe_usb(device));
-                for line in wired_report(device, verbose) {
+                let report = wired_report(device, verbose);
+                for line in &report.lines {
                     println!("    {line}");
                 }
+                on_usb.extend(report.ble_address);
             }
         }
         Err(err) => println!("  cannot scan: {err}"),
@@ -241,12 +247,15 @@ fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
             Some(address) => format!(" · {address}"),
             None => String::new(),
         };
+        // Read once: the same detail words the summary line and fills the
+        // lines under it.
+        let detail = ble_charge_detail(&board, verbose);
         println!(
             "  {name} · {} · {known_as:?}{address}{}",
-            state(board.presence),
-            charge(board.battery),
+            state(board.presence, board.address.as_deref(), &on_usb),
+            charge(board.battery, detail.as_ref()),
         );
-        for line in ble_report(&board, verbose) {
+        for line in ble_report(detail.as_ref()) {
             println!("    {line}");
         }
     }
@@ -262,19 +271,30 @@ fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
 /// answers, so an empty result here is the normal old-firmware case and says
 /// nothing. Only Voyager 2 has a battery or pointing-device header to report
 /// on; the rest have neither, so there is nothing worth asking them.
-fn wired_report(device: &UsbDevice, verbose: bool) -> Vec<String> {
+fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
     if device.keyboard != Some(ids::Keyboard::Voyager2) {
-        return Vec::new();
+        return WiredReport::default();
     }
     let Some((telemetry, detail, rails)) = usb_telemetry(device, verbose) else {
-        return Vec::new();
+        return WiredReport::default();
     };
 
     let mut lines = describe_telemetry(&telemetry, detail.as_ref());
     if let Some(detail) = detail {
         lines.extend(describe_charge(&telemetry, &detail, rails));
     }
-    lines
+    WiredReport {
+        lines,
+        ble_address: telemetry.ble.map(|ble| ble.address),
+    }
+}
+
+/// What a wired board answered: the lines to print under it, and the Bluetooth
+/// address it is using, which the roster matches its bonded entries against.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WiredReport {
+    lines: Vec<String>,
+    ble_address: Option<String>,
 }
 
 /// What the board answers, on one connection: the summary always, and the
@@ -375,176 +395,214 @@ fn describe_telemetry(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -
     lines
 }
 
-/// The address the board is using and which of its host slots it is.
-///
-/// Slots are counted from zero on the wire and from one for a reader, and a
-/// board that did not say how many it keeps gets the address alone.
+/// The address the board is using. The slot fields come off the wire with it
+/// and are not printed.
 fn ble_identity(ble: &BleIdentity) -> String {
-    match ble.slot_count {
-        0 => ble.address.clone(),
-        count => format!("{} (host {} of {count})", ble.address, ble.slot + 1),
-    }
+    ble.address.clone()
 }
 
-/// The lines under a Bluetooth board, when the detail was asked for.
+/// What a Bluetooth board's charge-detail characteristic says, when the detail
+/// was asked for.
 ///
 /// Only a connected board can be read at all, and only one whose firmware
 /// serves the characteristic answers; anything else says nothing, which is the
 /// same silence an old wired firmware gives.
-fn ble_report(board: &zapp_ble::BleBoard, verbose: bool) -> Vec<String> {
+fn ble_charge_detail(board: &zapp_ble::BleBoard, verbose: bool) -> Option<ChargeDetail> {
     if !verbose || board.presence != Presence::Connected {
-        return Vec::new();
+        return None;
     }
-    let Some(detail) = zapp_ble::read_charge_detail(&board.key) else {
+    zapp_ble::read_charge_detail(&board.key)
+}
+
+/// The lines under a Bluetooth board, out of the detail that was read.
+fn ble_report(detail: Option<&ChargeDetail>) -> Vec<String> {
+    let Some(detail) = detail else {
         return Vec::new();
     };
 
     // A board on the radio is a board off the cable, so what it is heading for
     // is empty. The radio read carries no VBUS flag either.
-    [
-        ("left", detail.left, detail.left_rails),
-        ("right", detail.right, detail.right_rails),
-    ]
-    .into_iter()
-    .flat_map(|(half, detail, rails)| {
-        let line = detail_line(half, &detail, Estimate::Empty, None);
-        // The rails go under the half they belong to, and only when that half
-        // measured them: a firmware that predates the block says nothing.
-        [Some(line), rails.map(rails_line)]
-    })
-    .flatten()
-    .collect()
-}
-
-/// One half's rails: what its input and system rails measure, what the input
-/// regulator is doing and whether the charger is switched on.
-///
-/// Only printed for a half that took a reading, so unlike the detail line
-/// nothing here says "unknown" for want of a measurement — only the charger
-/// register, which the firmware can decline to read on its own. The boost
-/// converter is left off the line entirely by firmware that does not report it.
-fn rails_line(rails: PmicRails) -> String {
-    let names = rails.vbusin.names();
-    let vbusin = match names.is_empty() {
-        true => "none".to_string(),
-        false => names.join(", "),
-    };
-    let charger = match rails.charger_enabled {
-        Some(true) => "charger enabled",
-        Some(false) => "charger disabled",
-        None => "charger unknown",
-    };
-
-    let boost = match rails.boost_off {
-        Some(true) => " · boost off",
-        Some(false) => " · boost on",
-        None => "",
-    };
-
-    // Only the half holding back says so; charging at the commanded rate is
-    // the ordinary case and reads as silence.
-    let reduced = match rails.charge_reduced {
-        true => " · charge reduced",
-        false => "",
-    };
-
-    format!(
-        "{:<8} · VBUS {} · VSYS {} · in: {vbusin} · {charger}{boost}{reduced}",
-        "rails",
-        volts(rails.vbus_mv),
-        volts(rails.vsys_mv),
-    )
+    // The radio read carries no VBUS flag, so the halves' own rails and charger
+    // say which way the board is going.
+    let going = heading_for([
+        (&detail.left, detail.left_rails),
+        (&detail.right, detail.right_rails),
+    ]);
+    table(&[
+        detail_header(going),
+        detail_row("left", &detail.left, going, None, detail.left_rails),
+        detail_row("right", &detail.right, going, None, detail.right_rails),
+    ])
 }
 
 /// The lines under a wired board once its charge telemetry has been read: what
-/// the source allows, then what each half's cell and charger are doing.
+/// each half's cell and charger are doing.
 ///
 /// The summary read comes along for each half's VBUS flag, which the detail
-/// block does not carry and the charger phase needs. The rails go under the
-/// half they belong to, and only for a half that measured them.
+/// block does not carry and the charger phase needs.
 fn describe_charge(
     summary: &Telemetry,
     telemetry: &ChargeTelemetry,
     rails: Option<PmicRailsReport>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(rates) = charge_rates(&summary.charging) {
-        lines.push(format!("{:<8} · {}", "charging", rates));
-    }
-    // On the cable the halves are filling, so what they are heading for is full.
-    for (half, detail, usb, rails) in [
-        (
+    let left_rails = rails.and_then(|rails| rails.left);
+    let right_rails = rails.and_then(|rails| rails.right);
+    let going = heading_for([
+        (&telemetry.left.detail, left_rails),
+        (&telemetry.right.detail, right_rails),
+    ]);
+    table(&[
+        detail_header(going),
+        detail_row(
             "left",
-            telemetry.left,
+            &telemetry.left.detail,
+            going,
             summary.left.usb,
-            rails.and_then(|rails| rails.left),
+            left_rails,
         ),
-        (
+        detail_row(
             "right",
-            telemetry.right,
+            &telemetry.right.detail,
+            going,
             summary.right.usb,
-            rails.and_then(|rails| rails.right),
+            right_rails,
         ),
-    ] {
-        lines.push(detail_line(half, &detail.detail, Estimate::Full, usb));
-        lines.extend(rails.map(rails_line));
-    }
-    lines
+    ])
 }
 
-/// What the source offers, what the board draws from it and what goes into the
-/// cells. A figure the board would not give is left out, and a board that gave
-/// none of the three has no line.
-fn charge_rates(charging: &Charging) -> Option<String> {
-    let rates: Vec<String> = [
-        ("source", charging.budget_ma),
-        ("limit", charging.input_limit_ma),
-        ("charge", charging.charge_current_ma),
-    ]
-    .into_iter()
-    .filter_map(|(what, ma)| ma.map(|ma| format!("{what} {ma} mA")))
-    .collect();
-
-    (!rates.is_empty()).then(|| rates.join(" · "))
-}
-
-/// Which estimate a line leads with: the one the half is heading for on the way
-/// it was read. A half read on the radio falls back to the other one, since it
-/// can be charging from a wall charger; a half read on the cable does not, since
-/// time-to-empty says nothing about a board that is plugged in.
+/// Which way the board is going, and so what its time column counts down to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Estimate {
     Full,
     Empty,
 }
 
-/// One half's line: volts, current, temperature, how long it has, what the
-/// charger is doing and whether anything latched.
-///
-/// Every piece the board would not give says "unknown" rather than dropping
-/// out, so the columns stay under each other.
-fn detail_line(
-    half: &str,
-    detail: &BatteryDetail,
-    heading_for: Estimate,
-    usb: Option<bool>,
-) -> String {
-    let parts = [
-        detail.voltage_mv.map_or_else(unknown, volts),
-        detail.current_ma.map_or_else(unknown, milliamps),
-        detail.temp_cdeg.map_or_else(unknown, degrees),
-        time_left(detail, heading_for),
-        detail
-            .charger
-            .map_or_else(unknown, |status| phase(status, usb)),
-        detail.fault.map_or_else(unknown, fault),
-    ];
+impl Estimate {
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Full => "full in",
+            Self::Empty => "empty in",
+        }
+    }
 
-    format!("{half:<8} · {}", parts.join(" · "))
+    /// What one half has left the way the board is going, or nothing when the
+    /// gauge did not say or the half is not going that way. A charge that has
+    /// terminated is not filling, whatever estimate the gauge still carries.
+    fn minutes(self, detail: &BatteryDetail) -> Option<u16> {
+        match self {
+            Self::Full => detail
+                .ttf_min
+                .filter(|_| !detail.charger.is_some_and(|status| status.complete)),
+            Self::Empty => detail.tte_min,
+        }
+    }
 }
 
-fn unknown() -> String {
-    "unknown".to_string()
+/// Which way a board is going: filling while anything says it is on a source,
+/// running down otherwise. Read off both halves together, so the time column is
+/// headed once for the board rather than once per half.
+fn heading_for(halves: [(&BatteryDetail, Option<PmicRails>); 2]) -> Estimate {
+    let on_source = halves.iter().any(|(detail, rails)| {
+        rails.is_some_and(|rails| rails.vbusin.present)
+            || detail.charger.is_some_and(charging_phase)
+    });
+    match on_source {
+        true => Estimate::Full,
+        false => Estimate::Empty,
+    }
+}
+
+/// Whether the charger names a phase at all, which it only does on a source.
+fn charging_phase(status: ChargerStatus) -> bool {
+    status.complete
+        || status.trickle
+        || status.constant_current
+        || status.constant_voltage
+        || status.recharge
+        || status.paused_die_temp
+}
+
+/// The headings the halves' rows sit under. The half's own name has none.
+fn detail_header(going: Estimate) -> Vec<String> {
+    [
+        "",
+        "cell",
+        "current",
+        "temp",
+        "VBUS",
+        "VSYS",
+        going.heading(),
+        "charger",
+        "fault",
+    ]
+    .iter()
+    .map(|heading| (*heading).to_string())
+    .collect()
+}
+
+/// One half's row: its cell, its rails, how long it has, what the charger is
+/// doing and whether anything latched.
+///
+/// A column the board would not fill in says "n/a" rather than dropping out, so
+/// the rows stay under their headings. The input rail is "n/a" for a half with
+/// nothing attached, since what it reads then is not an input.
+fn detail_row(
+    half: &str,
+    detail: &BatteryDetail,
+    going: Estimate,
+    usb: Option<bool>,
+    rails: Option<PmicRails>,
+) -> Vec<String> {
+    let vbus = rails
+        .filter(|rails| rails.vbusin.present)
+        .map(|rails| volts(rails.vbus_mv));
+
+    vec![
+        half.to_string(),
+        detail.voltage_mv.map_or_else(not_available, volts),
+        detail.current_ma.map_or_else(not_available, milliamps),
+        detail.temp_cdeg.map_or_else(not_available, degrees),
+        vbus.unwrap_or_else(not_available),
+        rails.map_or_else(not_available, |rails| volts(rails.vsys_mv)),
+        going.minutes(detail).map_or_else(not_available, duration),
+        detail
+            .charger
+            .map_or_else(not_available, |status| phase(status, usb)),
+        detail.fault.map_or_else(not_available, fault),
+    ]
+}
+
+/// Rows laid out in columns: each as wide as the widest thing in it, two spaces
+/// between, left-aligned, and nothing trailing the last one.
+fn table(rows: &[Vec<String>]) -> Vec<String> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (column, cell) in row.iter().enumerate() {
+                line.push_str(cell);
+                if column + 1 < row.len() {
+                    let pad = widths[column] - cell.chars().count();
+                    line.push_str(&" ".repeat(pad + 2));
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+fn not_available() -> String {
+    "n/a".to_string()
 }
 
 fn volts(millivolts: u16) -> String {
@@ -561,30 +619,11 @@ fn degrees(centidegrees: i16) -> String {
     format!("{:.1} °C", f64::from(centidegrees) / 100.0)
 }
 
-/// How long the half has, whichever way it is going. On the cable only
-/// time-to-full is said, since a plugged-in board is not heading for empty.
-fn time_left(detail: &BatteryDetail, heading_for: Estimate) -> String {
-    let estimates: &[(Estimate, Option<u16>)] = match heading_for {
-        Estimate::Full => &[(Estimate::Full, detail.ttf_min)],
-        Estimate::Empty => &[
-            (Estimate::Empty, detail.tte_min),
-            (Estimate::Full, detail.ttf_min),
-        ],
-    };
-
-    match estimates
-        .iter()
-        .find_map(|&(which, minutes)| minutes.map(|minutes| (which, minutes)))
-    {
-        Some((Estimate::Full, minutes)) => format!("full in {}", duration(minutes)),
-        Some((Estimate::Empty, minutes)) => format!("empty in {}", duration(minutes)),
-        None => unknown(),
-    }
-}
-
-/// Hours and minutes, or minutes on their own under an hour.
+/// Hours and minutes, or minutes on their own under an hour. An estimate that
+/// has run down to nothing is under a minute rather than none.
 fn duration(minutes: u16) -> String {
     match (minutes / 60, minutes % 60) {
+        (0, 0) => "under a minute".to_string(),
         (0, minutes) => format!("{minutes} min"),
         (hours, minutes) => format!("{hours} h {minutes:02} min"),
     }
@@ -617,7 +656,7 @@ fn phase(status: ChargerStatus, usb: Option<bool>) -> String {
 /// is one that happened since.
 fn fault(fault: ChargerFault) -> String {
     if fault.is_clear() {
-        return "no fault".to_string();
+        return "none".to_string();
     }
 
     let reasons = fault.reasons();
@@ -628,8 +667,8 @@ fn fault(fault: ChargerFault) -> String {
     };
     let sensors = fault.sensors();
     match sensors.is_empty() {
-        true => format!("fault: {named}"),
-        false => format!("fault: {named} ({})", sensors.join(", ")),
+        true => named,
+        false => format!("{named} ({})", sensors.join(", ")),
     }
 }
 
@@ -660,25 +699,35 @@ fn read_as(reading: BatteryReading, speed: Option<&str>) -> String {
 }
 
 /// One half's level and what its charger is doing, out of the same phase the
-/// detail line names. The phase bits are read in the order `phase` reads them,
-/// so the two lines never disagree.
+/// detail line names.
 fn read_in_phase(reading: BatteryReading, status: ChargerStatus, speed: Option<&str>) -> String {
     let level = level_as(reading.level);
-    match status {
-        _ if reading.usb == Some(true) && !status.battery_detected => {
-            format!("{level} no battery detected")
-        }
-        _ if status.complete => format!("{level} full"),
-        _ if status.trickle => format!("{level} trickle charging"),
-        _ if status.constant_current || status.constant_voltage => {
-            format!("{level} {}", charging_as(speed))
-        }
-        _ if status.recharge => format!("{level} charging"),
-        _ if status.paused_die_temp => format!("{level} charging paused (hot)"),
-        // No phase at all: idle on a source, and nothing to say off one.
-        _ if reading.usb == Some(true) => format!("{level} not charging"),
-        _ => level,
+    match phase_as(status, reading.usb, speed) {
+        Some(said) => format!("{level} {said}"),
+        None => level,
     }
+}
+
+/// A summary line's word for one charger phase, or `None` when there is nothing
+/// to say: no phase at all, off a source.
+///
+/// The bits are read in the order `phase` reads them, so the summary and the
+/// detail line never disagree. Only constant current is a speed: constant
+/// voltage is the tail of the charge, whatever the source offered.
+fn phase_as(status: ChargerStatus, usb: Option<bool>, speed: Option<&str>) -> Option<String> {
+    let said = match status {
+        _ if usb == Some(true) && !status.battery_detected => "no battery detected".to_string(),
+        _ if status.complete => "full".to_string(),
+        _ if status.trickle => "trickle charging".to_string(),
+        _ if status.constant_current => charging_as(speed),
+        _ if status.constant_voltage => "topping up".to_string(),
+        _ if status.recharge => "charging".to_string(),
+        _ if status.paused_die_temp => "charging paused (hot)".to_string(),
+        // No phase at all: idle on a source, and nothing to say off one.
+        _ if usb == Some(true) => "not charging".to_string(),
+        _ => return None,
+    };
+    Some(said)
 }
 
 fn level_as(level: Option<u8>) -> String {
@@ -720,17 +769,34 @@ fn features(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>) -> String
         .join(", ")
 }
 
-/// What the halves have left.
+/// What the halves have left, and what each half's charger is doing when the
+/// detail was read.
 ///
 /// A half the board does not publish is left out; one it publishes without a
 /// level is named and called unknown, because a half that is there and quiet is
 /// worth saying and a half that is not there is not.
-fn charge(battery: Battery) -> String {
-    let halves: Vec<String> = [("left", battery.left), ("right", battery.right)]
-        .into_iter()
-        .filter(|(_, level)| !level.is_absent())
-        .map(|(half, level)| format!("{half} {}", said(level)))
-        .collect();
+///
+/// The phase words this line the same way the wired summary is worded, off the
+/// same bits, so the two paths say the same thing for the same state. The radio
+/// read carries no VBUS flag and no source budget, so a half with no phase is
+/// only a level and a charge is never called fast or slow here.
+fn charge(battery: Battery, detail: Option<&ChargeDetail>) -> String {
+    let halves: Vec<String> = [
+        ("left", battery.left, detail.map(|detail| detail.left)),
+        ("right", battery.right, detail.map(|detail| detail.right)),
+    ]
+    .into_iter()
+    .filter(|(_, level, _)| !level.is_absent())
+    .map(|(half, level, detail)| {
+        let phase = detail
+            .and_then(|detail| detail.charger)
+            .and_then(|status| phase_as(status, None, None));
+        match phase {
+            Some(phase) => format!("{half} {} {phase}", said(level)),
+            None => format!("{half} {}", said(level)),
+        }
+    })
+    .collect();
 
     match halves.is_empty() {
         false => format!(" · {}", halves.join(" · ")),
@@ -749,11 +815,18 @@ fn said(level: Level) -> String {
     }
 }
 
-fn state(presence: Presence) -> &'static str {
+/// How reachable a bonded board is. A bonded entry whose address is one a board
+/// on the cable named is that board, so it is not out of range.
+fn state(presence: Presence, address: Option<&str>, on_usb: &[String]) -> &'static str {
     match presence {
         Presence::Connected => "connected",
         Presence::Nearby => "in range",
-        Presence::Paired => "paired, not in range",
+        Presence::Paired => {
+            match address.is_some_and(|address| on_usb.iter().any(|wired| wired == address)) {
+                true => "on USB, Bluetooth off",
+                false => "paired, not in range",
+            }
+        }
     }
 }
 
@@ -1231,7 +1304,7 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zapp_core::hid::{HalfDetail, Source, VbusInStatus};
+    use zapp_core::hid::{Charging, HalfDetail, Source, VbusInStatus};
 
     #[test]
     fn both_halves_of_a_split_board_are_named() {
@@ -1240,7 +1313,7 @@ mod tests {
             right: Level::Percent(27),
             keyboard: Level::Percent(0),
         };
-        assert_eq!(charge(battery), " · left 0% · right 27%");
+        assert_eq!(charge(battery, None), " · left 0% · right 27%");
     }
 
     #[test]
@@ -1250,7 +1323,7 @@ mod tests {
             right: Level::Unknown,
             keyboard: Level::Percent(36),
         };
-        assert_eq!(charge(battery), " · left 36% · right unknown");
+        assert_eq!(charge(battery, None), " · left 36% · right unknown");
     }
 
     #[test]
@@ -1261,7 +1334,7 @@ mod tests {
             right: Level::Absent,
             keyboard: Level::Percent(36),
         };
-        assert_eq!(charge(battery), " · left 36%");
+        assert_eq!(charge(battery, None), " · left 36%");
     }
 
     #[test]
@@ -1270,7 +1343,7 @@ mod tests {
             keyboard: Level::Percent(80),
             ..Battery::default()
         };
-        assert_eq!(charge(battery), " · 80%");
+        assert_eq!(charge(battery, None), " · 80%");
     }
 
     fn reading(level: Option<u8>, source: Source) -> BatteryReading {
@@ -1333,15 +1406,16 @@ mod tests {
             }),
             ..Telemetry::default()
         };
-        // Between the battery and the features, and the slot counted from one.
+        // Between the battery and the features, and the address alone: the
+        // slot the board named is not printed.
         assert_eq!(
             describe_telemetry(&telemetry, None)[1],
-            "bluetooth · FE:DB:E9:A8:B1:36 (host 3 of 6)"
+            "bluetooth · FE:DB:E9:A8:B1:36"
         );
     }
 
     #[test]
-    fn a_board_that_did_not_say_how_many_hosts_it_keeps_gives_the_address_alone() {
+    fn a_board_that_named_no_slot_gives_the_same_line() {
         let telemetry = Telemetry {
             version: 1,
             ble: Some(BleIdentity {
@@ -1385,6 +1459,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_half_holding_at_voltage_is_topping_up_rather_than_charging_fast() {
+        let telemetry = Telemetry {
+            version: 1,
+            left: charging_reading(Some(99), Source::Nrf),
+            right: charging_reading(Some(56), Source::Wired),
+            charging: Charging {
+                budget_ma: Some(1500),
+                ..Charging::default()
+            },
+            ..Telemetry::default()
+        };
+        let detail = ChargeTelemetry {
+            version: 1,
+            left: half_in(0x01 | 0x10),
+            right: half_in(0x01 | 0x08),
+        };
+
+        assert_eq!(
+            describe_telemetry(&telemetry, Some(&detail))[0],
+            "battery  · left 99% topping up · right 56% fast charging"
+        );
+    }
+
+    /// One half's charge detail, with its charger reading `raw`.
+    fn ble_half(raw: u8) -> BatteryDetail {
+        BatteryDetail {
+            charger: Some(ChargerStatus::from_bits(raw)),
+            ..BatteryDetail::default()
+        }
+    }
+
+    #[test]
+    fn a_bluetooth_summary_says_what_the_detail_read_said() {
+        let battery = Battery {
+            left: Level::Percent(99),
+            right: Level::Percent(54),
+            keyboard: Level::Percent(54),
+        };
+        let detail = ChargeDetail {
+            left: ble_half(0x01 | 0x02),
+            right: ble_half(0x01 | 0x08),
+            ..ChargeDetail::default()
+        };
+        // The same words the cable gives for the same bits. The radio carries
+        // no source budget, so a charge is neither fast nor slow here.
+        assert_eq!(
+            charge(battery, Some(&detail)),
+            " · left 99% full · right 54% charging"
+        );
+
+        let topping = ChargeDetail {
+            left: ble_half(0x01 | 0x10),
+            right: ble_half(0x01 | 0x04),
+            ..ChargeDetail::default()
+        };
+        assert_eq!(
+            charge(battery, Some(&topping)),
+            " · left 99% topping up · right 54% trickle charging"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_half_on_battery_is_only_a_level() {
+        let battery = Battery {
+            left: Level::Percent(99),
+            right: Level::Percent(54),
+            keyboard: Level::Percent(54),
+        };
+        // No phase and no VBUS flag on the radio: nothing to say about a
+        // charger, and a half the read did not reach is left as it was.
+        let detail = ChargeDetail {
+            left: ble_half(0x01),
+            right: BatteryDetail::default(),
+            ..ChargeDetail::default()
+        };
+        assert_eq!(charge(battery, Some(&detail)), " · left 99% · right 54%");
+
+        // And with no detail read at all the line is the level alone.
+        assert_eq!(charge(battery, None), " · left 99% · right 54%");
+    }
+
     /// One half whose charger reads `raw`, on USB.
     fn half_in(raw: u8) -> HalfDetail {
         HalfDetail {
@@ -1410,8 +1566,11 @@ mod tests {
 
         assert_eq!(said(0x01 | 0x02, Some("fast")), "57% full");
         assert_eq!(said(0x01 | 0x08, Some("fast")), "57% fast charging");
-        assert_eq!(said(0x01 | 0x10, Some("slow")), "57% slow charging");
+        assert_eq!(said(0x01 | 0x08, Some("slow")), "57% slow charging");
         assert_eq!(said(0x01 | 0x08, None), "57% charging");
+        // The tail of the charge is never fast, whatever the source offered.
+        assert_eq!(said(0x01 | 0x10, Some("fast")), "57% topping up");
+        assert_eq!(said(0x01 | 0x10, None), "57% topping up");
         // A trickle is never fast, whatever the source offered.
         assert_eq!(said(0x01 | 0x04, Some("fast")), "57% trickle charging");
         assert_eq!(said(0x01 | 0x20, Some("fast")), "57% charging");
@@ -1492,6 +1651,43 @@ mod tests {
     }
 
     #[test]
+    fn a_bonded_entry_that_is_the_board_on_the_cable_is_not_out_of_range() {
+        let on_usb = vec!["C6:14:15:90:63:EC".to_string()];
+
+        assert_eq!(
+            state(Presence::Paired, Some("C6:14:15:90:63:EC"), &on_usb),
+            "on USB, Bluetooth off"
+        );
+        // Another bonded board, and one whose handle spells out no address.
+        assert_eq!(
+            state(Presence::Paired, Some("FE:DB:E9:A8:B1:36"), &on_usb),
+            "paired, not in range"
+        );
+        assert_eq!(
+            state(Presence::Paired, None, &on_usb),
+            "paired, not in range"
+        );
+        // Nothing on the cable named an identity.
+        assert_eq!(
+            state(Presence::Paired, Some("C6:14:15:90:63:EC"), &[]),
+            "paired, not in range"
+        );
+    }
+
+    #[test]
+    fn a_reachable_board_is_worded_the_same_whatever_is_on_the_cable() {
+        let on_usb = vec!["C6:14:15:90:63:EC".to_string()];
+        for presence in [Presence::Connected, Presence::Nearby] {
+            assert_eq!(
+                state(presence, Some("C6:14:15:90:63:EC"), &on_usb),
+                state(presence, Some("C6:14:15:90:63:EC"), &[])
+            );
+        }
+        assert_eq!(state(Presence::Connected, None, &on_usb), "connected");
+        assert_eq!(state(Presence::Nearby, None, &on_usb), "in range");
+    }
+
+    #[test]
     fn a_board_that_is_not_a_voyager_2_is_never_asked_for_telemetry() {
         // The original Voyager has no battery and no nav header at all, so
         // there is nothing to report and nothing worth asking it for.
@@ -1502,7 +1698,7 @@ mod tests {
             vid: 0,
             pid: 0,
         };
-        assert_eq!(wired_report(&device, true), Vec::<String>::new());
+        assert_eq!(wired_report(&device, true), WiredReport::default());
     }
 
     /// One half filling on the cable, with nothing latched.
@@ -1519,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wired_board_says_what_each_half_is_filling_at() {
+    fn a_wired_board_lays_the_two_halves_out_under_headings() {
         let telemetry = ChargeTelemetry {
             version: 1,
             left: HalfDetail {
@@ -1541,14 +1737,14 @@ mod tests {
             ..Telemetry::default()
         };
 
+        // The rates the summary carries are decoded and not printed. No rails
+        // were read, so both rail columns are n/a for want of a measurement.
         assert_eq!(
             describe_charge(&summary, &telemetry, None),
             vec![
-                "charging · source 1500 mA · limit 700 mA · charge 550 mA",
-                "left     · 4.02 V · +512 mA · 28.5 °C · full in 1 h 20 min · \
-                 constant current · no fault",
-                "right    · 3.98 V · +298 mA · 27.9 °C · full in 2 h 05 min · \
-                 constant current · no fault",
+                "       cell    current  temp     VBUS  VSYS  full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  n/a   n/a   1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  n/a   n/a   2 h 05 min  constant current  none",
             ]
         );
     }
@@ -1576,47 +1772,51 @@ mod tests {
         (summary, telemetry)
     }
 
+    /// One half's rails on a cable. The flags come off the wire with the two
+    /// rails and are not printed.
+    fn rails() -> PmicRails {
+        PmicRails {
+            vbus_mv: 5030,
+            vsys_mv: 4960,
+            vbusin: VbusInStatus::from_bits(0x21),
+            charger_enabled: Some(true),
+            boost_off: Some(false),
+            charge_reduced: true,
+        }
+    }
+
     #[test]
-    fn a_wired_board_puts_each_half_s_rails_under_it() {
+    fn a_wired_board_puts_each_half_s_rails_in_its_own_row() {
         let (summary, telemetry) = wired_pair();
         let report = PmicRailsReport {
             version: 1,
             left: Some(PmicRails {
                 vbus_mv: 4620,
                 vsys_mv: 4550,
-                vbusin: VbusInStatus::from_bits(0x21),
-                charger_enabled: Some(true),
-                boost_off: None,
-                charge_reduced: false,
+                ..rails()
             }),
             right: Some(PmicRails {
                 vbus_mv: 4580,
                 vsys_mv: 4510,
                 vbusin: VbusInStatus::from_bits(0x01),
-                charger_enabled: Some(true),
-                boost_off: None,
-                charge_reduced: false,
+                ..rails()
             }),
         };
 
         assert_eq!(
             describe_charge(&summary, &telemetry, Some(report)),
             vec![
-                "charging · source 1500 mA",
-                "left     · 4.02 V · +512 mA · 28.5 °C · full in 1 h 20 min · \
-                 constant current · no fault",
-                "rails    · VBUS 4.62 V · VSYS 4.55 V · in: present, out active · charger enabled",
-                "right    · 3.98 V · +298 mA · 27.9 °C · full in 2 h 05 min · \
-                 constant current · no fault",
-                "rails    · VBUS 4.58 V · VSYS 4.51 V · in: present · charger enabled",
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  4.62 V  4.55 V  1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  4.58 V  4.51 V  2 h 05 min  constant current  none",
             ]
         );
     }
 
     #[test]
-    fn a_half_with_no_rails_keeps_its_detail_line() {
+    fn a_half_with_no_rails_has_n_a_in_both_rail_columns() {
         // An older firmware answers the rails command with nothing for a half,
-        // and that half's line stays exactly as it was.
+        // and that half's two rail columns say so rather than dropping out.
         let (summary, telemetry) = wired_pair();
         let report = PmicRailsReport {
             version: 1,
@@ -1625,59 +1825,214 @@ mod tests {
                 vbus_mv: 4580,
                 vsys_mv: 4510,
                 vbusin: VbusInStatus::from_bits(0x01),
-                charger_enabled: Some(true),
-                boost_off: None,
-                charge_reduced: false,
+                ..rails()
             }),
         };
 
         assert_eq!(
             describe_charge(&summary, &telemetry, Some(report)),
             vec![
-                "charging · source 1500 mA",
-                "left     · 4.02 V · +512 mA · 28.5 °C · full in 1 h 20 min · \
-                 constant current · no fault",
-                "right    · 3.98 V · +298 mA · 27.9 °C · full in 2 h 05 min · \
-                 constant current · no fault",
-                "rails    · VBUS 4.58 V · VSYS 4.51 V · in: present · charger enabled",
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  n/a     n/a     1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  4.58 V  4.51 V  2 h 05 min  constant current  none",
             ]
         );
-
-        // A board that never answered the command at all is the same silence.
-        assert_eq!(describe_charge(&summary, &telemetry, None).len(), 3);
     }
 
     #[test]
-    fn a_half_on_the_radio_says_how_long_it_has_left() {
-        let detail = BatteryDetail {
-            voltage_mv: Some(4020),
-            current_ma: Some(-45),
-            temp_cdeg: Some(2850),
-            tte_min: Some(750),
+    fn a_board_on_the_cable_counts_down_to_full() {
+        // One half finished and one still filling: the column is headed once
+        // for the board, and the finished half has no time to name.
+        let (summary, mut telemetry) = wired_pair();
+        telemetry.left.detail = BatteryDetail {
+            voltage_mv: Some(4170),
+            current_ma: Some(0),
+            temp_cdeg: Some(3440),
+            ttf_min: None,
+            charger: Some(ChargerStatus::from_bits(0x01 | 0x02)),
+            ..filling(4170, 0, 3440, 0)
+        };
+        telemetry.right.detail = filling(3990, 161, 3620, 386);
+        let report = PmicRailsReport {
+            version: 1,
+            left: Some(rails()),
+            right: Some(PmicRails {
+                vbus_mv: 4680,
+                vsys_mv: 4680,
+                vbusin: VbusInStatus::from_bits(0x01),
+                ..rails()
+            }),
+        };
+
+        assert_eq!(
+            describe_charge(&summary, &telemetry, Some(report)),
+            vec![
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.17 V  +0 mA    34.4 °C  5.03 V  4.96 V  n/a         charge complete   none",
+                "right  3.99 V  +161 mA  36.2 °C  4.68 V  4.68 V  6 h 26 min  constant current  none",
+            ]
+        );
+    }
+
+    /// One half running down on battery, with nothing latched.
+    fn running_down(voltage_mv: u16, current_ma: i16, temp_cdeg: i16, tte_min: u16) -> BatteryDetail {
+        BatteryDetail {
+            voltage_mv: Some(voltage_mv),
+            current_ma: Some(current_ma),
+            temp_cdeg: Some(temp_cdeg),
+            tte_min: Some(tte_min),
             ttf_min: None,
             charger: Some(ChargerStatus::from_bits(0x01)),
             fault: Some(ChargerFault::default()),
+        }
+    }
+
+    /// One half's rails on battery: nothing attached, so the input rail reads
+    /// zero because there is no input.
+    fn off_a_source(vsys_mv: u16) -> PmicRails {
+        PmicRails {
+            vbus_mv: 0,
+            vsys_mv,
+            vbusin: VbusInStatus::from_bits(0x00),
+            charger_enabled: Some(false),
+            ..rails()
+        }
+    }
+
+    #[test]
+    fn a_board_on_battery_counts_down_to_empty() {
+        // No half on a source and no charger phase anywhere: the column is
+        // headed the other way, and the input rail is n/a on both rows.
+        let detail = ChargeDetail {
+            left: running_down(4140, -40, 3120, 369),
+            right: running_down(3880, -31, 3050, 130),
+            left_rails: Some(off_a_source(4140)),
+            right_rails: Some(off_a_source(3880)),
         };
+
         assert_eq!(
-            detail_line("left", &detail, Estimate::Empty, None),
-            "left     · 4.02 V · -45 mA · 28.5 °C · empty in 12 h 30 min · \
-             charger idle · no fault"
+            ble_report(Some(&detail)),
+            vec![
+                "       cell    current  temp     VBUS  VSYS    empty in    charger       fault",
+                "left   4.14 V  -40 mA   31.2 °C  n/a   4.14 V  6 h 09 min  charger idle  none",
+                "right  3.88 V  -31 mA   30.5 °C  n/a   3.88 V  2 h 10 min  charger idle  none",
+            ]
         );
     }
 
     #[test]
-    fn a_half_on_the_cable_never_says_how_long_until_empty() {
-        // Plugged in, so time-to-empty means nothing even when the half has it.
-        let mut detail = filling(4020, -45, 2850, 80);
+    fn a_half_with_no_estimate_the_column_asks_for_says_n_a() {
+        // Heading for full, and the half only knows how long until empty.
+        let mut detail = filling(4020, 512, 2850, 80);
         detail.ttf_min = None;
         detail.tte_min = Some(45);
-        assert_eq!(time_left(&detail, Estimate::Full), "unknown");
+        assert_eq!(Estimate::Full.minutes(&detail), None);
+        assert_eq!(Estimate::Empty.minutes(&detail), Some(45));
 
-        // On the radio it is the answer, and time-to-full is the fallback.
-        assert_eq!(time_left(&detail, Estimate::Empty), "empty in 45 min");
-        detail.tte_min = None;
-        detail.ttf_min = Some(80);
-        assert_eq!(time_left(&detail, Estimate::Empty), "full in 1 h 20 min");
+        // And a finished charge is not filling, whatever the gauge carries.
+        let mut done = filling(4170, 0, 3520, 30);
+        done.charger = Some(ChargerStatus::from_bits(0x01 | 0x02));
+        assert_eq!(Estimate::Full.minutes(&done), None);
+    }
+
+    #[test]
+    fn an_estimate_under_a_minute_is_not_zero_minutes() {
+        assert_eq!(duration(0), "under a minute");
+
+        let detail = filling(4200, 131, 3500, 0);
+        assert_eq!(
+            detail_row("left", &detail, Estimate::Full, Some(true), None)[6],
+            "under a minute"
+        );
+    }
+
+    #[test]
+    fn a_board_is_filling_while_anything_says_it_is_on_a_source() {
+        let idle = running_down(4020, -45, 2850, 750);
+        let attached = off_a_source(4020);
+
+        // Nothing attached and no phase anywhere.
+        assert_eq!(
+            heading_for([(&idle, Some(attached)), (&idle, Some(attached))]),
+            Estimate::Empty
+        );
+        // One half's rails say an input is attached.
+        assert_eq!(
+            heading_for([(&idle, Some(attached)), (&idle, Some(rails()))]),
+            Estimate::Full
+        );
+        // Or one half's charger names a phase, with no rails read at all.
+        let charging = filling(4020, 512, 2850, 80);
+        assert_eq!(
+            heading_for([(&idle, None), (&charging, None)]),
+            Estimate::Full
+        );
+        assert_eq!(heading_for([(&idle, None), (&idle, None)]), Estimate::Empty);
+        // A completed charge is a board on a source too.
+        let mut done = charging;
+        done.charger = Some(ChargerStatus::from_bits(0x01 | 0x02));
+        assert_eq!(heading_for([(&idle, None), (&done, None)]), Estimate::Full);
+    }
+
+    #[test]
+    fn a_half_names_only_the_two_rails_it_measured() {
+        let detail = filling(3990, 161, 3620, 386);
+        let row = detail_row("right", &detail, Estimate::Full, Some(true), Some(rails()));
+        assert_eq!(row[4], "5.03 V");
+        assert_eq!(row[5], "4.96 V");
+
+        // What the input regulator, the charger register, the boost and the
+        // reduced-charge flag say is decoded and never printed.
+        let line = table(&[row]).remove(0);
+        for word in ["in:", "charger enabled", "boost", "charge reduced"] {
+            assert!(!line.contains(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_half_with_nothing_attached_names_only_its_system_rail() {
+        // On battery the input rail reads zero because there is no input, so
+        // its column is n/a and the system rail stays.
+        let detail = running_down(3990, -45, 3620, 386);
+        let row = detail_row("left", &detail, Estimate::Empty, None, Some(off_a_source(4150)));
+        assert_eq!(row[4], "n/a");
+        assert_eq!(row[5], "4.15 V");
+    }
+
+    #[test]
+    fn a_half_on_an_input_that_is_not_carrying_still_names_it() {
+        // Attached and suspended, or attached and held at its limit: there is
+        // an input to measure, so the column carries it.
+        let detail = filling(3990, 161, 3620, 386);
+        for raw in [0x01, 0x11, 0x03] {
+            let attached = PmicRails {
+                vbusin: VbusInStatus::from_bits(raw),
+                ..rails()
+            };
+            let row = detail_row("right", &detail, Estimate::Full, Some(true), Some(attached));
+            assert_eq!(row[4], "5.03 V", "{raw:#04x}");
+        }
+    }
+
+    #[test]
+    fn a_column_is_as_wide_as_the_widest_thing_in_it() {
+        let rows = [
+            vec!["".into(), "cell".into(), "fault".into()],
+            vec!["left".into(), "4.02 V".into(), "none".into()],
+            vec!["right".into(), "n/a".into(), "trickle timeout".into()],
+        ];
+        assert_eq!(
+            table(&rows),
+            vec![
+                "       cell    fault",
+                "left   4.02 V  none",
+                "right  n/a     trickle timeout",
+            ]
+        );
+        // Nothing trails the last column, whatever is under it.
+        for line in table(&rows) {
+            assert_eq!(line.trim_end(), line);
+        }
     }
 
     #[test]
@@ -1698,17 +2053,17 @@ mod tests {
 
     #[test]
     fn a_reading_the_board_did_not_take_keeps_its_column() {
-        // Every piece unknown, so the columns still line up under a half that
+        // Every column n/a, so the row still lines up under a half that
         // answered — and a flat cell is never invented from a missing one.
         assert_eq!(
-            detail_line("right", &BatteryDetail::default(), Estimate::Full, None),
-            "right    · unknown · unknown · unknown · unknown · unknown · unknown"
+            detail_row("right", &BatteryDetail::default(), Estimate::Full, None, None),
+            vec!["right", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"]
         );
     }
 
     #[test]
     fn hours_only_appear_once_there_is_one() {
-        assert_eq!(duration(0), "0 min");
+        assert_eq!(duration(0), "under a minute");
         assert_eq!(duration(59), "59 min");
         assert_eq!(duration(60), "1 h 00 min");
         assert_eq!(duration(125), "2 h 05 min");
@@ -1737,20 +2092,22 @@ mod tests {
 
     #[test]
     fn a_latched_fault_says_what_it_was() {
-        assert_eq!(fault(ChargerFault::default()), "no fault");
+        // Under a heading of its own, so a clear register is "none" rather
+        // than a sentence.
+        assert_eq!(fault(ChargerFault::default()), "none");
         assert_eq!(
             fault(ChargerFault {
                 reason: 0x40,
                 sensor: 0x00
             }),
-            "fault: trickle timeout"
+            "trickle timeout"
         );
         assert_eq!(
             fault(ChargerFault {
                 reason: 0x20,
                 sensor: 0x08
             }),
-            "fault: charge timeout (NTC hot)"
+            "charge timeout (NTC hot)"
         );
         // A bit with no name is still a fault, and says which one it was.
         assert_eq!(
@@ -1758,141 +2115,18 @@ mod tests {
                 reason: 0x80,
                 sensor: 0x00
             }),
-            "fault: 0x80"
+            "0x80"
         );
-    }
-
-    #[test]
-    fn a_figure_the_board_would_not_give_is_left_out() {
-        let charging = Charging {
-            budget_ma: Some(1500),
-            input_limit_ma: None,
-            charge_current_ma: Some(300),
-            state: None,
-        };
-        assert_eq!(
-            charge_rates(&charging).as_deref(),
-            Some("source 1500 mA · charge 300 mA")
-        );
-        // A board that gave none of the three has no line at all.
-        assert_eq!(charge_rates(&Charging::default()), None);
     }
 
     #[test]
     fn a_board_that_said_nothing_says_nothing() {
-        assert_eq!(charge(Battery::default()), "");
+        assert_eq!(charge(Battery::default(), None), "");
         // Including one connected but unreadable, which must not read as flat.
         let battery = Battery {
             keyboard: Level::Unknown,
             ..Battery::default()
         };
-        assert_eq!(charge(battery), "");
-    }
-
-    #[test]
-    fn a_half_on_the_radio_says_what_its_rails_measure() {
-        let rails = PmicRails {
-            vbus_mv: 4620,
-            vsys_mv: 4550,
-            vbusin: VbusInStatus::from_bits(0x21),
-            charger_enabled: Some(true),
-            boost_off: None,
-            charge_reduced: false,
-        };
-        assert_eq!(
-            rails_line(rails),
-            "rails    · VBUS 4.62 V · VSYS 4.55 V · in: present, out active · charger enabled"
-        );
-    }
-
-    #[test]
-    fn rails_with_nothing_attached_say_so_rather_than_stopping_short() {
-        let rails = PmicRails {
-            vbus_mv: 0,
-            vsys_mv: 3980,
-            vbusin: VbusInStatus::from_bits(0),
-            charger_enabled: Some(false),
-            boost_off: None,
-            charge_reduced: false,
-        };
-        assert_eq!(
-            rails_line(rails),
-            "rails    · VBUS 0.00 V · VSYS 3.98 V · in: none · charger disabled"
-        );
-    }
-
-    #[test]
-    fn a_charger_register_that_was_not_read_is_not_a_charger_that_is_off() {
-        let rails = PmicRails {
-            vbus_mv: 5040,
-            vsys_mv: 4600,
-            vbusin: VbusInStatus::from_bits(0x12),
-            charger_enabled: None,
-            boost_off: None,
-            charge_reduced: false,
-        };
-        assert_eq!(
-            rails_line(rails),
-            "rails    · VBUS 5.04 V · VSYS 4.60 V · in: current limit, suspended · charger unknown"
-        );
-    }
-
-    #[test]
-    fn a_half_that_reports_its_boost_says_which_way_it_is() {
-        let base = PmicRails {
-            vbus_mv: 4620,
-            vsys_mv: 4550,
-            vbusin: VbusInStatus::from_bits(0x21),
-            charger_enabled: Some(true),
-            boost_off: None,
-            charge_reduced: false,
-        };
-
-        let on = PmicRails {
-            boost_off: Some(false),
-            ..base
-        };
-        assert_eq!(
-            rails_line(on),
-            "rails    · VBUS 4.62 V · VSYS 4.55 V · in: present, out active · \
-             charger enabled · boost on"
-        );
-
-        let off = PmicRails {
-            boost_off: Some(true),
-            ..base
-        };
-        assert_eq!(
-            rails_line(off),
-            "rails    · VBUS 4.62 V · VSYS 4.55 V · in: present, out active · \
-             charger enabled · boost off"
-        );
-
-        // A half that does not report it says nothing rather than guessing.
-        assert!(!rails_line(base).contains("boost"));
-    }
-
-    #[test]
-    fn a_half_holding_its_charge_current_back_says_so() {
-        let base = PmicRails {
-            vbus_mv: 4620,
-            vsys_mv: 4550,
-            vbusin: VbusInStatus::from_bits(0x21),
-            charger_enabled: Some(true),
-            boost_off: None,
-            charge_reduced: false,
-        };
-
-        assert_eq!(
-            rails_line(PmicRails {
-                charge_reduced: true,
-                ..base
-            }),
-            "rails    · VBUS 4.62 V · VSYS 4.55 V · in: present, out active · \
-             charger enabled · charge reduced"
-        );
-
-        // A half charging at the rate it was told leaves the line as it was.
-        assert!(!rails_line(base).contains("charge reduced"));
+        assert_eq!(charge(battery, None), "");
     }
 }
