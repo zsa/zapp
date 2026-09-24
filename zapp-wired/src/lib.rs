@@ -45,6 +45,14 @@ pub enum WiredError {
     #[error("{0}")]
     Usb(String),
 
+    /// The bootloader is plugged in and this user may not open it.
+    ///
+    /// Its own variant rather than a [`Self::Usb`] string, because right after
+    /// a reset it is usually a moment rather than a fault: on Linux the node
+    /// appears as root's and the udev rule opens it up shortly after.
+    #[error("the ZSA bootloader is plugged in but this user may not open it: {0}")]
+    AccessDenied(String),
+
     #[error("vendor request {request:#04x} failed: {reason}")]
     Request { request: u8, reason: String },
 

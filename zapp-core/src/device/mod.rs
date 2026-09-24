@@ -1,7 +1,9 @@
+pub mod access;
 pub mod ids;
 pub mod monitor;
 pub mod watcher;
 
+pub use access::AccessGrace;
 pub use ids::{BootloaderDevice, BootloaderKind, Keyboard};
 pub use monitor::{DeviceEvent, DeviceMonitor};
 pub use watcher::{

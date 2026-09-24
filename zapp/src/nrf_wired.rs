@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::ProgressBar;
 
-use zapp_core::device::{self, Keyboard, UsbDevice};
+use zapp_core::device::access::ACCESS_RETRY;
+use zapp_core::device::{self, AccessGrace, Keyboard, UsbDevice};
 use zapp_core::flash::FlashProgress;
 use zapp_core::hid::{BatteryReading, Telemetry};
 use zapp_smp::bundle::{self, Bundle};
@@ -1825,11 +1826,17 @@ pub fn bootloader_present() -> bool {
     match UsbLink::open() {
         Ok(_) => true,
         Err(WiredError::NoBootloader) => false,
+        Err(WiredError::AccessDenied(err)) => {
+            // Plugged in, and either not opened up by udev yet or never will
+            // be. Both are the cable: the wired path waits out the first and
+            // names the second.
+            log::debug!("a bootloader is present but refused to open: {err}");
+            true
+        }
         Err(err) => {
-            // Something is plugged in that cannot be opened — a permissions
-            // problem, most likely. Say so rather than silently going over
-            // the radio, where the same board would work and the cause would
-            // stay hidden.
+            // Something is plugged in that cannot be opened. Say so rather
+            // than silently going over the radio, where the same board would
+            // work and the cause would stay hidden.
             log::warn!("a bootloader is present but could not be opened: {err}");
             false
         }
@@ -1847,18 +1854,29 @@ const WAIT_FOR_BOOTLOADER: Duration = Duration::from_secs(60);
 /// to update it, so "not plugged in" is the normal starting state, not an
 /// error. Waiting matches what flashing a QMK image already does and turns the
 /// whole thing into one command and one button press.
+///
+/// A bootloader that refuses to open is waited for too, for
+/// [`ACCESS_GRACE`](zapp_core::device::access::ACCESS_GRACE)
+/// from the first refusal: right after a reset that is udev not having opened
+/// the node up yet.
 fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
+    let deadline = Instant::now() + limit;
+    let mut grace = AccessGrace::default();
+
     match UsbLink::open() {
         Ok(link) => {
             log::debug!("found the ZSA bootloader over USB");
             return Ok(link);
         }
         Err(WiredError::NoBootloader) => {}
+        Err(WiredError::AccessDenied(err)) => {
+            grace.retry(Instant::now());
+            log::debug!("the bootloader refused to open ({err}), trying again");
+        }
         Err(err) => return Err(err).context("Could not open the ZSA bootloader"),
     }
 
     let spinner = new_spinner("Waiting for keyboard in bootloader mode...");
-    let deadline = Instant::now() + limit;
 
     loop {
         match UsbLink::open() {
@@ -1868,17 +1886,48 @@ fn open_waiting(limit: Duration) -> Result<Retrying<UsbLink>> {
                 return Ok(link);
             }
             Err(WiredError::NoBootloader) if Instant::now() < deadline => {
+                grace.reset();
                 std::thread::sleep(Duration::from_millis(250));
             }
             Err(WiredError::NoBootloader) => {
                 spinner.finish_and_clear();
                 bail!("No bootloader appeared in {} seconds.", limit.as_secs())
             }
+            Err(WiredError::AccessDenied(err))
+                if grace.retry(Instant::now()) && Instant::now() < deadline =>
+            {
+                log::debug!("the bootloader refused to open ({err}), trying again");
+                std::thread::sleep(ACCESS_RETRY);
+            }
+            Err(WiredError::AccessDenied(err)) => {
+                spinner.finish_and_clear();
+                return Err(access_denied(&err));
+            }
             Err(err) => {
                 spinner.finish_and_clear();
                 return Err(err).context("Could not open the ZSA bootloader");
             }
         }
+    }
+}
+
+/// The error for a bootloader that is plugged in and stayed closed to this
+/// user.
+fn access_denied(cause: &str) -> anyhow::Error {
+    if cfg!(target_os = "linux") {
+        anyhow!(
+            "The ZSA bootloader is plugged in, but this user is not allowed to open it \
+             ({cause}). The udev rule for ZSA devices (vendor 3297) is missing or has not \
+             been applied. It should read:\n\n    \
+             SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"3297\", MODE:=\"0666\"\n\n\
+             Install it under /etc/udev/rules.d/, then run `sudo udevadm control \
+             --reload-rules && sudo udevadm trigger` and replug the keyboard."
+        )
+    } else {
+        anyhow!(
+            "The ZSA bootloader is plugged in, but this user is not allowed to open it \
+             ({cause})."
+        )
     }
 }
 

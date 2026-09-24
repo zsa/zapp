@@ -818,6 +818,7 @@ pub mod usb {
 
     use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
     use nusb::{Endpoint, Interface, MaybeFuture};
+    use zapp_core::device::access::permission_denied;
 
     use super::{IgnitionLink, Retrying, BULK_WRITE_TIMEOUT, CONTROL_TIMEOUT, INTERFACE, PID, VID};
     use crate::WiredError;
@@ -855,14 +856,11 @@ pub mod usb {
                 .find(|device| device.vendor_id() == VID && device.product_id() == PID)
                 .ok_or(WiredError::NoBootloader)?;
 
-            let device = info
-                .open()
-                .wait()
-                .map_err(|err| WiredError::Usb(err.to_string()))?;
+            let device = info.open().wait().map_err(open_error)?;
             let interface = device
                 .detach_and_claim_interface(INTERFACE)
                 .wait()
-                .map_err(|err| WiredError::Usb(err.to_string()))?;
+                .map_err(open_error)?;
 
             Self::on(interface)
         }
@@ -879,6 +877,15 @@ pub mod usb {
                     .map_err(|err| WiredError::Usb(err.to_string()))?,
                 interface,
             })
+        }
+    }
+
+    /// An error opening the device, with a permission refusal kept apart.
+    fn open_error(err: nusb::Error) -> WiredError {
+        if permission_denied(&err) {
+            WiredError::AccessDenied(err.to_string())
+        } else {
+            WiredError::Usb(err.to_string())
         }
     }
 
