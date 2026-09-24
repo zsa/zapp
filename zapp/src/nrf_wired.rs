@@ -198,7 +198,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
         &mut ignition,
         &bundle,
         force,
-        REPLY_TIMEOUT,
+        reply_timeout(),
         SETTLE_TIMEOUT,
     ) {
         Ok(outcome) => {
@@ -1076,7 +1076,12 @@ fn write_half<L: IgnitionLink + 'static>(
         // image with no way back, and the confirm tunnel means this run can wait
         // until the half is up and running it before deciding — see the note at
         // the top of this file.
-        arm(&mut client, half, &wanted)?;
+        if let Err(err) = arm(&mut client, half, &wanted) {
+            if matches!(err.downcast_ref::<SmpError>(), Some(SmpError::Timeout(_))) {
+                probe_silent_mark(shared, ignition, half, status, timeout);
+            }
+            return Err(err);
+        }
         log::debug!(
             "{half}: {} bytes written, spare slot now carries {}",
             image.len(),
@@ -1164,6 +1169,49 @@ fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
         }
         Err(err) => Err(err)
             .with_context(|| format!("Could not mark the {half} half's new image for test")),
+    }
+}
+
+/// Looks at a half whose mark went unanswered: hung, restarted, or answered
+/// into the void. Logs only; every step's failure is logged and dropped.
+fn probe_silent_mark<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    ignition: &mut Ignition<Shared<L>>,
+    half: Half,
+    status: &Status,
+    timeout: Duration,
+) {
+    log::warn!("{half}: no reply to the mark, probing");
+    match ignition.status() {
+        Ok(status) => log::warn!("{half}: ignition status after the silent mark: {status:?}"),
+        Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
+    }
+
+    if let Err(err) = ignition.send(half.into(), b"\n") {
+        log::warn!("{half}: could not send a resync newline: {err}");
+    }
+    let mut client = connect(shared, half, status.payload_budget(), timeout);
+    match client.image_state() {
+        Ok(slots) if slots.is_empty() => log::warn!("{half}: image state lists no slots"),
+        Ok(slots) => {
+            for slot in &slots {
+                log::warn!(
+                    "{half}: slot {} carries {} ({}) [{}]",
+                    slot.slot,
+                    short(&slot.hash),
+                    named(&slot.version),
+                    slot.flags().join(" ")
+                );
+            }
+            let pending = slots.iter().any(|slot| slot.slot == 1 && slot.pending);
+            log::warn!("{half}: slot 1 pending: {pending}");
+        }
+        Err(err) => log::warn!("{half}: image state read failed too: {err}"),
+    }
+
+    match ignition.status() {
+        Ok(status) => log::warn!("{half}: ignition status after the probe: {status:?}"),
+        Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
     }
 }
 
