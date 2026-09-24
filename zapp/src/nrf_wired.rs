@@ -280,6 +280,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
 
 /// Says what went wrong, in one line, and stops.
 fn report_failure(err: anyhow::Error) -> ! {
+    crate::flash_log::fail(&err);
     eprintln!("Error: {err:#}");
     std::process::exit(1);
 }

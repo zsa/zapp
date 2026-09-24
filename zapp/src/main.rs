@@ -1,4 +1,5 @@
 mod confirm;
+mod flash_log;
 mod nrf_wired;
 mod zsab;
 
@@ -149,13 +150,12 @@ impl Default for LinkArgs {
 
 /// Runs the command the arguments name, and says one line about a failure.
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp(None)
-        .init();
-
     let cli = Cli::parse();
+    flash_log::init(matches!(cli.command, Commands::Flash { .. } | Commands::Update));
 
-    if let Err(err) = dispatch(cli.command) {
+    let result = dispatch(cli.command);
+    flash_log::finish(&result);
+    if let Err(err) = result {
         eprintln!("Error: {err:#}");
         std::process::exit(1);
     }
