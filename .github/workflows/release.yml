@@ -192,7 +192,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
-      attestations: write
+      # attestations: write
 
     steps:
       - uses: actions/checkout@v4
@@ -203,10 +203,11 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: "artifacts/*"
+      # Attestations need a paid plan on private repos.
+      # - name: Attest build provenance
+      #   uses: actions/attest-build-provenance@v2
+      #   with:
+      #     subject-path: "artifacts/*"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
