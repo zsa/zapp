@@ -489,7 +489,7 @@ impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L>
         let summary = reasons.join(" ");
         if let Err(err) = self.reboot_both() {
             log::debug!("could not reopen a session to revert: {err:#}");
-            return anyhow!("Flashing failed, the right side did not confirm.");
+            return unconfirmed(&landed, &summary);
         }
 
         let mut restored: Vec<(Half, bool)> = Vec::new();
@@ -569,6 +569,20 @@ impl<L: IgnitionLink + 'static> WiredPair<'_, L> {
     }
 }
 
+/// The failure for a pair that could not be put back, naming the halves that
+/// never answered — or the reasons, for a pair that answered on two builds.
+fn unconfirmed(landed: &[(Half, Landed)], summary: &str) -> anyhow::Error {
+    let silent: Vec<String> = landed
+        .iter()
+        .filter(|(_, verdict)| !matches!(verdict, Landed::Ok { .. }))
+        .map(|(half, _)| half.to_string())
+        .collect();
+    if silent.is_empty() {
+        return anyhow!("Flashing failed; {summary}");
+    }
+    anyhow!("Flashing failed, the {} side did not confirm.", silent.join(" and "))
+}
+
 /// The hash a verdict says the half is running, if it said one at all.
 fn hash_of(verdict: &Landed) -> Option<Vec<u8>> {
     match verdict {
@@ -629,15 +643,55 @@ fn read_once<L: IgnitionLink>(ignition: &mut Ignition<L>, half: Half, wanted: &[
         // A stall here is ignition refusing the request rather than the half
         // refusing anything: a session still open, or a bootloader from before
         // the tunnel existed.
+        if matches!(err, WiredError::Stalled { .. }) {
+            probe_bridge(ignition);
+        }
         return Landed::Gone {
             why: format!("The {half} half could not be asked what it is running: {err}."),
         };
     }
     match poll_confirm(ignition, half, ConfirmMode::Read, wanted, EXCHANGE) {
         Ok(result) => read_landed(result, half),
-        Err(err) => Landed::Gone {
-            why: format!("The {half} half's answer could not be read back: {err}."),
-        },
+        Err(err) => {
+            if matches!(err, WiredError::Stalled { .. }) {
+                probe_bridge(ignition);
+            }
+            Landed::Gone {
+                why: format!("The {half} half's answer could not be read back: {err}."),
+            }
+        }
+    }
+}
+
+/// Logs what the bridge looks like once a confirm request has been refused.
+///
+/// Ignition takes a confirm only while no session is open, so a stall there
+/// should be the answer to a session left open — but END and RESET_TARGET
+/// have been seen stalling too, which the firmware never does while its main
+/// loop runs. STATUS tells the two apart: a bridge that answers it is alive and
+/// says what it thinks is going on; one that stalls it as well has stopped
+/// servicing USB. What is on the bus says whether it is still the bootloader.
+fn probe_bridge<L: IgnitionLink>(ignition: &mut Ignition<L>) {
+    match ignition.status() {
+        Ok(_) => {}
+        Err(err) => log::debug!("the bridge refused STATUS as well: {err}"),
+    }
+    let Some(attached) = attached() else {
+        return;
+    };
+    if attached.is_empty() {
+        log::debug!("nothing from ZSA is on USB");
+    }
+    for device in &attached {
+        log::debug!(
+            "on USB: {:04x}:{:04x} {}",
+            device.vid,
+            device.pid,
+            match device.bootloader {
+                Some(kind) => format!("bootloader {kind:?}"),
+                None => "keyboard firmware".to_string(),
+            }
+        );
     }
 }
 
@@ -1547,7 +1601,11 @@ fn agreed(bundle: &Bundle, carried: &[Carried]) -> Result<()> {
         }
     }
     if found.is_empty() {
-        log::debug!("both halves are on {}", named(&wanted));
+        // A half that never answered has no hash to disagree with, which is
+        // not the same as agreeing: its read is what fails the run.
+        if carried.iter().all(|entry| entry.hash.is_some()) {
+            log::debug!("both halves are on {}", named(&wanted));
+        }
         return Ok(());
     }
 
@@ -3796,6 +3854,40 @@ mod tests {
             hash: Some(hash.to_vec()),
             was: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_pair_that_could_not_be_put_back_names_the_half_that_never_answered() {
+        let landed = [
+            (
+                Half::Right,
+                Landed::Ok {
+                    confirmed: false,
+                    active: vec![0xb8; 32],
+                },
+            ),
+            (
+                Half::Left,
+                Landed::Gone {
+                    why: "The left half did not answer.".into(),
+                },
+            ),
+        ];
+        let err = unconfirmed(&landed, "The left half did not answer.").to_string();
+        assert_eq!(err, "Flashing failed, the left side did not confirm.");
+    }
+
+    #[test]
+    fn a_pair_that_answered_on_two_builds_keeps_its_reasons() {
+        let landed = [(
+            Half::Right,
+            Landed::Ok {
+                confirmed: false,
+                active: vec![0xb8; 32],
+            },
+        )];
+        let err = unconfirmed(&landed, "The halves are on different builds.").to_string();
+        assert_eq!(err, "Flashing failed; The halves are on different builds.");
     }
 
     #[test]
