@@ -8,9 +8,10 @@
 //! operations through [`PairConfirm`]; the decision itself is [`settle`], and
 //! there is exactly one of it.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use zapp_smp::Half;
 
+use crate::error::{kind_of, ErrorKind};
 use crate::text::{named, short};
 
 /// The three things a transport does to settle a pair, plus the notes it makes
@@ -146,6 +147,44 @@ pub fn decide(landed: &[(Half, Landed)], mismatch: Option<String>) -> Decision {
     match reasons.is_empty() {
         true => Decision::Keep,
         false => Decision::Revert { reasons },
+    }
+}
+
+/// The failure for a pair that was put back: reverted, or naming the halves
+/// that did not come back on their old firmware. Both transports word their
+/// revert this way.
+pub(crate) fn reverted(restored: &[(Half, bool)], summary: &str) -> anyhow::Error {
+    let unrestored: Vec<Half> = restored
+        .iter()
+        .filter(|(_, back)| !back)
+        .map(|(half, _)| *half)
+        .collect();
+    if unrestored.is_empty() {
+        return kind_of(
+            ErrorKind::Reverted,
+            None,
+            anyhow!("Flashing failed and reverted to the previous firmware; {summary}"),
+        );
+    }
+
+    let named: Vec<String> = unrestored.iter().map(Half::to_string).collect();
+    kind_of(
+        ErrorKind::NotReverted {
+            halves: unrestored.clone(),
+        },
+        single(&unrestored),
+        anyhow!(
+            "Flashing failed, the {} side did not revert; {summary}",
+            named.join(" and ")
+        ),
+    )
+}
+
+/// The one half a list names, when it names exactly one.
+pub(crate) fn single(halves: &[Half]) -> Option<Half> {
+    match halves {
+        [half] => Some(*half),
+        _ => None,
     }
 }
 

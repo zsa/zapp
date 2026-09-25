@@ -2594,7 +2594,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "zapp-core",
  "zapp-smp",
+ "zapp-wired",
 ]
 
 [[package]]

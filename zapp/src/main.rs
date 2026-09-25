@@ -1,5 +1,6 @@
 mod flash_log;
 mod nrf_wired;
+mod screen;
 mod zsab;
 
 use std::fs::File;
@@ -20,13 +21,14 @@ use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
-    BatteryDetail, BatteryReading, BleIdentity, CMD_GET_CHARGE_TELEMETRY, CMD_GET_PMIC_RAILS,
-    CMD_GET_TELEMETRY, ChargeTelemetry, ChargerFault, ChargerStatus, HidConnection, HidEvent, Nav,
+    BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus, Nav,
     PmicRails, PmicRailsReport, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
 use zapp_wired::Ignition;
+use zapp_update::probe::usb_telemetry;
+use zapp_update::{route, Transport};
 
 #[derive(Parser)]
 #[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
@@ -197,11 +199,6 @@ fn dispatch(command: Commands) -> Result<()> {
 const BLE_SETTLE: Duration = Duration::from_millis(750);
 const BLE_SCAN: Duration = Duration::from_secs(7);
 
-/// How long to wait for a wired board to answer the telemetry query. Firmware
-/// that predates the command never answers at all, so this elapses in the
-/// ordinary case and must stay short enough not to be felt.
-const TELEMETRY_WAIT: Duration = Duration::from_millis(500);
-
 fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
     let wired = device::list_devices();
 
@@ -308,60 +305,6 @@ struct WiredReport {
     charge: String,
     lines: Vec<String>,
     ble_address: Option<String>,
-}
-
-/// What the board answers, on one connection: the summary always, and the
-/// detail behind it only when it was asked for. A board whose firmware predates
-/// any of these commands never answers it, which is why each wait can elapse.
-type UsbTelemetry = (Telemetry, Option<ChargeTelemetry>, Option<PmicRailsReport>);
-
-fn usb_telemetry(device: &UsbDevice, rails: bool) -> Option<UsbTelemetry> {
-    if device.bootloader.is_some() {
-        return None; // a board in its bootloader runs no keyboard firmware
-    }
-
-    let conn = HidConnection::open(device.vid, device.pid).ok()?;
-    let telemetry = ask(&conn, CMD_GET_TELEMETRY, |event| match event {
-        HidEvent::Telemetry(telemetry) => Some(telemetry),
-        _ => None,
-    })?;
-    // Asked for every listing, verbose or not: the charger phase words the
-    // board's own line, and the two wordings must not differ.
-    let charge = ask(&conn, CMD_GET_CHARGE_TELEMETRY, |event| match event {
-        HidEvent::ChargeTelemetry(telemetry) => Some(telemetry),
-        _ => None,
-    });
-    let rails = rails
-        .then(|| {
-            ask(&conn, CMD_GET_PMIC_RAILS, |event| match event {
-                HidEvent::PmicRails(report) => Some(report),
-                _ => None,
-            })
-        })
-        .flatten();
-
-    Some((telemetry, charge, rails))
-}
-
-/// Send one query and wait out the answer `take` is looking for.
-///
-/// Everything else on the way past is the connection's own handshake, which
-/// runs whether anything wants it or not.
-fn ask<T>(conn: &HidConnection, cmd: u8, take: impl Fn(HidEvent) -> Option<T>) -> Option<T> {
-    conn.send(cmd, &[]);
-
-    let deadline = Instant::now() + TELEMETRY_WAIT;
-    loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        match conn.recv_timeout(left)? {
-            HidEvent::Disconnected => return None,
-            event => {
-                if let Some(answer) = take(event) {
-                    return Some(answer);
-                }
-            }
-        }
-    }
 }
 
 /// What each half of a wired board has left, in the shape and the wording the
@@ -856,7 +799,7 @@ fn bootloader_version(device: &UsbDevice) -> String {
         return String::new();
     }
     let version = match UsbLink::open_bare() {
-        Ok(link) => nrf_wired::ignition_version(&mut Ignition::new(link)),
+        Ok(link) => zapp_update::wired::ignition_version(&mut Ignition::new(link)),
         Err(err) => {
             log::debug!("could not open ignition to ask its version: {err}");
             match UsbLink::attached_bcd() {
@@ -918,32 +861,6 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
 /// Whether a DFU suffix names a Voyager 2, either revision.
 fn is_voyager2_image(pid: u16) -> bool {
     matches!(pid, 0x1978 | 0x0792)
-}
-
-/// The way an update reaches the keyboard, for saying so on the loaded line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Transport {
-    Usb,
-    Bluetooth,
-}
-
-impl Transport {
-    fn label(self) -> &'static str {
-        match self {
-            Transport::Usb => "USB",
-            Transport::Bluetooth => "Bluetooth",
-        }
-    }
-}
-
-/// Which way a Voyager 2 update goes: the cable whenever the keyboard is on it,
-/// in its bootloader or running its own firmware, Bluetooth otherwise.
-fn route() -> Transport {
-    if nrf_wired::bootloader_present() || nrf_wired::voyager2_present() {
-        Transport::Usb
-    } else {
-        Transport::Bluetooth
-    }
 }
 
 /// A Voyager 2 keyboard image, over whichever way the keyboard is reachable.

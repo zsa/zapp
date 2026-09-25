@@ -16,7 +16,7 @@ const STDERR_FILTER: &str = "warn,nusb=off";
 
 /// The file's filter: debug for the workspace's crates, info for the rest.
 const FILE_FILTER: &str = "info,zapp=debug,zapp_core=debug,zapp_ble=debug,zapp_hid_proto=debug,\
-                           zapp_oryx=debug,zapp_smp=debug,zapp_wired=debug";
+                           zapp_oryx=debug,zapp_smp=debug,zapp_update=debug,zapp_wired=debug";
 
 /// Size past which the log is moved to `.1` before a run appends to it.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
