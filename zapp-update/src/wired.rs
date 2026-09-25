@@ -10,7 +10,7 @@
 //!
 //! What is left is an order and a set of checks, which is what this file is.
 //! Every wait polls: ignition's STATUS, an SMP reply, or the running half's
-//! answer to a confirm query — see [`SETTLE_TIMEOUT`].
+//! answer to a confirm query — see [`crate::Timings::settle`].
 //!
 //! The write goes into the spare slot and is marked for test, exactly as the
 //! Bluetooth path marks it, and nothing is kept until both halves have been
@@ -34,8 +34,8 @@
 //! than from a bootloader looking at flash, and it needs no reboot to make. So
 //! both halves are verified first and kept afterwards, together, and a pair
 //! that does not come out of it right is reset back onto what it was running —
-//! see [`revert_both`]. [`came_back`] still runs last and still asks the same
-//! separate question: whether the keyboard is up and typing.
+//! see `WiredPair::revert_pair`. `came_back` still runs last and still asks
+//! the same separate question: whether the keyboard is up and typing.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};

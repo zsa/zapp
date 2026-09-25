@@ -36,7 +36,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 pub mod ble;
-pub mod confirm;
+mod confirm;
 mod error;
 pub mod event;
 pub mod guard;
