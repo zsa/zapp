@@ -1,4 +1,3 @@
-mod confirm;
 mod flash_log;
 mod nrf_wired;
 mod zsab;

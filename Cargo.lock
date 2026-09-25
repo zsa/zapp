@@ -2527,6 +2527,7 @@ dependencies = [
  "zapp-core",
  "zapp-oryx",
  "zapp-smp",
+ "zapp-update",
  "zapp-wired",
 ]
 
@@ -2585,6 +2586,15 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "zapp-core",
+]
+
+[[package]]
+name = "zapp-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "zapp-smp",
 ]
 
 [[package]]

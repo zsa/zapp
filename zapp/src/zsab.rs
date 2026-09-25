@@ -21,6 +21,9 @@ use zapp_ble::{Battery, Level};
 use zapp_core::device::{self, ids::Keyboard};
 use zapp_core::flash::FlashProgress;
 
+use zapp_update::confirm::{Landed, PairConfirm};
+use zapp_update::text::{named, short, sizes};
+
 use crate::{smp_connect, smp_connect_quiet, LinkArgs};
 
 /// How long to leave a half alone after telling it to restart.
@@ -261,7 +264,7 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
             before,
             spinner: None,
         };
-        let settled = crate::confirm::settle(&mut pair, &read, &keep);
+        let settled = zapp_update::confirm::settle(&mut pair, &read, &keep);
         // Whatever it came to, the line the spinner owns is given back before
         // anything else is said.
         pair.clear();
@@ -699,42 +702,6 @@ fn both_on_the_bundle(bundle: &Bundle, running: &[(Half, Vec<u8>)]) -> Result<()
     )
 }
 
-/// What a restarted half came back as.
-///
-/// `pub(crate)` because the wired path in [`crate::nrf_wired`] reaches the same
-/// three answers through its own transport and hands them to the same
-/// [`decide`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Landed {
-    /// Reachable, and running the image that was written.
-    Ok { confirmed: bool, active: Vec<u8> },
-    /// Reachable, running something else — MCUboot put the old image back, or
-    /// it never had anything running at all.
-    Wrong { active: Vec<u8>, version: String },
-    /// Not reachable inside [`REBOOT_TIMEOUT`].
-    Gone { why: String },
-}
-
-impl Landed {
-    /// The one sentence this verdict is worth.
-    pub(crate) fn why(&self, half: Half) -> String {
-        match self {
-            Landed::Ok { active, .. } => {
-                format!("The {half} half came back running {}.", short(active))
-            }
-            Landed::Wrong { active, .. } if active.is_empty() => {
-                format!("The {half} half came back but reports nothing running.")
-            }
-            Landed::Wrong { active, version } => format!(
-                "The {half} half came back running {} ({}), not the image that was written.",
-                short(active),
-                named(version)
-            ),
-            Landed::Gone { why } => why.clone(),
-        }
-    }
-}
-
 /// Waits for a half to come back, and says what it came back as.
 ///
 /// None of the three answers is a reason to abort on its own: whether a half
@@ -863,7 +830,7 @@ impl BleConfirm<'_> {
     }
 }
 
-impl crate::confirm::PairConfirm for BleConfirm<'_> {
+impl PairConfirm for BleConfirm<'_> {
     fn running(&mut self, half: Half) -> Landed {
         self.saying("Waiting for the halves to restart...");
         let hash = self.bundle.hash(half).unwrap_or_default();
@@ -977,34 +944,6 @@ impl crate::confirm::PairConfirm for BleConfirm<'_> {
     }
 }
 
-/// Keep both halves, or put both back.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Decision {
-    Keep,
-    Revert { reasons: Vec<String> },
-}
-
-/// What to do with a pair that has come back.
-///
-/// Pure on purpose: this is the one decision the whole run turns on, and the
-/// only part of it that can be checked without a keyboard. One half short of
-/// perfect is a revert — a keyboard is a pair or it is nothing. `mismatch` is
-/// [`both_on_the_bundle`]'s complaint, a revert case like any other, since two
-/// halves on two builds cannot talk to each other.
-pub(crate) fn decide(landed: &[(Half, Landed)], mismatch: Option<String>) -> Decision {
-    let mut reasons: Vec<String> = landed
-        .iter()
-        .filter(|(_, verdict)| !matches!(verdict, Landed::Ok { .. }))
-        .map(|(half, verdict)| verdict.why(*half))
-        .collect();
-    reasons.extend(mismatch);
-
-    match reasons.is_empty() {
-        true => Decision::Keep,
-        false => Decision::Revert { reasons },
-    }
-}
-
 /// Whether a connection announces itself.
 ///
 /// One line, one spinner: a connect made while the run is already saying what
@@ -1067,18 +1006,6 @@ fn charging() -> bool {
     })
 }
 
-/// Both halves' images, right first — the order they are written in.
-///
-/// `pub(crate)` so the wired path in [`crate::nrf_wired`] says the same thing
-/// the same way.
-pub(crate) fn sizes(bundle: &Bundle) -> String {
-    [Half::Right, Half::Left]
-        .iter()
-        .map(|half| format!("{} {} KiB", half.as_str(), bundle.image(*half).len() / 1024))
-        .collect::<Vec<_>>()
-        .join(" + ")
-}
-
 fn announce(bundle: &Bundle, path: &Path, len: usize) {
     println!(
         "Bundle loaded: {} ({}) flashing over Bluetooth",
@@ -1139,22 +1066,6 @@ fn titled(half: Half) -> &'static str {
     match half {
         Half::Left => "Left",
         Half::Right => "Right",
-    }
-}
-
-/// Enough of a hash to recognise, since a SHA-512 is 128 characters of hex.
-pub(crate) fn short(hash: &[u8]) -> String {
-    let hex = smp::image::hex(hash);
-    match hex.len() > 20 {
-        true => format!("{}…{}", &hex[..8], &hex[hex.len() - 8..]),
-        false => hex,
-    }
-}
-
-pub(crate) fn named(version: &str) -> String {
-    match version.is_empty() {
-        true => "(no version)".to_string(),
-        false => version.to_string(),
     }
 }
 
@@ -1313,87 +1224,6 @@ mod tests {
         );
     }
 
-    /// A pair back from its restarts, both on what was written.
-    fn both_landed() -> Vec<(Half, Landed)> {
-        vec![
-            (
-                Half::Left,
-                Landed::Ok {
-                    confirmed: false,
-                    active: vec![0xa1; 64],
-                },
-            ),
-            (
-                Half::Right,
-                Landed::Ok {
-                    confirmed: false,
-                    active: vec![0xb2; 64],
-                },
-            ),
-        ]
-    }
-
-    #[test]
-    fn a_pair_that_both_came_back_on_what_was_written_is_kept() {
-        assert_eq!(decide(&both_landed(), None), Decision::Keep);
-        // Including the resumed run, where nothing restarted at all.
-        assert_eq!(decide(&[], None), Decision::Keep);
-    }
-
-    #[test]
-    fn a_half_that_never_came_back_takes_the_other_half_down_with_it() {
-        let mut landed = both_landed();
-        landed[1].1 = Landed::Gone {
-            why: "The right half did not come back within 180 s of its restart.".to_string(),
-        };
-        let Decision::Revert { reasons } = decide(&landed, None) else {
-            panic!("a missing half is not something to keep an image over");
-        };
-        assert_eq!(reasons.len(), 1, "{reasons:?}");
-        assert!(reasons[0].contains("right half did not come back"), "{reasons:?}");
-    }
-
-    #[test]
-    fn a_half_that_came_back_on_the_wrong_image_reverts_the_pair() {
-        let mut landed = both_landed();
-        landed[0].1 = Landed::Wrong {
-            active: vec![0x99; 64],
-            version: "0.1.9".to_string(),
-        };
-        let Decision::Revert { reasons } = decide(&landed, None) else {
-            panic!("a half on the old image is a failed update");
-        };
-        assert!(reasons[0].contains("The left half came back running"), "{reasons:?}");
-        assert!(reasons[0].contains("0.1.9"), "{reasons:?}");
-        assert!(
-            reasons[0].contains("not the image that was written"),
-            "{reasons:?}"
-        );
-
-        // A half reporting nothing at all is named as that rather than given an
-        // empty hash to print.
-        landed[0].1 = Landed::Wrong {
-            active: Vec::new(),
-            version: String::new(),
-        };
-        let Decision::Revert { reasons } = decide(&landed, None) else {
-            panic!("a half with nothing running is a failed update");
-        };
-        assert!(reasons[0].contains("reports nothing running"), "{reasons:?}");
-    }
-
-    #[test]
-    fn two_halves_that_both_came_back_on_different_builds_still_revert() {
-        // Each half was checked against the bundle on its own and both passed,
-        // which is not the same as the pair matching.
-        let Decision::Revert { reasons } =
-            decide(&both_landed(), Some("they are on two builds".to_string()))
-        else {
-            panic!("two builds on one keyboard is not a keyboard");
-        };
-        assert_eq!(reasons, vec!["they are on two builds".to_string()]);
-    }
-
     #[test]
     fn a_board_that_agrees_with_the_plan_is_not_worth_a_line() {
         assert_eq!(
@@ -1535,14 +1365,6 @@ mod tests {
         ];
         assert_eq!(active_hash(&slots), vec![0x02; 4]);
         assert!(active_hash(&[]).is_empty());
-    }
-
-    #[test]
-    fn a_long_hash_is_shortened_to_something_a_person_can_match() {
-        let hash = vec![0xab; 64];
-        assert_eq!(short(&hash), "abababab…abababab");
-        // A short one is left whole rather than elided into nothing.
-        assert_eq!(short(&[0x01, 0x02]), "0102");
     }
 
     #[test]

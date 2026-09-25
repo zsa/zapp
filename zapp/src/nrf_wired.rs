@@ -59,8 +59,10 @@ use zapp_wired::{
     Ignition, IgnitionLink, LeftTransport, Retrying, RightTransport, Status, WiredError,
 };
 
+use zapp_update::confirm::{Landed, PairConfirm};
+use zapp_update::text::{named, short, sizes};
+
 use crate::new_spinner;
-use crate::zsab::{named, short, sizes, Landed};
 
 /// How long to give ignition's entry sequence.
 ///
@@ -446,7 +448,7 @@ fn run<L: IgnitionLink + 'static>(
         payload_budget: status.payload_budget(),
     };
     let settled =
-        crate::confirm::settle(&mut pair, &[Half::Right, Half::Left], &[Half::Right, Half::Left]);
+        zapp_update::confirm::settle(&mut pair, &[Half::Right, Half::Left], &[Half::Right, Half::Left]);
     // Whatever it came to, the line the spinner owns is given back before
     // anything else is said.
     pair.clear();
@@ -481,7 +483,7 @@ struct WiredPair<'a, L: IgnitionLink + 'static> {
     payload_budget: usize,
 }
 
-impl<L: IgnitionLink + 'static> crate::confirm::PairConfirm for WiredPair<'_, L> {
+impl<L: IgnitionLink + 'static> PairConfirm for WiredPair<'_, L> {
     fn running(&mut self, half: Half) -> Landed {
         let wanted = self.bundle.hash(half).unwrap_or_default();
         read_settle(self.ignition, half, &wanted, self.started, self.settle)
@@ -620,7 +622,7 @@ impl<L: IgnitionLink + 'static> WiredPair<'_, L> {
             .context("Could not re-open a session to restart the halves")?;
 
         for half in [Half::Right, Half::Left] {
-            <Self as crate::confirm::PairConfirm>::revert(self, half)?;
+            <Self as PairConfirm>::revert(self, half)?;
         }
 
         // The reads that follow need an idle session, the same as the first one
@@ -2638,7 +2640,7 @@ fn print_show(report: &ShowReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zsab::{decide, Decision};
+    use zapp_update::confirm::{decide, Decision};
 
     // ---- The confirm poll ------------------------------------------------
 

@@ -1,0 +1,12 @@
+[package]
+name = "zapp-update"
+version = "0.1.0"
+edition = "2024"
+description = "Updating a Voyager 2's firmware, over Bluetooth or the cable, without a terminal"
+
+[dependencies]
+# The orchestration builds its failures the way the CLI always has, as context
+# chains, and the public error is rendered from them.
+anyhow = "1"
+log = "0.4"
+zapp-smp = { path = "../zapp-smp" }
