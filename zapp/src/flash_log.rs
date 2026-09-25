@@ -8,6 +8,12 @@ use std::sync::OnceLock;
 
 use log::{Level, Log, Metadata, Record};
 
+/// The terminal's filter when `RUST_LOG` is unset. nusb is silenced: it logs
+/// its own teardown at error level, and the one that reaches a user is the
+/// interface close failing on a bootloader that has just reset itself away,
+/// after a run that succeeded. The flash log still records it.
+const STDERR_FILTER: &str = "warn,nusb=off";
+
 /// The file's filter: debug for the workspace's crates, info for the rest.
 const FILE_FILTER: &str = "info,zapp=debug,zapp_core=debug,zapp_ble=debug,zapp_hid_proto=debug,\
                            zapp_oryx=debug,zapp_smp=debug,zapp_wired=debug";
@@ -45,7 +51,7 @@ impl Log for Tee {
 /// warning and nothing else.
 pub fn init(flashing: bool) {
     let stderr =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(STDERR_FILTER))
             .format_timestamp(None)
             .build();
     let mut max_level = stderr.filter();
