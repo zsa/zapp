@@ -51,7 +51,8 @@ pub enum Phase {
     Declaring,
     /// One half's turn: its image is written, if it needs one.
     Writing(Half),
-    /// A half was marked for test and is restarting onto its new image.
+    /// A half is restarting: onto its new image when it was marked for test,
+    /// on the one it runs when it was only written under `force`.
     Restarting(Half),
     /// Waiting for the right half to come back before the left is written
     /// (Bluetooth only).

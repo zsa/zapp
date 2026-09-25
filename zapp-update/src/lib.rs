@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
+pub mod ble;
 pub mod confirm;
 mod error;
 pub mod event;
@@ -120,6 +121,17 @@ pub struct Timings {
     pub settle: Duration,
     /// Cable: how long the keyboard gets to come back on USB afterwards.
     pub keyboard_restart: Duration,
+    /// Bluetooth: how long to leave a half alone after telling it to restart.
+    pub reboot_settle: Duration,
+    /// Bluetooth: how long to keep trying to reach a half that is coming back.
+    pub reboot_timeout: Duration,
+    /// Bluetooth: between attempts to reach a half that has not answered yet.
+    pub retry_every: Duration,
+    /// Bluetooth: how long the left's relay lock lingers after the right was
+    /// touched.
+    pub relay_settle: Duration,
+    /// Bluetooth: how long the STM32 gets to reach its bootloader.
+    pub stm32_bootloader_wait: Duration,
 }
 
 impl Default for Timings {
@@ -129,6 +141,11 @@ impl Default for Timings {
             right_half_wait: wired::WAIT_FOR_RIGHT,
             settle: wired::SETTLE_TIMEOUT,
             keyboard_restart: wired::CONFIRM_WINDOW,
+            reboot_settle: ble::REBOOT_SETTLE,
+            reboot_timeout: ble::REBOOT_TIMEOUT,
+            retry_every: ble::RETRY_EVERY,
+            relay_settle: ble::RELAY_SETTLE,
+            stm32_bootloader_wait: ble::BLE_BOOTLOADER_WAIT,
         }
     }
 }

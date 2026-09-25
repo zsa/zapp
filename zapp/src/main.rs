@@ -7,14 +7,12 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_ble::dfu::{self, DfuClient, Wait};
-use zapp_ble::smp::{self, Half, SmpClient};
 use zapp_ble::{Battery, BleMonitor, ChargeDetail, Level, Presence};
 use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
 use zapp_core::device::{self, UsbDevice, WatchStatus};
@@ -29,6 +27,8 @@ use zapp_wired::ignition::{bcd_version, usb::UsbLink};
 use zapp_wired::Ignition;
 use zapp_update::probe::usb_telemetry;
 use zapp_update::{route, Transport};
+
+use crate::screen::Screen;
 
 #[derive(Parser)]
 #[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
@@ -111,44 +111,6 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
-}
-
-/// Everything about reaching a board that does not say which half.
-///
-/// The bundle flow talks to both halves in turn and picks the order itself, so
-/// the half is never an argument. Only `device` comes off the command line;
-/// the rest are the tuning the Bluetooth client needs and are left at their
-/// defaults.
-pub struct LinkArgs {
-    /// Which board, by advertised name or by the handle `zapp devices` shows
-    device: Option<String>,
-    /// Bytes of payload per Bluetooth write, the ATT MTU less its 3-byte
-    /// header. `None` takes what the platform reports.
-    mtu: Option<usize>,
-    /// Bluetooth writes to spend on one request. `None` takes 5.
-    writes: Option<usize>,
-    /// Largest request to send, fragmented across writes. Overrides `writes`.
-    /// `None` takes the buffer the board reports, capped by `writes`.
-    chunk: Option<usize>,
-    /// Seconds to wait for each reply
-    timeout: u64,
-}
-
-/// Seconds to wait for a reply, when nobody said otherwise.
-const DEFAULT_LINK_TIMEOUT: u64 = 15;
-
-impl Default for LinkArgs {
-    /// Written out rather than derived: a derived `Default` gives `timeout`
-    /// zero, and every request then times out before it has been sent.
-    fn default() -> Self {
-        Self {
-            device: None,
-            mtu: None,
-            writes: None,
-            chunk: None,
-            timeout: DEFAULT_LINK_TIMEOUT,
-        }
-    }
 }
 
 /// Runs the command the arguments name, and says one line about a failure.
@@ -876,7 +838,13 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
         return wait_and_flash(fw);
     }
 
-    flash_over_ble(data, named)
+    let options = zapp_update::Options {
+        device: named.map(str::to_string),
+        ..zapp_update::Options::default()
+    };
+    let mut screen = Screen::default();
+    zapp_update::ble::flash_stm32(data, &options, &mut |event| screen.show(event))?;
+    Ok(())
 }
 
 /// A bundle, over whichever way the keyboard is reachable.
@@ -900,11 +868,7 @@ fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
         return nrf_wired::flash(path, force);
     }
 
-    let link = LinkArgs {
-        device: named.map(str::to_string),
-        ..LinkArgs::default()
-    };
-    zsab::update(path, force, &link)
+    zsab::update(path, force, named)
 }
 
 /// Whether the file leads with the .zsab magic.
@@ -1053,164 +1017,6 @@ pub(crate) fn flash_bar(total: u64, prefix: &str) -> ProgressBar {
     );
     bar.set_prefix(prefix.to_string());
     bar
-}
-
-/// Connects to the board these arguments name, saying so while it happens.
-///
-/// The spinner is the whole point of doing this in one place: a board that is
-/// bonded but idle takes seconds to wake, and silence there looks like a hang.
-/// Only for a connect nothing else is already covering — two spinners share one
-/// line and redraw over each other, so a caller holding one of its own wants
-/// [`smp_connect_quiet`].
-pub fn smp_connect(args: &LinkArgs, half: Half) -> Result<SmpClient> {
-    let spinner = new_spinner(match half {
-        Half::Left => "Connecting over Bluetooth...",
-        Half::Right => "Connecting to the right half over Bluetooth...",
-    });
-    let client = smp_connect_quiet(args, half);
-    spinner.finish_and_clear();
-    client
-}
-
-/// The same connection, for a caller that is already saying what it is waiting
-/// for.
-pub fn smp_connect_quiet(args: &LinkArgs, half: Half) -> Result<SmpClient> {
-    let client = smp::open(args.device.as_deref(), half);
-
-    let mut client = client.with_context(|| match half {
-        Half::Left => "Could not reach the board over Bluetooth".to_string(),
-        Half::Right => "Could not reach the right half over Bluetooth".to_string(),
-    })?;
-    if let Some(mtu) = args.mtu {
-        client = client.with_mtu(mtu);
-    }
-    let mut client = client.with_timeout(Duration::from_secs(args.timeout));
-
-    // The timeout has to be set first: this is a request like any other, and
-    // it is the first thing the board is asked.
-    match args.chunk {
-        Some(chunk) => client = client.with_request_limit(chunk),
-        None => {
-            // What the board says it can reassemble is more than it will take.
-            // Reassembly across writes carries no sequence numbers and no
-            // checksum — neither Zephyr's nor the left relay's — so a fragment
-            // lost anywhere discards the request silently and no reply ever
-            // comes; the more writes a request spans, the more of that
-            // exposure it buys. Measured on a Voyager 2's left half (reports
-            // 2475, 249 per write): os_mgmt echo answers up to 8 writes and
-            // stops dead at 9, and an upload of a 316 KB image takes 51 s at
-            // one write, 25 s at five, 22 s at eight. Five keeps margin under
-            // the ceiling for most of the gain.
-            //
-            // The right half is not measured: its ceiling is the 1024-byte
-            // frame the relay and its own reassembly buffer share, which five
-            // writes already exceeds, so the reported buffer is what binds and
-            // the count only matters if that frame size changes. Same default
-            // either way; `--writes` and `--chunk` override it.
-            const WRITES_PER_REQUEST: usize = 5;
-            let writes = args.writes.unwrap_or(WRITES_PER_REQUEST).max(1);
-            let reported = client.negotiate_request_limit();
-            let safe = (client.mtu() * writes).min(reported);
-            if reported > safe {
-                log::info!(
-                    "board reports {reported} per request; using {safe} \
-                     ({writes} writes) — pass --chunk or --writes to override"
-                );
-                client = client.with_request_limit(safe);
-            }
-        }
-    }
-    log::debug!(
-        "connected, {} bytes per write, {} per request",
-        client.mtu(),
-        client.request_limit()
-    );
-    Ok(client)
-}
-
-/// Connects to the update service on the board `device` names.
-fn dfu_connect(device: Option<&str>) -> Result<DfuClient> {
-    let spinner = new_spinner("Connecting over Bluetooth...");
-    let client = dfu::open(device);
-    spinner.finish_and_clear();
-
-    let client = client.context("Could not reach the keyboard over Bluetooth")?;
-    log::debug!("connected, {} bytes of image per write", client.chunk());
-    Ok(client)
-}
-
-/// Seconds to give the STM32 to reach its bootloader, when nobody said
-/// otherwise.
-const BLE_BOOTLOADER_WAIT: Duration = Duration::from_secs(30);
-
-/// A keyboard image into the STM32, over ZSA's update service on the left half,
-/// which relays it over the wire between the chips into the ignition bootloader.
-fn flash_over_ble(image: &[u8], device: Option<&str>) -> Result<()> {
-    // Refused here rather than by the keyboard: the board answers this with one
-    // error byte, and the sentence that carries both figures is the one that
-    // says what to do about it.
-    if image.len() > dfu::MAX_IMAGE {
-        bail!(
-            "The image is {} bytes; the STM32's application region holds {} bytes.",
-            image.len(),
-            dfu::MAX_IMAGE
-        );
-    }
-
-    log::debug!("image {} bytes, crc-32 {:08x}", image.len(), dfu::crc32(image));
-
-    let mut client = dfu_connect(device)?;
-
-    let spinner = new_spinner("Waiting for keyboard in bootloader mode...");
-    let ready = client.make_ready(BLE_BOOTLOADER_WAIT, &report_wait);
-    spinner.finish_and_clear();
-    ready.context("The STM32 is not in its bootloader")?;
-
-    let pb = flash_bar(100, "");
-    let started = Instant::now();
-    let result = client.flash(image, &|progress| match progress {
-        FlashProgress::Erasing {
-            bytes_erased,
-            total_bytes,
-        } => {
-            pb.set_position(((bytes_erased * 100) / total_bytes) as u64);
-            pb.set_message("Erasing...");
-        }
-        FlashProgress::Writing {
-            bytes_written,
-            total_bytes,
-        } => {
-            pb.set_position(((bytes_written * 100) / total_bytes) as u64);
-            pb.set_message("Writing...");
-        }
-        FlashProgress::Resetting => {
-            pb.set_position(100);
-            pb.set_message("Resetting...");
-        }
-        FlashProgress::Complete => pb.finish_with_message("Done!"),
-    });
-    if let Err(err) = result {
-        // The bar owns its line, so it goes before anything is said about why.
-        pb.finish_and_clear();
-        return Err(err).context("The flash failed");
-    }
-
-    log::debug!(
-        "wrote {} bytes in {:.1} s",
-        image.len(),
-        started.elapsed().as_secs_f64()
-    );
-    Ok(())
-}
-
-/// What the readiness step is doing.
-fn report_wait(wait: Wait) {
-    match wait {
-        Wait::Already => log::debug!("the STM32 is already in its bootloader"),
-        Wait::Rebooting => log::debug!("rebooting the STM32 into its bootloader"),
-        Wait::Waiting(waited) => log::debug!("not there yet after {} s", waited.as_secs()),
-        Wait::Arrived(waited) => log::debug!("in the bootloader after {} s", waited.as_secs()),
-    }
 }
 
 fn wait_and_flash(fw: &Firmware) -> Result<()> {

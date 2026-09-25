@@ -9,6 +9,7 @@ description = "Updating a Voyager 2's firmware, over Bluetooth or the cable, wit
 # chains, and the public error is rendered from them.
 anyhow = "1"
 log = "0.4"
+zapp-ble = { path = "../zapp-ble" }
 zapp-core = { path = "../zapp-core" }
 zapp-smp = { path = "../zapp-smp" }
 zapp-wired = { path = "../zapp-wired" }
@@ -17,3 +18,5 @@ zapp-wired = { path = "../zapp-wired" }
 # The wired orchestration is tested against the in-memory keyboard rather than
 # against a board, which needs the loopback stack compiled into the library.
 zapp-wired = { path = "../zapp-wired", features = ["loopback"] }
+# The Bluetooth orchestration is tested against in-memory halves.
+zapp-smp = { path = "../zapp-smp", features = ["test-double"] }
