@@ -92,15 +92,33 @@ impl<L: IgnitionLink> Wired<L> {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                self.log_held();
                 return Ok(None);
             }
             let bytes = self.ignition.receive(left)?;
             if bytes.is_empty() {
                 // The link waited out the time there was and nothing came.
+                self.log_held();
                 return Ok(None);
             }
             self.messages.push(&bytes);
         }
+    }
+
+    /// Says what a read that came up empty is still holding.
+    ///
+    /// A reply that never arrives either never left the board or arrived
+    /// short of its end, and only this side can tell the two apart: bytes held
+    /// here are the front of a reply whose rest the bridge or the half is
+    /// sitting on.
+    fn log_held(&self) {
+        log::debug!(
+            "{:?}: read timed out holding {} bytes of an unfinished pipe message and {} \
+             of an unfinished frame",
+            self.target,
+            self.messages.pending(),
+            self.lines.pending()
+        );
     }
 
     /// Everything already reassembled, up to the next whole frame.

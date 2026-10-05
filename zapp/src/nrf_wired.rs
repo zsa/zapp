@@ -1291,6 +1291,41 @@ fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
     }
 }
 
+/// Takes whatever arrives on the link until it has been quiet for a moment,
+/// and says how much came and what it ends with.
+///
+/// Read through to the quiet so the connection opened after it starts on a
+/// message boundary, not half-way into a reply nobody is waiting for.
+fn listen<L: IgnitionLink + 'static>(ignition: &mut Ignition<Shared<L>>, half: Half, when: &str) {
+    const QUIET: Duration = Duration::from_millis(300);
+    const LIMIT: Duration = Duration::from_secs(2);
+    let started = Instant::now();
+    let mut got = Vec::new();
+    while started.elapsed() < LIMIT {
+        match ignition.receive(QUIET) {
+            Ok(bytes) if bytes.is_empty() => break,
+            Ok(bytes) => got.extend_from_slice(&bytes),
+            Err(err) => {
+                log::warn!("{half}: listening {when} failed: {err}");
+                break;
+            }
+        }
+    }
+    if got.is_empty() {
+        log::warn!("{half}: nothing arrived {when}");
+        return;
+    }
+    let tail: String = got[got.len().saturating_sub(96)..]
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+        .collect();
+    log::warn!(
+        "{half}: {} bytes arrived {when}, after {} ms, ending {tail:?}",
+        got.len(),
+        started.elapsed().as_millis()
+    );
+}
+
 /// Looks at a half whose mark went unanswered: hung, restarted, or answered
 /// into the void. Every step's failure is logged and dropped.
 ///
@@ -1310,9 +1345,15 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
         Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
     }
 
+    // Which side sat on the mark is in when its reply turns up. Arriving
+    // while the link is left alone, it was held in transit; arriving only once
+    // the newline below has gone, the half was still waiting for the end of
+    // the request line, and the mark is happening now rather than then.
+    listen(ignition, half, "with the link left alone");
     if let Err(err) = ignition.send(half.into(), b"\n") {
         log::warn!("{half}: could not send a resync newline: {err}");
     }
+    listen(ignition, half, "after the resync newline");
     let mut client = connect(shared, half, status.payload_budget(), timeout);
     let mut marked = false;
     match client.image_state() {
