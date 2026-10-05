@@ -138,6 +138,15 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// only about not asking thousands of times over a wait of minutes.
 const SETTLE_POLL: Duration = Duration::from_secs(5);
 
+/// How long a bridge that refuses even STATUS is given to come back before the
+/// settle stops asking.
+///
+/// A bridge in that state has stopped answering anything, so the rest of the
+/// window is spent on stalled transfers, and so is everything after it — the
+/// revert and the reset that would hand the keyboard back to QMK are refused
+/// the same way. Better to say so promptly.
+const WEDGED_LIMIT: Duration = Duration::from_secs(15);
+
 /// How a queued confirm exchange is followed: how often it is asked after, how
 /// long an idle answer is given before the request is sent again, and how long
 /// the whole thing may take.
@@ -610,14 +619,26 @@ fn read_settle<L: IgnitionLink>(
     settle: Duration,
 ) -> Landed {
     let deadline = started + settle;
+    let mut wedged_since: Option<Instant> = None;
     loop {
-        let verdict = read_once(ignition, half, wanted);
+        let (verdict, wedged) = read_once(ignition, half, wanted);
         // Anything but Gone is the half having answered; only a half that is not
         // up yet is worth asking again.
         if !matches!(verdict, Landed::Gone { .. }) {
             log::debug!(
                 "{half}: read after {} s: {}",
                 started.elapsed().as_secs(),
+                verdict.why(half)
+            );
+            return verdict;
+        }
+
+        if !wedged {
+            wedged_since = None;
+        } else if wedged_since.get_or_insert_with(Instant::now).elapsed() >= WEDGED_LIMIT {
+            log::debug!(
+                "{half}: gave up reading, the bridge has refused STATUS for {} s: {}",
+                WEDGED_LIMIT.as_secs(),
                 verdict.why(half)
             );
             return verdict;
@@ -638,27 +659,28 @@ fn read_settle<L: IgnitionLink>(
 }
 
 /// One READ exchange: ask what the half is running, and write nothing.
-fn read_once<L: IgnitionLink>(ignition: &mut Ignition<L>, half: Half, wanted: &[u8]) -> Landed {
+///
+/// Also says whether the bridge refused STATUS on the way, which is a bridge
+/// that has stopped answering anything — see [`probe_bridge`].
+fn read_once<L: IgnitionLink>(
+    ignition: &mut Ignition<L>,
+    half: Half,
+    wanted: &[u8],
+) -> (Landed, bool) {
     if let Err(err) = ignition.confirm_start(half, ConfirmMode::Read, wanted) {
         // A stall here is ignition refusing the request rather than the half
         // refusing anything: a session still open, or a bootloader from before
         // the tunnel existed.
-        if matches!(err, WiredError::Stalled { .. }) {
-            probe_bridge(ignition);
-        }
-        return Landed::Gone {
-            why: format!("The {half} half could not be asked what it is running: {err}."),
-        };
+        let wedged = matches!(err, WiredError::Stalled { .. }) && !probe_bridge(ignition);
+        let why = format!("The {half} half could not be asked what it is running: {err}.");
+        return (Landed::Gone { why }, wedged);
     }
     match poll_confirm(ignition, half, ConfirmMode::Read, wanted, EXCHANGE) {
-        Ok(result) => read_landed(result, half),
+        Ok(result) => (read_landed(result, half), false),
         Err(err) => {
-            if matches!(err, WiredError::Stalled { .. }) {
-                probe_bridge(ignition);
-            }
-            Landed::Gone {
-                why: format!("The {half} half's answer could not be read back: {err}."),
-            }
+            let wedged = matches!(err, WiredError::Stalled { .. }) && !probe_bridge(ignition);
+            let why = format!("The {half} half's answer could not be read back: {err}.");
+            (Landed::Gone { why }, wedged)
         }
     }
 }
@@ -671,13 +693,18 @@ fn read_once<L: IgnitionLink>(ignition: &mut Ignition<L>, half: Half, wanted: &[
 /// loop runs. STATUS tells the two apart: a bridge that answers it is alive and
 /// says what it thinks is going on; one that stalls it as well has stopped
 /// servicing USB. What is on the bus says whether it is still the bootloader.
-fn probe_bridge<L: IgnitionLink>(ignition: &mut Ignition<L>) {
-    match ignition.status() {
-        Ok(_) => {}
-        Err(err) => log::debug!("the bridge refused STATUS as well: {err}"),
-    }
+///
+/// Returns whether the bridge answered STATUS.
+fn probe_bridge<L: IgnitionLink>(ignition: &mut Ignition<L>) -> bool {
+    let alive = match ignition.status() {
+        Ok(_) => true,
+        Err(err) => {
+            log::debug!("the bridge refused STATUS as well: {err}");
+            false
+        }
+    };
     let Some(attached) = attached() else {
-        return;
+        return alive;
     };
     if attached.is_empty() {
         log::debug!("nothing from ZSA is on USB");
@@ -693,6 +720,7 @@ fn probe_bridge<L: IgnitionLink>(ignition: &mut Ignition<L>) {
             }
         );
     }
+    alive
 }
 
 /// The exchange-level failure a result carries, if any — ignition's answer
