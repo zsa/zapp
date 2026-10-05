@@ -1161,10 +1161,15 @@ fn write_half<L: IgnitionLink + 'static>(
         // until the half is up and running it before deciding — see the note at
         // the top of this file.
         if let Err(err) = arm(&mut client, half, &wanted) {
-            if matches!(err.downcast_ref::<SmpError>(), Some(SmpError::Timeout(_))) {
-                probe_silent_mark(shared, ignition, half, status, timeout);
+            // A mark whose reply never arrives has still been seen to land:
+            // the reply turned up later, behind the probe's own traffic, and
+            // the probe read the slot back pending. What the board says now
+            // is the answer the reply would have given.
+            let silent = matches!(err.downcast_ref::<SmpError>(), Some(SmpError::Timeout(_)));
+            if !(silent && probe_silent_mark(shared, ignition, half, status, timeout, &wanted)) {
+                return Err(err);
             }
-            return Err(err);
+            log::warn!("{half}: the mark landed without its reply; carrying on");
         }
         log::debug!(
             "{half}: {} bytes written, spare slot now carries {}",
@@ -1257,14 +1262,18 @@ fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
 }
 
 /// Looks at a half whose mark went unanswered: hung, restarted, or answered
-/// into the void. Logs only; every step's failure is logged and dropped.
+/// into the void. Every step's failure is logged and dropped.
+///
+/// True when the half lists `wanted` marked for test, which is the mark having
+/// landed whatever became of its reply.
 fn probe_silent_mark<L: IgnitionLink + 'static>(
     shared: &Shared<L>,
     ignition: &mut Ignition<Shared<L>>,
     half: Half,
     status: &Status,
     timeout: Duration,
-) {
+    wanted: &[u8],
+) -> bool {
     log::warn!("{half}: no reply to the mark, probing");
     match ignition.status() {
         Ok(status) => log::warn!("{half}: ignition status after the silent mark: {status:?}"),
@@ -1275,6 +1284,7 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
         log::warn!("{half}: could not send a resync newline: {err}");
     }
     let mut client = connect(shared, half, status.payload_budget(), timeout);
+    let mut marked = false;
     match client.image_state() {
         Ok(slots) if slots.is_empty() => log::warn!("{half}: image state lists no slots"),
         Ok(slots) => {
@@ -1289,6 +1299,11 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
             }
             let pending = slots.iter().any(|slot| slot.slot == 1 && slot.pending);
             log::warn!("{half}: slot 1 pending: {pending}");
+            // Marked for test, and for test only: a permanent mark is not what
+            // was asked for, and would leave no way back.
+            marked = slots
+                .iter()
+                .any(|slot| slot.hash == wanted && slot.pending && !slot.permanent);
         }
         Err(err) => log::warn!("{half}: image state read failed too: {err}"),
     }
@@ -1297,6 +1312,7 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
         Ok(status) => log::warn!("{half}: ignition status after the probe: {status:?}"),
         Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
     }
+    marked
 }
 
 /// What a half has outstanding when its turn in the write pass is over.
