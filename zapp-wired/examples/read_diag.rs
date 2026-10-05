@@ -2,10 +2,12 @@
 //!
 //! A diagnostic ignition writes, into RAM that a reset does not clear, the PC
 //! it was last interrupted at (sampled by SysTick every millisecond), a
-//! HardFault's frame if one was taken, the type of the last UART frame it
-//! handled, and a snapshot of the USB peripheral. On the next boot
-//! it copies that record aside and serves it over vendor request 0x91. So:
-//! reproduce the wedge, press the reset button (do not unplug), run this.
+//! HardFault's frame if one was taken, how often the EP0 guard fired, and a
+//! trace of EP0 events and UART frames that freezes shortly after the guard
+//! first fires. On the next boot it copies that record aside and serves it over
+//! vendor request 0x91. So: reproduce, press the reset button (do not unplug),
+//! run this. A successful `zapp flash` restarts into the keyboard firmware,
+//! which overwrites the record; run it with `ZAPP_KEEP_IGNITION=1`.
 //!
 //! ```text
 //! cargo run -p zapp-wired --example read_diag
@@ -22,10 +24,10 @@ use zapp_wired::ignition::{INTERFACE, PID, VID};
 
 const REQ_DIAG: u8 = 0x91;
 const MAGIC: u32 = 0x4449_4147;
+const VERSION: u32 = 5;
 
-/// Word offsets in the report, following `struct diag_record` (v4) and then
-/// the reset flags.
-const FIELDS: [&str; 24] = [
+/// Words before the trace, following `struct diag_record` (v5).
+const FIELDS: [&str; 21] = [
     "magic",
     "version",
     "ticks",
@@ -41,25 +43,34 @@ const FIELDS: [&str; 24] = [
     "bfar",
     "last_frame",
     "loop_rate",
-    "usb_cntr",
-    "usb_istr",
-    "usb_fnr",
-    "usb_daddr",
-    "usb_ep0r",
     "ep0_rescues",
     "ep0_rescue_ms",
     "ep0_rescue_epr",
-    "rcc_csr",
+    "trace_next",
+    "trace_left",
+    "trace_frozen",
 ];
-const REPORT_LEN: u16 = (FIELDS.len() * 4) as u16;
+const TRACE_LEN: usize = 32;
+const EVENT_LEN: usize = 16;
+/// The record, then the reset flags of the boot that served it.
+const REPORT_LEN: usize = FIELDS.len() * 4 + TRACE_LEN * EVENT_LEN + 4;
+
+const STATES: [&str; 8] = [
+    "IDLE",
+    "STALLED",
+    "DATA_IN",
+    "LAST_DATA_IN",
+    "STATUS_IN",
+    "DATA_OUT",
+    "LAST_DATA_OUT",
+    "STATUS_OUT",
+];
 
 fn exception(xpsr: u32) -> String {
     match xpsr & 0x1ff {
         0 => "thread mode (the main loop)".into(),
         2 => "NMI".into(),
         3 => "HardFault".into(),
-        11 => "SVCall".into(),
-        14 => "PendSV".into(),
         15 => "SysTick".into(),
         n if n >= 16 => format!("IRQ {} (37 = USART1/EXTI25)", n - 16),
         n => format!("exception {n}"),
@@ -90,8 +101,82 @@ fn reset_cause(csr: u32) -> String {
     }
 }
 
-fn ep_stat(bits: u32) -> &'static str {
-    ["DISABLED", "STALL", "NAK", "VALID"][(bits & 3) as usize]
+fn stat(bits: u16) -> &'static str {
+    ["DIS", "STALL", "NAK", "VALID"][(bits & 3) as usize]
+}
+
+fn request(code: u8) -> String {
+    match code {
+        0x00 => "GET_STATUS".into(),
+        0x05 => "SET_ADDRESS".into(),
+        0x06 => "GET_DESCRIPTOR".into(),
+        0x09 => "SET_CONFIGURATION".into(),
+        0x80 => "BEGIN".into(),
+        0x81 => "SELECT".into(),
+        0x82 => "END".into(),
+        0x83 => "STATUS".into(),
+        0x84 => "RELEASE_MD".into(),
+        0x85 => "RESET_TARGET".into(),
+        0x86 => "CONFIRM".into(),
+        0x87 => "CONFIRM_RESULT".into(),
+        0x92 => "VERSION".into(),
+        other => format!("0x{other:02x}"),
+    }
+}
+
+struct Event {
+    us: u32,
+    istr: u16,
+    ep0r: u16,
+    loops: u32,
+    kind: u8,
+    state: u8,
+    request: u8,
+}
+
+impl Event {
+    fn parse(bytes: &[u8]) -> Self {
+        let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap());
+        Self {
+            us: u32_at(0),
+            istr: u16_at(4),
+            ep0r: u16_at(6),
+            loops: u32_at(8),
+            kind: bytes[12],
+            state: bytes[13],
+            request: bytes[14],
+        }
+    }
+
+    fn describe(&self) -> String {
+        let state = STATES.get(self.state as usize).copied().unwrap_or("?");
+        let usb = format!(
+            "ISTR ctr={} dir={} ep={}  EP0R ctr_rx={} setup={} rx={:<5} ctr_tx={} tx={:<5}",
+            (self.istr >> 15) & 1,
+            (self.istr >> 4) & 1,
+            self.istr & 0xf,
+            (self.ep0r >> 15) & 1,
+            (self.ep0r >> 11) & 1,
+            stat(self.ep0r >> 12),
+            (self.ep0r >> 7) & 1,
+            stat(self.ep0r >> 4),
+        );
+        match self.kind {
+            1 => format!(
+                "CTR     in {:<13} req {:<14} {usb}",
+                state,
+                request(self.request)
+            ),
+            2 => format!(
+                "RESCUE  in {:<13} req {:<14} {usb}",
+                state,
+                request(self.request)
+            ),
+            3 => format!("UART frame 0x{:02x}{:>36}{usb}", self.request, ""),
+            other => format!("kind {other}: {usb}"),
+        }
+    }
 }
 
 fn main() {
@@ -114,7 +199,7 @@ fn main() {
                 request: REQ_DIAG,
                 value: 0,
                 index: INTERFACE as u16,
-                length: REPORT_LEN,
+                length: REPORT_LEN as u16,
             },
             Duration::from_secs(1),
         )
@@ -126,37 +211,33 @@ fn main() {
             return;
         }
     };
-    if bytes.len() < REPORT_LEN as usize {
-        println!(
-            "short report, {} bytes (an older DIAG build?): {bytes:02x?}",
-            bytes.len()
-        );
-        return;
-    }
     let word = |name: &str| {
         let i = FIELDS.iter().position(|field| *field == name).unwrap();
         u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
     };
-
-    println!("this boot's reset cause: {}", reset_cause(word("rcc_csr")));
+    if bytes.len() < FIELDS.len() * 4 || word("version") != VERSION {
+        println!(
+            "{} bytes of a record this reader does not know (it reads version {VERSION})",
+            bytes.len()
+        );
+        return;
+    }
+    if bytes.len() < REPORT_LEN {
+        println!("short report, {} of {REPORT_LEN} bytes", bytes.len());
+        return;
+    }
+    let csr = u32::from_le_bytes(bytes[REPORT_LEN - 4..].try_into().unwrap());
+    println!("this boot's reset cause: {}", reset_cause(csr));
     if word("magic") != MAGIC {
         println!("no record from the previous run (power-on, or it never booted a DIAG build)");
         return;
     }
-    for name in &FIELDS[..FIELDS.len() - 1] {
-        println!("{name:>13}: 0x{:08x} ({})", word(name), word(name));
-    }
 
-    println!();
     println!(
-        "main loop: {} iterations, {} in its last whole second",
+        "main loop: {} passes, {} in its last whole second; last sample pc 0x{:08x} in {}",
         word("loops"),
-        word("loop_rate")
-    );
-    println!(
-        "last sample: pc 0x{:08x} lr 0x{:08x} in {}",
+        word("loop_rate"),
         word("pc"),
-        word("lr"),
         exception(word("xpsr"))
     );
     if word("fault_pc") != 0 {
@@ -170,61 +251,54 @@ fn main() {
             word("bfar")
         );
     }
-    if word("ep0_rescues") != 0 {
+    let rescues = word("ep0_rescues");
+    if rescues == 0 {
+        println!("EP0 guard never fired");
+    } else {
         println!(
-            "EP0 GUARD FIRED {} time(s), last at {} ms, EP0R was 0x{:04x}",
-            word("ep0_rescues"),
+            "EP0 guard fired {rescues} time(s), last at {} ms, EP0R was 0x{:04x}",
             word("ep0_rescue_ms"),
             word("ep0_rescue_epr")
         );
-    } else {
-        println!("EP0 guard never fired");
-    }
-    let frame = word("last_frame");
-    if frame & 0x100 != 0 {
-        println!("last UART frame handled: type 0x{:02x}", frame & 0xff);
     }
 
+    // ---- The trace, oldest first ----
+    let next = word("trace_next") as usize;
+    let count = next.min(TRACE_LEN);
+    let events: Vec<Event> = (next - count..next)
+        .map(|n| {
+            let at = FIELDS.len() * 4 + (n % TRACE_LEN) * EVENT_LEN;
+            Event::parse(&bytes[at..at + EVENT_LEN])
+        })
+        .collect();
+    let frozen = word("trace_frozen") != 0;
     println!();
-    let cntr = word("usb_cntr");
     println!(
-        "USB CNTR: FRES={} PDWN={} LP_MODE={} FSUSP={} (all 0 when running)",
-        cntr & 1,
-        (cntr >> 1) & 1,
-        (cntr >> 2) & 1,
-        (cntr >> 3) & 1
+        "trace: {count} of {next} events, {}",
+        if frozen {
+            "frozen after the first rescue"
+        } else {
+            "still running when the board stopped (no rescue, or too few events after it)"
+        }
     );
-    let istr = word("usb_istr");
-    println!(
-        "USB ISTR: CTR={} PMAOVR={} ERR={} WKUP={} SUSP={} RESET={} SOF={} EP_ID={}",
-        (istr >> 15) & 1,
-        (istr >> 14) & 1,
-        (istr >> 13) & 1,
-        (istr >> 12) & 1,
-        (istr >> 11) & 1,
-        (istr >> 10) & 1,
-        (istr >> 9) & 1,
-        istr & 0xf
-    );
-    let daddr = word("usb_daddr");
-    println!(
-        "USB DADDR: enabled={} address={}",
-        (daddr >> 7) & 1,
-        daddr & 0x7f
-    );
-    println!(
-        "USB FNR: frame {} (RXDP={} RXDM={})",
-        word("usb_fnr") & 0x7ff,
-        (word("usb_fnr") >> 15) & 1,
-        (word("usb_fnr") >> 14) & 1
-    );
-    let ep = word("usb_ep0r");
-    println!(
-        "EP0R 0x{ep:04x}: rx={} tx={} ctr_rx={} ctr_tx={} setup={}",
-        ep_stat(ep >> 12),
-        ep_stat(ep >> 4),
-        (ep >> 15) & 1,
-        (ep >> 7) & 1,
-        (ep >> 11) & 1
-    );
+    // Times are from the first rescue when there is one, the first event if not.
+    let zero = events
+        .iter()
+        .find(|event| event.kind == 2)
+        .or(events.first())
+        .map(|event| event.us)
+        .unwrap_or(0);
+    let mut previous: Option<&Event> = None;
+    for event in &events {
+        let passes = previous
+            .map(|p| event.loops.wrapping_sub(p.loops))
+            .unwrap_or(0);
+        println!(
+            "{:>+9} us  +{:<5} {}",
+            event.us as i64 - zero as i64,
+            passes,
+            event.describe()
+        );
+        previous = Some(event);
+    }
 }

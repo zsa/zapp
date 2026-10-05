@@ -87,6 +87,14 @@ const STATUS_POLL: Duration = Duration::from_millis(10);
 const BOND_ATTEMPTS: u32 = 4;
 const BOND_RETRY: Duration = Duration::from_millis(500);
 
+/// Whether a successful run should leave the STM32 in Ignition rather than
+/// restart it into the keyboard firmware, which would overwrite the RAM a
+/// `make DIAG=1` Ignition keeps its record in. Press reset afterwards and read
+/// the record with zapp-wired's read_diag example.
+fn keep_ignition() -> bool {
+    std::env::var("ZAPP_KEEP_IGNITION").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 /// Whether a failed run should leave the keyboard exactly as it is, for
 /// reading a half's own counters over SWD before anything zeroes them.
 fn keep_state_on_failure() -> bool {
@@ -261,6 +269,14 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
             // would throw away the STATUS the failure is explained from.
             if let Err(err) = ignition.end() {
                 log::debug!("could not end the session: {err}");
+            }
+
+            if keep_ignition() {
+                println!(
+                    "ZAPP_KEEP_IGNITION: left in Ignition, not restarted; the keyboard was \
+                     not checked."
+                );
+                return Ok(());
             }
 
             // Leave a keyboard, not a bootloader. Both halves are back on
