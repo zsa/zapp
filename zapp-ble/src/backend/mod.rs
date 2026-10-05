@@ -13,6 +13,8 @@ use crate::{BleError, BleSighting};
 mod bluez;
 #[cfg(target_os = "linux")]
 mod bluez_gatt;
+#[cfg(target_os = "macos")]
+mod corebluetooth;
 
 /// An open link to one characteristic on one board.
 ///
@@ -140,7 +142,11 @@ pub fn read_charge_detail(key: &str) -> Option<ChargeDetail> {
     {
         bluez::read_charge_detail(key)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        corebluetooth::read_charge_detail(key)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = key;
         None
@@ -152,14 +158,29 @@ pub fn read_charge_detail(key: &str) -> Option<ChargeDetail> {
 /// `known` seeds the platforms that cannot enumerate their own bonds; the rest
 /// ignore it.
 pub fn for_platform(known: &[String]) -> Option<Box<dyn Backend>> {
-    let _ = known;
-
     #[cfg(target_os = "linux")]
-    match bluez::Bluez::connect() {
-        Ok(backend) => return Some(Box::new(backend)),
-        // No system bus, or no BlueZ on it. Nothing else to fall back to.
-        Err(err) => log::warn!("no BlueZ: {err}"),
+    {
+        let _ = known;
+        match bluez::Bluez::connect() {
+            Ok(backend) => Some(Box::new(backend)),
+            // No system bus, or no BlueZ on it. Nothing else to fall back to.
+            Err(err) => {
+                log::warn!("no BlueZ: {err}");
+                None
+            }
+        }
     }
 
-    None
+    // Always a backend: a radio that is off or a permission that was refused
+    // is said by the first snapshot, in words, rather than as "no adapter".
+    #[cfg(target_os = "macos")]
+    {
+        Some(Box::new(corebluetooth::CoreBluetooth::new(known)))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = known;
+        None
+    }
 }

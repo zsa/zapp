@@ -16,7 +16,9 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::MatchRule;
 
 use super::{bluez_gatt, Backend, GattChannel, Usage};
-use crate::battery::{self, Battery, ChargeDetail};
+use crate::battery::{
+    self, Battery, ChargeDetail, BATTERY_LEVEL, BATTERY_SERVICE, CHARGE_DETAIL, PRESENTATION_FORMAT,
+};
 use crate::{identity, BleError, BleSighting};
 
 pub(super) const BLUEZ: &str = "org.bluez";
@@ -25,16 +27,6 @@ const ADAPTER: &str = "org.bluez.Adapter1";
 pub(super) const SERVICE: &str = "org.bluez.GattService1";
 pub(super) const CHARACTERISTIC: &str = "org.bluez.GattCharacteristic1";
 const DESCRIPTOR: &str = "org.bluez.GattDescriptor1";
-
-/// Battery Service, its level characteristic, and the descriptor saying which
-/// half an instance speaks for.
-const BATTERY_SERVICE: u128 = 0x0000180f_0000_1000_8000_00805f9b34fb;
-const BATTERY_LEVEL: u128 = 0x00002a19_0000_1000_8000_00805f9b34fb;
-const PRESENTATION_FORMAT: u128 = 0x00002904_0000_1000_8000_00805f9b34fb;
-
-/// The left half's battery telemetry service, read-only characteristic: what
-/// the two halves' gauges and chargers read, built on demand.
-const CHARGE_DETAIL: u128 = 0x12345678_1234_5678_1234_56789abcdef2;
 
 /// How long each discovery window stays open, and how often one opens.
 ///

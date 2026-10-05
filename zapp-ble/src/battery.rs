@@ -5,6 +5,16 @@ use zapp_core::hid::{
     PMIC_RAILS_SIZE,
 };
 
+/// Battery Service, its level characteristic, and the descriptor saying which
+/// half an instance speaks for.
+pub(crate) const BATTERY_SERVICE: u128 = 0x0000180f_0000_1000_8000_00805f9b34fb;
+pub(crate) const BATTERY_LEVEL: u128 = 0x00002a19_0000_1000_8000_00805f9b34fb;
+pub(crate) const PRESENTATION_FORMAT: u128 = 0x00002904_0000_1000_8000_00805f9b34fb;
+
+/// The left half's battery telemetry service, read-only characteristic: what
+/// the two halves' gauges and chargers read, built on demand.
+pub(crate) const CHARGE_DETAIL: u128 = 0x12345678_1234_5678_1234_56789abcdef2;
+
 /// The level a board publishes when it has no reading: outside the 0..100 the
 /// spec allows, so a host shows "unknown" rather than a made-up number.
 const UNKNOWN: u8 = 0xFF;

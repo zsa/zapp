@@ -21,3 +21,12 @@ env_logger = "0.11"
 # Pure Rust D-Bus, so BlueZ costs no system library at build time. The blocking
 # API keeps the crate free of an async runtime.
 zbus = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreBluetooth through objc2's generated bindings. The central runs on a
+# dispatch queue of its own, so nothing here needs a run loop or an async
+# runtime: the delegate hands each callback to a blocking caller.
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-core-bluetooth = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSUUID", "NSValue"] }
