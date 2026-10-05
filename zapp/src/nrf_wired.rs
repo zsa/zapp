@@ -69,6 +69,15 @@ use crate::zsab::{named, short, sizes, Landed};
 /// is waiting for nothing.
 const BEGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How often the session-open wait asks for STATUS.
+///
+/// It used to ask back to back, near six thousand times a second for the
+/// seconds the entry sequence takes, which buried every capture under
+/// identical STATUS lines and kept the bridge servicing USB while it was
+/// driving the right half's mailbox. The sequence moves in hundreds of
+/// milliseconds, so this costs nothing.
+const STATUS_POLL: Duration = Duration::from_millis(10);
+
 /// How long to wait for each reply from a half.
 /// How many times the first read after SELECT is tried before the half is
 /// called gone, and the pause between tries.
@@ -715,7 +724,10 @@ fn read_once<L: IgnitionLink>(
 /// Returns whether the bridge answered STATUS.
 fn probe_bridge<L: IgnitionLink>(ignition: &mut Ignition<L>) -> bool {
     let alive = match ignition.status() {
-        Ok(_) => true,
+        Ok(status) => {
+            log::debug!("the bridge answered STATUS: {status:?}");
+            true
+        }
         Err(err) => {
             log::debug!("the bridge refused STATUS as well: {err}");
             false
@@ -1357,6 +1369,7 @@ fn wait_active<L: IgnitionLink>(
     waiting: &mut Waiting,
 ) -> std::result::Result<Status, NotOpened> {
     let started = Instant::now();
+    let mut last: Option<Status> = None;
     loop {
         let status = match ignition.status() {
             Ok(status) => status,
@@ -1365,6 +1378,7 @@ fn wait_active<L: IgnitionLink>(
             // deadline below is what bounds the wait.
             Err(WiredError::Faulted { reason, .. }) if started.elapsed() < BEGIN_TIMEOUT => {
                 log::debug!("STATUS poll lost on the bus, asking again: {reason}");
+                std::thread::sleep(STATUS_POLL);
                 continue;
             }
             Err(err) => {
@@ -1373,6 +1387,14 @@ fn wait_active<L: IgnitionLink>(
                 ));
             }
         };
+        // Only what changed: the answers in between are the same line again.
+        if last != Some(status) {
+            log::debug!(
+                "STATUS after {} ms: {status:?}",
+                started.elapsed().as_millis()
+            );
+            last = Some(status);
+        }
         match status.state {
             SessionState::Active => return Ok(status),
             SessionState::Fault => {
@@ -1408,6 +1430,7 @@ fn wait_active<L: IgnitionLink>(
                 BEGIN_TIMEOUT.as_secs()
             )));
         }
+        std::thread::sleep(STATUS_POLL);
     }
 }
 

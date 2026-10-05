@@ -593,7 +593,9 @@ impl<L: IgnitionLink> Ignition<L> {
     pub fn status(&mut self) -> Result<Status, WiredError> {
         let bytes = self.link.control_in(REQ_STATUS, 0, STATUS_LEN)?;
         let status = Status::parse(&bytes)?;
-        log::debug!("STATUS {status:?}");
+        // Trace, not debug: the session-open wait asks this in a loop and logs
+        // the answers that differ itself.
+        log::trace!("STATUS {status:?}");
         Ok(status)
     }
 
