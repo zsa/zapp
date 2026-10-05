@@ -161,6 +161,16 @@ const WEDGED_LIMIT: Duration = Duration::from_secs(15);
 /// the whole thing may take.
 #[derive(Debug, Clone, Copy)]
 struct Exchange {
+    /// After a CONFIRM, before the first read of the result block.
+    ///
+    /// A read sent the moment the CONFIRM is done can reach ignition before
+    /// it has finished the CONFIRM's status stage. Up to 2.0.2 that left EP0
+    /// stalling every request until the chip was reset, and 2.0.3 still
+    /// costs a stalled read on it: libopencm3 handles the new SETUP ahead of
+    /// the old completion and loses track of the transfer. A DIAG trace put
+    /// the window at one main-loop pass, about 150 us; this is well clear of
+    /// it and nothing next to the poll interval.
+    first_poll: Duration,
     /// Between reads of ignition's confirm result block.
     poll: Duration,
     /// How long the block may stay idle after a CONFIRM before the host
@@ -185,6 +195,7 @@ struct Exchange {
 }
 
 const EXCHANGE: Exchange = Exchange {
+    first_poll: Duration::from_millis(5),
     poll: Duration::from_millis(50),
     resend_after: Duration::from_millis(250),
     resends: 2,
@@ -850,6 +861,8 @@ fn poll_confirm<L: IgnitionLink>(
     wanted: &[u8],
     pacing: Exchange,
 ) -> Result<ConfirmResult, WiredError> {
+    // The CONFIRM this follows has only just been sent; see `first_poll`.
+    std::thread::sleep(pacing.first_poll);
     let mut asked = Instant::now();
     let mut deadline = asked + pacing.limit;
     let mut resent = 0;
@@ -872,7 +885,7 @@ fn poll_confirm<L: IgnitionLink>(
                         pacing.resends
                     );
                     match ignition.confirm_start(half, mode, wanted) {
-                        Ok(()) => {}
+                        Ok(()) => std::thread::sleep(pacing.first_poll),
                         // Refused: ignition is holding the first one after
                         // all, so there is nothing to do but keep watching.
                         Err(WiredError::Stalled { .. }) => {
@@ -2699,6 +2712,7 @@ mod tests {
     }
 
     const FAST: Exchange = Exchange {
+        first_poll: Duration::ZERO,
         poll: Duration::from_millis(1),
         resend_after: Duration::from_millis(20),
         resends: 2,
