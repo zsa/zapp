@@ -205,12 +205,18 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         upload(&mut client, half, image)?;
         // The transfer was still worth doing under --force — it is the one part
         // of this that proves the link end to end — but there is nothing to
-        // swap to, so the mark that would fail is not sent.
-        if !swaps(half) {
-            log::debug!("{half} already runs this exact image — nothing to swap");
-            continue;
+        // swap to, so the mark that would fail is not sent. The restart still
+        // is: an upload puts the half into its update state (green, blinking
+        // fast) and only a reset takes it out again, which is what the wired
+        // path does too. It comes back on the image it was already running.
+        if swaps(half) {
+            restart(&mut client, half, &hash)?;
+        } else {
+            log::debug!("{half} already runs this exact image — nothing to swap, restarting it as it is");
+            client
+                .reset()
+                .with_context(|| format!("Could not restart the {half} half"))?;
         }
-        restart(&mut client, half, &hash)?;
         match half {
             Half::Right => progress.right_restarted = true,
             Half::Left => progress.left_restarted = true,
@@ -245,11 +251,7 @@ fn run(bundle: &Bundle, force: bool, link: &LinkArgs, progress: &mut Progress) -
         .into_iter()
         .filter(|half| restarted(*progress, *half))
         .collect();
-    let keep: Vec<Half> = plan
-        .iter()
-        .filter(|(_, step)| *step != Step::Installed)
-        .map(|(half, _)| *half)
-        .collect();
+    let keep = to_keep(&installed);
 
     {
         let mut pair = BleConfirm {
@@ -586,6 +588,21 @@ fn step_of(steps: &[(Half, Step)], wanted: Half) -> Step {
 /// [`Step::Installed`] and the run stops before any session is opened.
 fn swaps_after(planned: Step, found: Step) -> bool {
     planned == Step::Upload && found != Step::Installed
+}
+
+/// The halves the run ends by confirming: every one not already running its
+/// image confirmed.
+///
+/// Read off what the halves were found carrying, not off the plan. `--force`
+/// plans an upload for both, but a half already running the bundle's image is
+/// never restarted (see [`swaps_after`]), and confirming it anyway is refused
+/// by the board — the session is still waiting on that half's restart.
+fn to_keep(installed: &[(Half, Step)]) -> Vec<Half> {
+    installed
+        .iter()
+        .filter(|(_, step)| *step != Step::Installed)
+        .map(|(half, _)| *half)
+        .collect()
 }
 
 fn restarted(progress: Progress, half: Half) -> bool {
@@ -1204,6 +1221,19 @@ mod tests {
         // part of the run that proves the link end to end — and nothing
         // follows it.
         assert!(!swaps_after(Step::Upload, Step::Installed));
+    }
+
+    #[test]
+    fn a_forced_half_already_running_its_image_is_not_confirmed_either() {
+        // The run that failed over Bluetooth: both halves on v0.1.15 already,
+        // --force, both uploaded, neither restarted — and a confirm sent for
+        // the right that the board refused as "the left half is busy".
+        assert_eq!(to_keep(&plan(Step::Installed, Step::Installed)), vec![]);
+        assert_eq!(to_keep(&plan(Step::Installed, Step::Upload)), vec![Half::Left]);
+        assert_eq!(
+            to_keep(&plan(Step::Confirm, Step::Upload)),
+            vec![Half::Right, Half::Left]
+        );
     }
 
     #[test]
