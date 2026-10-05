@@ -46,6 +46,15 @@ pub const REQ_CONFIRM: u8 = 0x86;
 pub const REQ_CONFIRM_RESULT: u8 = 0x87;
 /// Diagnostic: what answers on the TRRS I2C bus.
 pub const REQ_I2C_SCAN: u8 = 0x90;
+/// Read [`IgnitionVersion`]: the version and the commit the image was built
+/// from. Ignition 2.0.3 and later; older ones stall it.
+pub const REQ_VERSION: u8 = 0x92;
+
+/// Bytes in a VERSION response.
+pub const VERSION_LEN: usize = 16;
+
+/// The only VERSION layout this build can read; byte 0 of the response.
+pub const VERSION_LAYOUT: u8 = 1;
 
 /// Bytes in a STATUS response.
 pub const STATUS_LEN: usize = 16;
@@ -159,6 +168,64 @@ impl TargetState {
             other => Self::Unrecognised(other),
         }
     }
+}
+
+/// Which Ignition is running: its version, and the commit it was built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnitionVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+    /// The abbreviated SHA of the commit, as `git rev-parse --short` gave it.
+    pub sha: String,
+    /// Built from a tree with uncommitted changes, so `sha` is only where it
+    /// started from.
+    pub dirty: bool,
+    /// A `make DIAG=1` build, which keeps a post-mortem record. Never a release.
+    pub diag: bool,
+}
+
+impl IgnitionVersion {
+    /// A VERSION response, checked before it is believed.
+    pub fn parse(bytes: &[u8]) -> Result<Self, WiredError> {
+        if bytes.len() < VERSION_LEN {
+            return Err(WiredError::ShortVersion { got: bytes.len() });
+        }
+        if bytes[0] != VERSION_LAYOUT {
+            return Err(WiredError::VersionLayout { got: bytes[0] });
+        }
+        let sha = &bytes[5..VERSION_LEN];
+        let end = sha.iter().position(|&b| b == 0).unwrap_or(sha.len());
+        Ok(Self {
+            major: bytes[1],
+            minor: bytes[2],
+            patch: bytes[3],
+            sha: String::from_utf8_lossy(&sha[..end]).into_owned(),
+            dirty: bytes[4] & 0x01 != 0,
+            diag: bytes[4] & 0x02 != 0,
+        })
+    }
+}
+
+impl std::fmt::Display for IgnitionVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{} ({}", self.major, self.minor, self.patch, self.sha)?;
+        if self.dirty {
+            f.write_str("-dirty")?;
+        }
+        if self.diag {
+            f.write_str(", diag")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// The version an Ignition puts in its device descriptor, for one too old to
+/// answer [`REQ_VERSION`]: BCD `0xJJMN`, so 0x0203 is 2.0.3. Every Voyager 2
+/// Ignition before 2.0.3 reports 0x0200 whatever it is.
+pub fn bcd_version(bcd: u16) -> String {
+    let digit = |shift: u16| (bcd >> shift) & 0xf;
+    format!("{}.{}.{}", digit(12) * 10 + digit(8), digit(4), digit(0))
 }
 
 /// A STATUS response, version 2.
@@ -569,6 +636,13 @@ impl<L: IgnitionLink> Ignition<L> {
         Ok(result)
     }
 
+    /// Which Ignition this is. Ignition before 2.0.3 stalls the request; its
+    /// device descriptor's version is the most there is to know about it.
+    pub fn version(&mut self) -> Result<IgnitionVersion, WiredError> {
+        let bytes = self.link.control_in(REQ_VERSION, 0, VERSION_LEN)?;
+        IgnitionVersion::parse(&bytes)
+    }
+
     /// Whatever answered on the TRRS I2C bus, as the firmware reported it.
     ///
     /// The bytes are handed back raw: what they mean has changed between
@@ -846,6 +920,16 @@ pub mod usb {
         /// unwrapped link, for a caller doing its own.
         pub fn open() -> Result<Retrying<Self>, WiredError> {
             Ok(Retrying::new(Self::open_bare()?))
+        }
+
+        /// The attached bootloader's `bcdDevice`, without opening it. See
+        /// [`super::bcd_version`].
+        pub fn attached_bcd() -> Option<u16> {
+            nusb::list_devices()
+                .wait()
+                .ok()?
+                .find(|device| device.vendor_id() == VID && device.product_id() == PID)
+                .map(|device| device.device_version())
         }
 
         /// The same link, with nothing between it and the bus.
@@ -1129,6 +1213,71 @@ mod tests {
                 "version {version}"
             );
         }
+    }
+
+    /// What ignition 2.0.3 built from a dirty tree at fa2b805b6f sends.
+    fn version_bytes() -> Vec<u8> {
+        let mut bytes = vec![1, 2, 0, 3, 0x01];
+        bytes.extend_from_slice(b"fa2b805b6f\0");
+        bytes
+    }
+
+    #[test]
+    fn a_version_reads_its_numbers_flags_and_sha() {
+        let version = IgnitionVersion::parse(&version_bytes()).unwrap();
+        assert_eq!(
+            version,
+            IgnitionVersion {
+                major: 2,
+                minor: 0,
+                patch: 3,
+                sha: "fa2b805b6f".into(),
+                dirty: true,
+                diag: false,
+            }
+        );
+        assert_eq!(version.to_string(), "2.0.3 (fa2b805b6f-dirty)");
+    }
+
+    #[test]
+    fn a_diag_build_says_so() {
+        let mut bytes = version_bytes();
+        bytes[4] = 0x02;
+        assert_eq!(
+            IgnitionVersion::parse(&bytes).unwrap().to_string(),
+            "2.0.3 (fa2b805b6f, diag)"
+        );
+    }
+
+    /// A SHA as long as the field leaves no room for the NUL, and is still
+    /// the whole SHA.
+    #[test]
+    fn a_sha_that_fills_the_field_is_read_whole() {
+        let mut bytes = version_bytes();
+        bytes.truncate(5);
+        bytes.extend_from_slice(b"0123456789a");
+        assert_eq!(IgnitionVersion::parse(&bytes).unwrap().sha, "0123456789a");
+    }
+
+    #[test]
+    fn a_version_in_another_layout_or_cut_short_is_refused() {
+        let mut bytes = version_bytes();
+        bytes[0] = 2;
+        assert!(matches!(
+            IgnitionVersion::parse(&bytes),
+            Err(WiredError::VersionLayout { got: 2 })
+        ));
+        assert!(matches!(
+            IgnitionVersion::parse(&version_bytes()[..VERSION_LEN - 1]),
+            Err(WiredError::ShortVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn a_descriptor_version_reads_as_bcd() {
+        assert_eq!(bcd_version(0x0203), "2.0.3");
+        assert_eq!(bcd_version(0x0200), "2.0.0");
+        assert_eq!(bcd_version(0x1234), "12.3.4");
     }
 
     #[test]

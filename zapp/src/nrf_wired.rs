@@ -52,7 +52,7 @@ use zapp_smp::bundle::{self, Bundle};
 use zapp_smp::settings::{self, EsbConfig};
 use zapp_smp::{image, Half, ImageSlot, SmpClient, SmpError, TransportError};
 use zapp_wired::ignition::{
-    usb::UsbLink, ConfirmMode, ConfirmRc, ConfirmResult, ConfirmState, ConfirmStatus, Halves,
+    bcd_version, usb::UsbLink, ConfirmMode, ConfirmRc, ConfirmResult, ConfirmState, ConfirmStatus, Halves,
     SessionState, TargetState,
 };
 use zapp_wired::{
@@ -193,6 +193,21 @@ const SPARE_IMAGE: u32 = 2;
 // The command
 // ---------------------------------------------------------------------------
 
+/// Which Ignition is on the other end, in words: what it reports, or for one
+/// too old to report anything, the version in its device descriptor.
+pub fn ignition_version<L: IgnitionLink>(ignition: &mut Ignition<L>) -> String {
+    match ignition.version() {
+        Ok(version) => version.to_string(),
+        Err(err) => {
+            log::debug!("ignition did not say which it is: {err}");
+            match UsbLink::attached_bcd() {
+                Some(bcd) => format!("{} (from its descriptor; no commit reported)", bcd_version(bcd)),
+                None => "unknown".to_string(),
+            }
+        }
+    }
+}
+
 /// Writes both halves from one bundle.
 pub fn flash(path: &Path, force: bool) -> Result<()> {
     let blob = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
@@ -202,6 +217,9 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
 
     let shared = Shared::new(open()?);
     let mut ignition = Ignition::new(shared.clone());
+    // Into the log before anything can go wrong, so a capture always says
+    // which bridge it came from.
+    log::debug!("ignition {}", ignition_version(&mut ignition));
 
     match run(
         &shared,

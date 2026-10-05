@@ -26,6 +26,8 @@ use zapp_core::hid::{
     PmicRails, PmicRailsReport, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
+use zapp_wired::ignition::{bcd_version, usb::UsbLink};
+use zapp_wired::Ignition;
 
 #[derive(Parser)]
 #[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
@@ -214,7 +216,12 @@ fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
         Ok(devices) => {
             for device in devices {
                 let report = wired_report(device, verbose);
-                println!("  {}{}", describe_usb(device), report.charge);
+                println!(
+                    "  {}{}{}",
+                    describe_usb(device),
+                    bootloader_version(device),
+                    report.charge
+                );
                 for line in &report.lines {
                     println!("    {line}");
                 }
@@ -840,6 +847,26 @@ fn state(presence: Presence, address: Option<&str>, on_usb: &[String]) -> &'stat
             }
         }
     }
+}
+
+/// " · ignition 2.0.3 (fa2b805b6f)" for a Voyager 2 sitting in Ignition, and
+/// nothing for anything else. Asked over the bridge's own vendor interface,
+/// so a bootloader another program has open falls back to its descriptor.
+fn bootloader_version(device: &UsbDevice) -> String {
+    if device.bootloader != Some(ids::BootloaderKind::IgnitionV2) {
+        return String::new();
+    }
+    let version = match UsbLink::open_bare() {
+        Ok(link) => nrf_wired::ignition_version(&mut Ignition::new(link)),
+        Err(err) => {
+            log::debug!("could not open ignition to ask its version: {err}");
+            match UsbLink::attached_bcd() {
+                Some(bcd) => format!("{} (from its descriptor)", bcd_version(bcd)),
+                None => return String::new(),
+            }
+        }
+    };
+    format!(" · ignition {version}")
 }
 
 fn describe_usb(device: &UsbDevice) -> String {

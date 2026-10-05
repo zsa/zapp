@@ -92,6 +92,16 @@ pub enum WiredError {
     )]
     ShortConfirm { got: usize },
 
+    #[error("a version response needs {expected} bytes, got {got}", expected = ignition::VERSION_LEN)]
+    ShortVersion { got: usize },
+
+    #[error(
+        "this build reads layout {expected} of ignition's version and the board sent \
+         layout {got}",
+        expected = ignition::VERSION_LAYOUT
+    )]
+    VersionLayout { got: u8 },
+
     #[error(
         "a confirm names an image by {expected} bytes of hash and this one has {got}",
         expected = ignition::CONFIRM_HASH_LEN
