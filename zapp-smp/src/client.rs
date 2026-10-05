@@ -437,6 +437,16 @@ impl SmpClient {
                 Err(err) => return Err(err),
             };
             let next = img::advance(off, size as u32, total, img::parse_upload(&reply)?.off)?;
+            // mcumgr resumes an upload whose hash it already holds — and after
+            // any swap the spare slot holds the image that was swapped out, so
+            // flipping between two builds sends next to nothing. Worth a line:
+            // otherwise a finished "upload" looks impossibly fast.
+            if next > off.saturating_add(size as u32) {
+                log::info!(
+                    "the board already holds this image up to byte {next} of {total}; \
+                     skipping ahead from {off}"
+                );
+            }
 
             if next <= off {
                 stalls += 1;
