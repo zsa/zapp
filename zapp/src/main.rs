@@ -20,7 +20,7 @@ use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
     BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus, Nav,
-    PmicRails, PmicRailsReport, Telemetry,
+    NavReport, PmicRails, PmicRailsReport, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
@@ -310,11 +310,7 @@ fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
     if let Some(ble) = &telemetry.ble {
         lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
     }
-    lines.push(format!(
-        "{:<8} · {}",
-        "features",
-        features(telemetry.nav_build, telemetry.nav_left, telemetry.nav_right)
-    ));
+    lines.push(features_line(&telemetry.nav()));
     lines
 }
 
@@ -351,11 +347,13 @@ fn ble_report(detail: Option<&ChargeDetail>) -> Vec<String> {
         (&detail.left, detail.left_rails),
         (&detail.right, detail.right_rails),
     ]);
-    table(&[
+    let mut lines: Vec<String> = detail.nav.iter().map(features_line).collect();
+    lines.extend(table(&[
         detail_header(going),
         detail_row("left", &detail.left, going, None, detail.left_rails),
         detail_row("right", &detail.right, going, None, detail.right_rails),
-    ])
+    ]));
+    lines
 }
 
 /// The lines under a wired board once its charge telemetry has been read: what
@@ -667,11 +665,11 @@ fn charging_as(speed: Option<&str>) -> String {
     }
 }
 
-/// One entry per pointing device this build knows about: not supported when
-/// the build was never compiled to drive it, connected when either half
-/// currently reports it present, disconnected when the build supports it but
-/// neither half does.
-fn features(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>) -> String {
+/// One entry per pointing device: unknown when the build is not known, not
+/// supported when the build cannot drive it, connected with the side it is on
+/// (or with no side when only the shared bus found it), disconnected when both
+/// halves answered without it, and unknown otherwise.
+fn features(nav: &NavReport) -> String {
     let devices: [(&str, fn(Nav) -> bool); 2] = [
         ("Trackball", |nav| nav.trackball),
         ("Trackpad", |nav| nav.trackpad),
@@ -679,17 +677,30 @@ fn features(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>) -> String
     devices
         .into_iter()
         .map(|(name, has)| {
-            let state = match build.filter(|&build| has(build)) {
-                None => "not supported",
-                Some(_) => match left.is_some_and(has) || right.is_some_and(has) {
-                    true => "connected",
-                    false => "disconnected",
+            let found = |side: Option<Nav>| side.is_some_and(has);
+            let state = match nav.build {
+                None => "unknown",
+                Some(build) if !has(build) => "not supported",
+                Some(_) => match (found(nav.left), found(nav.right)) {
+                    (true, true) => "connected, left and right",
+                    (true, false) => "connected, left",
+                    (false, true) => "connected, right",
+                    (false, false) if found(nav.bus) => "connected",
+                    _ if nav.left.is_some() && nav.right.is_some() => "disconnected",
+                    // A non-zero bus mask comes from a bus that reaches both halves.
+                    _ if nav.bus.is_some_and(|bus| bus != Nav::default()) => "disconnected",
+                    _ => "unknown",
                 },
             };
             format!("{name} ({state})")
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The features line, as wired and Bluetooth boards print it.
+fn features_line(nav: &NavReport) -> String {
+    format!("{:<8} · {}", "features", features(nav))
 }
 
 /// What the halves have left, and what each half's charger is doing when the
@@ -1138,6 +1149,7 @@ mod tests {
                 trackball: true,
                 trackpad: false,
             }),
+            nav_bus: Some(Nav::default()),
             charging: Charging {
                 budget_ma: Some(1500),
                 ..Charging::default()
@@ -1153,7 +1165,7 @@ mod tests {
         // The board named no Bluetooth identity, so nothing is said about one.
         assert_eq!(
             describe_telemetry(&telemetry),
-            vec!["features · Trackball (connected), Trackpad (not supported)"]
+            vec!["features · Trackball (connected, right), Trackpad (not supported)"]
         );
     }
 
@@ -1389,28 +1401,129 @@ mod tests {
         assert_eq!(read_as(charging, Some("fast")), "50% fast charging");
     }
 
+    const NONE: Option<Nav> = Some(Nav {
+        trackball: false,
+        trackpad: false,
+    });
+    const BALL: Option<Nav> = Some(Nav {
+        trackball: true,
+        trackpad: false,
+    });
+    const PAD: Option<Nav> = Some(Nav {
+        trackball: false,
+        trackpad: true,
+    });
+    const BOTH: Option<Nav> = Some(Nav {
+        trackball: true,
+        trackpad: true,
+    });
+    const UNKNOWN: Option<Nav> = None;
+
+    /// Scenario, left, right, bus, and the features line it gives.
+    type Case = (&'static str, Option<Nav>, Option<Nav>, Option<Nav>, &'static str);
+
+    fn nav(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>, bus: Option<Nav>) -> NavReport {
+        NavReport {
+            build,
+            left,
+            right,
+            bus,
+        }
+    }
+
     #[test]
-    fn a_device_the_build_cannot_drive_is_not_a_missing_one() {
-        let ball = Nav {
-            trackball: true,
-            trackpad: false,
+    fn each_pointing_device_says_whether_and_where_it_is_connected() {
+        // A build with both devices.
+        let modes: [Case; 15] = [
+            // Cable plugged: no side, the bus says what is there.
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (disconnected)"),
+            ("plugged, ball", UNKNOWN, UNKNOWN, BALL, "Trackball (connected), Trackpad (disconnected)"),
+            ("plugged, pad", UNKNOWN, UNKNOWN, PAD, "Trackball (disconnected), Trackpad (connected)"),
+            ("plugged, both", UNKNOWN, UNKNOWN, BOTH, "Trackball (connected), Trackpad (connected)"),
+            ("plugged, unknown", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (unknown)"),
+            // Cable unplugged: per side, bus empty.
+            ("unplugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (disconnected)"),
+            ("ball left", BALL, NONE, NONE, "Trackball (connected, left), Trackpad (disconnected)"),
+            ("ball right", NONE, BALL, NONE, "Trackball (connected, right), Trackpad (disconnected)"),
+            ("pad left", PAD, NONE, NONE, "Trackball (disconnected), Trackpad (connected, left)"),
+            ("pad right", NONE, PAD, NONE, "Trackball (disconnected), Trackpad (connected, right)"),
+            ("ball left, pad right", BALL, PAD, NONE, "Trackball (connected, left), Trackpad (connected, right)"),
+            ("pad left, ball right", PAD, BALL, NONE, "Trackball (connected, right), Trackpad (connected, left)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (unknown), Trackpad (unknown)"),
+            ("right unknown, ball left", BALL, UNKNOWN, NONE, "Trackball (connected, left), Trackpad (unknown)"),
+            // Firmware without the bus field: unplugged reads per side, plugged
+            // sent unknown for both halves.
+            ("old, ball right", NONE, BALL, UNKNOWN, "Trackball (connected, right), Trackpad (disconnected)"),
+        ];
+        for (scenario, left, right, bus, want) in modes {
+            assert_eq!(features(&nav(BOTH, left, right, bus)), want, "{scenario}");
+        }
+
+        // The build decides first, whatever the halves say.
+        for (scenario, left, right, bus, _) in modes {
+            assert_eq!(
+                features(&nav(NONE, left, right, bus)),
+                "Trackball (not supported), Trackpad (not supported)",
+                "no devices, {scenario}"
+            );
+            assert_eq!(
+                features(&nav(UNKNOWN, left, right, bus)),
+                "Trackball (unknown), Trackpad (unknown)",
+                "build unknown, {scenario}"
+            );
+        }
+
+        // A trackball-only build: the pad is not supported, the ball as above.
+        let ball_build: [Case; 7] = [
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (not supported)"),
+            ("plugged, ball", UNKNOWN, UNKNOWN, BALL, "Trackball (connected), Trackpad (not supported)"),
+            ("plugged, unknown", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (not supported)"),
+            ("ball left", BALL, NONE, NONE, "Trackball (connected, left), Trackpad (not supported)"),
+            ("ball right", NONE, BALL, NONE, "Trackball (connected, right), Trackpad (not supported)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (unknown), Trackpad (not supported)"),
+            ("old, plugged", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (not supported)"),
+        ];
+        for (scenario, left, right, bus, want) in ball_build {
+            assert_eq!(features(&nav(BALL, left, right, bus)), want, "{scenario}");
+        }
+
+        // A trackpad-only build.
+        let pad_build: [Case; 6] = [
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (not supported), Trackpad (disconnected)"),
+            ("plugged, pad", UNKNOWN, UNKNOWN, PAD, "Trackball (not supported), Trackpad (connected)"),
+            ("pad left", PAD, NONE, NONE, "Trackball (not supported), Trackpad (connected, left)"),
+            ("pad right", NONE, PAD, NONE, "Trackball (not supported), Trackpad (connected, right)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (not supported), Trackpad (unknown)"),
+            ("old, pad left", PAD, NONE, UNKNOWN, "Trackball (not supported), Trackpad (connected, left)"),
+        ];
+        for (scenario, left, right, bus, want) in pad_build {
+            assert_eq!(features(&nav(PAD, left, right, bus)), want, "{scenario}");
+        }
+
+        // Both halves report the same device: the sides win over the bus.
+        assert_eq!(
+            features(&nav(BOTH, BALL, BALL, BALL)),
+            "Trackball (connected, left and right), Trackpad (disconnected)"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_board_prints_the_features_line_when_it_sent_one() {
+        let without = ChargeDetail::default();
+        assert!(!ble_report(Some(&without))
+            .iter()
+            .any(|line| line.starts_with("features")));
+
+        let with = ChargeDetail {
+            nav: Some(nav(BOTH, PAD, BALL, NONE)),
+            ..ChargeDetail::default()
         };
-        let both = Nav {
-            trackball: true,
-            trackpad: true,
-        };
+        let lines = ble_report(Some(&with));
         assert_eq!(
-            features(Some(ball), Some(Nav::default()), Some(ball)),
-            "Trackball (connected), Trackpad (not supported)"
+            lines[0],
+            "features · Trackball (connected, right), Trackpad (connected, left)"
         );
-        assert_eq!(
-            features(Some(both), Some(Nav::default()), Some(Nav::default())),
-            "Trackball (disconnected), Trackpad (disconnected)"
-        );
-        assert_eq!(
-            features(None, Some(ball), None),
-            "Trackball (not supported), Trackpad (not supported)"
-        );
+        assert_eq!(&lines[1..], &ble_report(Some(&without))[..]);
     }
 
     #[test]
@@ -1681,6 +1794,7 @@ mod tests {
             right: running_down(3880, -31, 3050, 130),
             left_rails: Some(off_a_source(4140)),
             right_rails: Some(off_a_source(3880)),
+            nav: None,
         };
 
         assert_eq!(

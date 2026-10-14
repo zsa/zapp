@@ -101,6 +101,7 @@ mod telemetry_offset {
     pub const BLE_ADDR: usize = 19;
     pub const BLE_SLOT: usize = 25;
     pub const BLE_SLOT_COUNT: usize = 26;
+    pub const NAV_BUS: usize = 27;
 }
 
 /// Bytes in the address the identity block carries.
@@ -264,7 +265,9 @@ pub struct Nav {
 }
 
 impl Nav {
-    fn from_mask(mask: u8) -> Option<Self> {
+    /// One nav mask byte, as both the HID telemetry and the Bluetooth detail
+    /// read carry it. `None` for the unknown sentinel.
+    pub fn from_mask(mask: u8) -> Option<Self> {
         (mask != TELEMETRY_NAV_UNKNOWN).then_some(Nav {
             trackball: mask & TELEMETRY_NAV_TRACKBALL != 0,
             trackpad: mask & TELEMETRY_NAV_TRACKPAD != 0,
@@ -355,6 +358,34 @@ pub struct BleIdentity {
     pub slot_count: u8,
 }
 
+/// Pointing devices a board reports: what the build drives, what each half
+/// has, and what the shared bus has while the cable is plugged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NavReport {
+    pub build: Option<Nav>,
+    pub left: Option<Nav>,
+    pub right: Option<Nav>,
+    pub bus: Option<Nav>,
+}
+
+impl NavReport {
+    /// Bytes in the build, left, right, bus block.
+    pub const SIZE: usize = 4;
+
+    /// Decode a build, left, right, bus block. `None` when it is short.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let [build, left, right, bus] = *bytes.get(..Self::SIZE)? else {
+            return None;
+        };
+        Some(Self {
+            build: Nav::from_mask(build),
+            left: Nav::from_mask(left),
+            right: Nav::from_mask(right),
+            bus: Nav::from_mask(bus),
+        })
+    }
+}
+
 /// What a board says about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Telemetry {
@@ -367,9 +398,24 @@ pub struct Telemetry {
     pub nav_build: Option<Nav>,
     pub nav_left: Option<Nav>,
     pub nav_right: Option<Nav>,
+    /// Pointing devices found on the bus the halves share while the cable is
+    /// plugged, side unknown. Empty with the cable unplugged; `None` from a
+    /// firmware that predates the field.
+    pub nav_bus: Option<Nav>,
     /// `None` from a firmware that predates the field, and from a board that
     /// has no identity in its active slot yet.
     pub ble: Option<BleIdentity>,
+}
+
+impl Telemetry {
+    pub fn nav(&self) -> NavReport {
+        NavReport {
+            build: self.nav_build,
+            left: self.nav_left,
+            right: self.nav_right,
+            bus: self.nav_bus,
+        }
+    }
 }
 
 /// What the charger is doing, out of the nPM1300's `BCHGCHARGESTATUS`.
@@ -895,6 +941,7 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
         nav_build: telemetry_field(params, at::NAV_BUILD).and_then(Nav::from_mask),
         nav_left: telemetry_field(params, at::NAV_LEFT).and_then(Nav::from_mask),
         nav_right: telemetry_field(params, at::NAV_RIGHT).and_then(Nav::from_mask),
+        nav_bus: telemetry_field(params, at::NAV_BUS).and_then(Nav::from_mask),
         ble: telemetry_ble(params),
     })
 }
@@ -1503,6 +1550,116 @@ mod tests {
                 .ble,
             None
         );
+    }
+
+    /// A whole 32-byte report as the board sends it: opcode, payload, then
+    /// whatever the rest of the buffer holds.
+    fn telemetry_report(payload: &[u8], fill: u8) -> [u8; REPORT_SIZE] {
+        let mut data = [fill; REPORT_SIZE];
+        data[0] = EVT_TELEMETRY;
+        data[1..1 + payload.len()].copy_from_slice(payload);
+        data
+    }
+
+    fn telemetry_from_report(data: &[u8]) -> Telemetry {
+        let (event, replies) = process_packet(data);
+        assert!(replies.is_empty());
+        let Some(HidEvent::Telemetry(telemetry)) = event else {
+            panic!("expected telemetry");
+        };
+        telemetry
+    }
+
+    #[test]
+    fn a_board_from_before_the_bus_field_says_nothing_about_the_bus() {
+        // len 25 ends at the slot count. The byte after it is not the bus
+        // field, whatever it holds.
+        let payload = telemetry_payload_with_ble(1);
+        assert_eq!(payload[1], 25);
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, TELEMETRY_NAV_TRACKPAD));
+
+        assert_eq!(telemetry.nav_bus, None);
+        assert_eq!(
+            telemetry.nav_left,
+            Some(Nav {
+                trackball: true,
+                trackpad: false
+            })
+        );
+        assert_eq!(telemetry.ble.unwrap().slot_count, 6);
+    }
+
+    #[test]
+    fn the_bus_field_follows_the_slot_count() {
+        // Cable plugged: both halves 0xFF, a trackball and a trackpad on the
+        // shared bus.
+        let mut payload = telemetry_payload_with_ble(1);
+        payload[1] = 26;
+        payload[8] = TELEMETRY_NAV_TRACKBALL | TELEMETRY_NAV_TRACKPAD;
+        payload[9] = TELEMETRY_NAV_UNKNOWN;
+        payload[10] = TELEMETRY_NAV_UNKNOWN;
+        payload.push(TELEMETRY_NAV_TRACKBALL | TELEMETRY_NAV_TRACKPAD);
+        assert_eq!(payload.len(), 28);
+        let data = telemetry_report(&payload, 0);
+        assert_eq!(data[28], 0x03, "report byte 28");
+
+        let telemetry = telemetry_from_report(&data);
+        let both = Nav {
+            trackball: true,
+            trackpad: true,
+        };
+        assert_eq!(
+            telemetry.nav(),
+            NavReport {
+                build: Some(both),
+                left: None,
+                right: None,
+                bus: Some(both),
+            }
+        );
+        assert_eq!(telemetry.ble.unwrap().address, "FE:DB:E9:A8:B1:36");
+
+        // Cable unplugged: per side, bus empty, right half not linked.
+        payload[9] = TELEMETRY_NAV_TRACKPAD;
+        payload[27] = 0;
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, 0xFE));
+        assert_eq!(
+            telemetry.nav(),
+            NavReport {
+                build: Some(both),
+                left: Some(Nav {
+                    trackball: false,
+                    trackpad: true
+                }),
+                right: None,
+                bus: Some(Nav::default()),
+            }
+        );
+
+        // Unknown on the bus.
+        payload[27] = TELEMETRY_NAV_UNKNOWN;
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
+        assert_eq!(telemetry.nav_bus, None);
+    }
+
+    #[test]
+    fn a_nav_block_is_build_left_right_bus() {
+        assert_eq!(
+            NavReport::decode(&[0x01, 0x00, 0xFF, 0x02]),
+            Some(NavReport {
+                build: Some(Nav {
+                    trackball: true,
+                    trackpad: false
+                }),
+                left: Some(Nav::default()),
+                right: None,
+                bus: Some(Nav {
+                    trackball: false,
+                    trackpad: true
+                }),
+            })
+        );
+        assert_eq!(NavReport::decode(&[0x01, 0x00, 0xFF]), None);
     }
 
     #[test]

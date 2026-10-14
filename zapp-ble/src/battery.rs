@@ -1,8 +1,8 @@
 //! Charge left in a board and, on a split one, in each half.
 
 use zapp_core::hid::{
-    decode_battery_detail, decode_pmic_rails, BatteryDetail, PmicRails, BATTERY_DETAIL_SIZE,
-    PMIC_RAILS_SIZE,
+    decode_battery_detail, decode_pmic_rails, BatteryDetail, NavReport, PmicRails,
+    BATTERY_DETAIL_SIZE, PMIC_RAILS_SIZE,
 };
 
 /// Battery Service, its level characteristic, and the descriptor saying which
@@ -116,6 +116,8 @@ const DETAIL_LEFT: usize = 2;
 const DETAIL_RIGHT: usize = DETAIL_LEFT + BATTERY_DETAIL_SIZE;
 const RAILS_LEFT: usize = DETAIL_RIGHT + BATTERY_DETAIL_SIZE;
 const RAILS_RIGHT: usize = RAILS_LEFT + PMIC_RAILS_SIZE;
+/// Build, left, right, bus nav masks, after the scan and nRF diag blocks.
+const NAV: usize = 86;
 
 /// What one board's charge-detail characteristic says: the volts, milliamps
 /// and degrees behind the two Battery Service levels.
@@ -131,6 +133,9 @@ pub struct ChargeDetail {
     /// not taken a reading yet.
     pub left_rails: Option<PmicRails>,
     pub right_rails: Option<PmicRails>,
+    /// Pointing devices as the STM32 reports them. `None` from a board whose
+    /// firmware predates the block.
+    pub nav: Option<NavReport>,
 }
 
 impl ChargeDetail {
@@ -161,6 +166,7 @@ impl ChargeDetail {
             right: block(DETAIL_RIGHT),
             left_rails: rails(RAILS_LEFT),
             right_rails: rails(RAILS_RIGHT),
+            nav: whole(NAV, NavReport::SIZE).and_then(NavReport::decode),
         })
     }
 }
@@ -184,6 +190,7 @@ pub fn half_from_format(descriptor: &[u8]) -> Option<Half> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zapp_core::hid::Nav;
 
     #[test]
     fn the_format_descriptor_names_the_half() {
@@ -372,6 +379,82 @@ mod tests {
         let detail = ChargeDetail::decode(&value).unwrap();
         assert!(detail.left_rails.is_some());
         assert_eq!(detail.right_rails, None);
+    }
+
+    /// The value as a board of the 84-byte generation serves it: rails, then
+    /// scan and nRF diag blocks this host does not read, filled with markers.
+    fn charge_value_with_diag() -> Vec<u8> {
+        let mut value = charge_value_with_rails();
+        value[1] = 84;
+        value.extend((42..86).map(|i| i as u8));
+        assert_eq!(value.len(), 86);
+        value
+    }
+
+    /// The same, grown by the build, left, right, bus nav block.
+    fn charge_value_with_nav(nav: [u8; 4]) -> Vec<u8> {
+        let mut value = charge_value_with_diag();
+        value[1] = 88;
+        value.extend_from_slice(&nav);
+        assert_eq!(value.len(), 90);
+        value
+    }
+
+    #[test]
+    fn a_board_from_before_the_nav_block_has_none() {
+        let detail = ChargeDetail::decode(&charge_value_with_diag()).unwrap();
+        assert_eq!(detail.nav, None);
+        assert_eq!(detail.left.voltage_mv, Some(4020));
+        assert_eq!(detail.right_rails.unwrap().vbus_mv, 4480);
+    }
+
+    #[test]
+    fn the_nav_block_is_read_after_the_diag_blocks() {
+        let ball = Nav {
+            trackball: true,
+            trackpad: false,
+        };
+        let pad = Nav {
+            trackball: false,
+            trackpad: true,
+        };
+        let both = Nav {
+            trackball: true,
+            trackpad: true,
+        };
+
+        // Cable unplugged: ball on the left, right half not linked.
+        let detail = ChargeDetail::decode(&charge_value_with_nav([0x03, 0x01, 0xFF, 0x00])).unwrap();
+        assert_eq!(
+            detail.nav,
+            Some(NavReport {
+                build: Some(both),
+                left: Some(ball),
+                right: None,
+                bus: Some(Nav::default()),
+            })
+        );
+
+        // Cable plugged: a pad on the shared bus, side unknown.
+        let detail = ChargeDetail::decode(&charge_value_with_nav([0x03, 0xFF, 0xFF, 0x02])).unwrap();
+        assert_eq!(
+            detail.nav,
+            Some(NavReport {
+                build: Some(both),
+                left: None,
+                right: None,
+                bus: Some(pad),
+            })
+        );
+        // Everything before it reads as before.
+        assert_eq!(detail.left.voltage_mv, Some(4020));
+        assert_eq!(detail.right_rails.unwrap().vbus_mv, 4480);
+    }
+
+    #[test]
+    fn a_nav_block_that_arrived_short_is_not_read() {
+        let value = charge_value_with_nav([0x01, 0x01, 0x00, 0x00]);
+        assert_eq!(ChargeDetail::decode(&value[..89]).unwrap().nav, None);
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub use zapp_hid_proto::{
     CMD_GET_PMIC_RAILS, CMD_GET_TELEMETRY, CMD_RGB_CONTROL, CMD_SET_LAYER, CMD_SET_RGB_ALL_LED,
     CMD_SET_RGB_LED, CMD_SET_STATUS_LED, CMD_STATUS_LED_CONTROL, CMD_UPDATE_BRIGHTNESS,
     ChargeState, ChargeTelemetry, ChargerFault, ChargerStatus, Charging, HalfDetail, HidEvent, Nav,
+    NavReport,
     PMIC_RAILS_REPORT_VERSION, PMIC_RAILS_SIZE, PmicRails, PmicRailsReport, Source, Telemetry,
     USAGE_PAGE, VbusInStatus, decode_battery_detail, decode_pmic_rails, parse_pmic_rails_report,
 };
