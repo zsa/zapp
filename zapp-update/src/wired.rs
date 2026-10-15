@@ -1176,10 +1176,13 @@ fn write_half<L: IgnitionLink + 'static>(
             // the probe read the slot back pending. What the board says now
             // is the answer the reply would have given.
             let silent = matches!(err.downcast_ref::<SmpError>(), Some(SmpError::Timeout(_)));
+            // The probe's notes go to the flash log only: when it finds the
+            // mark there is nothing for the person flashing to act on, and
+            // when it does not, the error says so and the log has the rest.
             if !(silent && probe_silent_mark(shared, ignition, half, status, timeout, &wanted)) {
                 return Err(err);
             }
-            log::warn!("{half}: the mark landed without its reply; carrying on");
+            log::debug!("{half}: the mark landed without its reply; carrying on");
         }
         log::debug!(
             "{half}: {} bytes written, spare slot now carries {}",
@@ -1256,8 +1259,17 @@ fn boot_out<L: IgnitionLink>(
 /// decode — and only reaches the listing once the trailer is written. A reply
 /// that will not decode is therefore a mark that went through. The listing is
 /// re-read on the next pass anyway, so nothing is lost by dropping this one.
+///
+/// The wait is [`MARK_TIMEOUT`] rather than the run's: writing the trailer
+/// takes milliseconds, and a mark that has not answered by then is one whose
+/// reply is held up, which only the probe after it shakes loose.
 fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
-    match client.mark(wanted, false) {
+    log_mark(client, half, wanted);
+    let timeout = client.timeout();
+    client.set_timeout(timeout.min(MARK_TIMEOUT));
+    let marked = client.mark(wanted, false);
+    client.set_timeout(timeout);
+    match marked {
         Ok(_) => Ok(()),
         Err(SmpError::Cbor(detail)) => {
             log::debug!(
@@ -1269,6 +1281,42 @@ fn arm(client: &mut SmpClient, half: Half, wanted: &[u8]) -> Result<()> {
         Err(err) => Err(err)
             .with_context(|| format!("Could not mark the {half} half's new image for test")),
     }
+}
+
+/// How long a mark waits for its reply before the probe takes over.
+const MARK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Records the mark request as it goes onto the wire, for the flash log.
+///
+/// A mark whose reply never comes is a field report: the log is all there is,
+/// and it has to say what was sent and under which sequence number, so a late
+/// reply further down can be matched to it.
+fn log_mark(client: &SmpClient, half: Half, wanted: &[u8]) {
+    let seq = client.next_seq();
+    let payload = zapp_smp::img::state_write(wanted, false);
+    let frame = match zapp_smp::proto::frame(
+        zapp_smp::proto::Op::Write,
+        zapp_smp::img::GROUP,
+        zapp_smp::img::CMD_STATE,
+        seq,
+        &payload,
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            log::debug!("{half}: marking with seq {seq}, frame not encodable here: {err}");
+            return;
+        }
+    };
+    let (lines, bytes) = match zapp_wired::nlip::encode(&frame) {
+        Ok(lines) => (lines.len(), lines.iter().map(Vec::len).sum::<usize>()),
+        Err(_) => (0, 0),
+    };
+    log::debug!(
+        "{half}: marking with seq {seq}: {} bytes of SMP in {lines} line(s), {bytes} bytes \
+         on the wire: {}",
+        frame.len(),
+        image::hex(&frame)
+    );
 }
 
 /// Takes whatever arrives on the link until it has been quiet for a moment,
@@ -1286,20 +1334,20 @@ fn listen<L: IgnitionLink + 'static>(ignition: &mut Ignition<Shared<L>>, half: H
             Ok(bytes) if bytes.is_empty() => break,
             Ok(bytes) => got.extend_from_slice(&bytes),
             Err(err) => {
-                log::warn!("{half}: listening {when} failed: {err}");
+                log::debug!("{half}: listening {when} failed: {err}");
                 break;
             }
         }
     }
     if got.is_empty() {
-        log::warn!("{half}: nothing arrived {when}");
+        log::debug!("{half}: nothing arrived {when}");
         return;
     }
     let tail: String = got[got.len().saturating_sub(96)..]
         .iter()
         .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
         .collect();
-    log::warn!(
+    log::debug!(
         "{half}: {} bytes arrived {when}, after {} ms, ending {tail:?}",
         got.len(),
         started.elapsed().as_millis()
@@ -1319,10 +1367,10 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
     timeout: Duration,
     wanted: &[u8],
 ) -> bool {
-    log::warn!("{half}: no reply to the mark, probing");
+    log::debug!("{half}: no reply to the mark, probing");
     match ignition.status() {
-        Ok(status) => log::warn!("{half}: ignition status after the silent mark: {status:?}"),
-        Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
+        Ok(status) => log::debug!("{half}: ignition status after the silent mark: {status:?}"),
+        Err(err) => log::debug!("{half}: could not read ignition status: {err}"),
     }
 
     // Which side sat on the mark is in when its reply turns up. Arriving
@@ -1330,17 +1378,21 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
     // the newline below has gone, the half was still waiting for the end of
     // the request line, and the mark is happening now rather than then.
     listen(ignition, half, "with the link left alone");
-    if let Err(err) = ignition.send(half.into(), b"\n") {
-        log::warn!("{half}: could not send a resync newline: {err}");
+    // Flushed, or the bridge sits on it and the next request carries it in.
+    if let Err(err) = ignition
+        .send(half.into(), b"\n")
+        .and_then(|()| ignition.flush(half.into()))
+    {
+        log::debug!("{half}: could not send a resync newline: {err}");
     }
     listen(ignition, half, "after the resync newline");
     let mut client = connect(shared, half, status.payload_budget(), timeout);
     let mut marked = false;
     match client.image_state() {
-        Ok(slots) if slots.is_empty() => log::warn!("{half}: image state lists no slots"),
+        Ok(slots) if slots.is_empty() => log::debug!("{half}: image state lists no slots"),
         Ok(slots) => {
             for slot in &slots {
-                log::warn!(
+                log::debug!(
                     "{half}: slot {} carries {} ({}) [{}]",
                     slot.slot,
                     short(&slot.hash),
@@ -1349,19 +1401,19 @@ fn probe_silent_mark<L: IgnitionLink + 'static>(
                 );
             }
             let pending = slots.iter().any(|slot| slot.slot == 1 && slot.pending);
-            log::warn!("{half}: slot 1 pending: {pending}");
+            log::debug!("{half}: slot 1 pending: {pending}");
             // Marked for test, and for test only: a permanent mark is not what
             // was asked for, and would leave no way back.
             marked = slots
                 .iter()
                 .any(|slot| slot.hash == wanted && slot.pending && !slot.permanent);
         }
-        Err(err) => log::warn!("{half}: image state read failed too: {err}"),
+        Err(err) => log::debug!("{half}: image state read failed too: {err}"),
     }
 
     match ignition.status() {
-        Ok(status) => log::warn!("{half}: ignition status after the probe: {status:?}"),
-        Err(err) => log::warn!("{half}: could not read ignition status: {err}"),
+        Ok(status) => log::debug!("{half}: ignition status after the probe: {status:?}"),
+        Err(err) => log::debug!("{half}: could not read ignition status: {err}"),
     }
     marked
 }

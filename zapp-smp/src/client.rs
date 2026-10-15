@@ -131,6 +131,22 @@ impl SmpClient {
         self
     }
 
+    /// How long a request waits for its reply.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Changes the reply wait for the requests from here on.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    /// The sequence number the next request goes out with, which is how its
+    /// reply is told apart from a late one.
+    pub fn next_seq(&self) -> u8 {
+        self.seq
+    }
+
     pub fn mtu(&self) -> usize {
         self.mtu
     }
