@@ -8,6 +8,7 @@ description = "BLE discovery for ZSA keyboards"
 log = "0.4"
 thiserror = "2"
 zapp-core = { path = "../zapp-core" }
+zapp-hid-proto = { path = "../zapp-hid-proto" }
 zapp-smp = { path = "../zapp-smp" }
 
 [dev-dependencies]

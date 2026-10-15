@@ -2544,6 +2544,7 @@ dependencies = [
  "objc2-foundation",
  "thiserror 2.0.18",
  "zapp-core",
+ "zapp-hid-proto",
  "zapp-smp",
  "zbus",
 ]

@@ -11,6 +11,7 @@ mod board;
 pub mod dfu;
 pub mod identity;
 mod monitor;
+pub mod oryx;
 pub mod pick;
 mod roster;
 pub mod smp;
@@ -33,6 +34,9 @@ pub enum BleError {
     /// carry.
     #[error("{0}")]
     NotFound(String),
+    /// Connected, and the board's GATT tree has no such characteristic.
+    #[error("{device} does not carry characteristic {characteristic:032x}")]
+    Missing { device: String, characteristic: u128 },
     /// Reachable, but not bonded — and an SMP link needs an encrypted one.
     #[error("{0} is not bonded to this machine")]
     NotBonded(String),

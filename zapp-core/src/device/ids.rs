@@ -11,8 +11,14 @@ pub const HALFKAY_PID: u16 = 0x0478;
 
 /// ZSA's BLE UUID space: `3297xxxx-e5aa-4f42-a596-1ea5a0200001`, keyed on the
 /// vendor id. `32970001`-`32970004` is the firmware-update service and its
-/// characteristics; per-product identity UUIDs start at `32970101`.
+/// characteristics; per-product identity UUIDs start at `32970101`; `32970201`
+/// up is the right half's SMP relay; `32970301`-`32970303` is the Oryx live
+/// protocol.
 pub const ZSA_BLE_DFU_SERVICE: u128 = 0x32970001_e5aa_4f42_a596_1ea5a0200001;
+
+/// The Oryx live protocol over BLE: the raw-HID 0xFF60 reports, one per write
+/// and one per notification. Served by the Voyager 2's left half.
+pub const ZSA_BLE_ORYX_SERVICE: u128 = 0x32970301_e5aa_4f42_a596_1ea5a0200001;
 
 /// Known ZSA keyboard models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

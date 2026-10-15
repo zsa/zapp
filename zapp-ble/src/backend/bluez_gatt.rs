@@ -91,9 +91,10 @@ pub fn open(
     // it now.
     let tree = objects.get_managed_objects().map_err(bluez::platform)?;
     let path = find_characteristic(&tree, device, service, characteristic).ok_or_else(|| {
-        BleError::NotFound(format!(
-            "{device} does not carry characteristic {characteristic:032x}"
-        ))
+        BleError::Missing {
+            device: device.to_string(),
+            characteristic,
+        }
     })?;
     log::debug!("characteristic {characteristic:032x} at {path}");
 

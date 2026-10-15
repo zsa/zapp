@@ -7,8 +7,10 @@
 //! implementation in zsausb/device.go.
 //!
 //! The wire format itself lives in `zapp-hid-proto`, shared with transports
-//! that cannot link hidapi; this module is the hidapi transport around it.
+//! that cannot link hidapi. This module runs the handshake and the read loop
+//! over any [`ReportLink`]; hidapi is the one it opens itself.
 
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -35,7 +37,19 @@ const REPORT_ID: u8 = 0x00;
 /// Poll interval when the non-blocking read returns nothing.
 const IDLE_POLL: Duration = Duration::from_millis(20);
 
-/// A live connection to a keyboard's raw HID interface.
+/// One 32-byte report each way, over whatever carries the protocol.
+///
+/// The reports are the same on every carrier: hidapi's raw HID interface, or
+/// a GATT service that moves them one per write and one per notification.
+pub trait ReportLink: Send + 'static {
+    /// Sends one report.
+    fn send(&mut self, report: &[u8; REPORT_SIZE]) -> io::Result<()>;
+
+    /// The next report, or `None` once `timeout` elapses.
+    fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>>;
+}
+
+/// A live connection to a keyboard's raw HID protocol.
 ///
 /// Spawns a reader thread that performs the handshake (firmware version,
 /// pairing, protocol version) and streams events until dropped.
@@ -60,13 +74,19 @@ impl HidConnection {
         let device = api.open_path(&path)?;
         device.set_blocking_mode(false)?;
 
+        Ok(Self::over(HidLink(device)))
+    }
+
+    /// Runs the protocol over `link`: starts the reader thread and kicks off
+    /// the handshake.
+    pub fn over(link: impl ReportLink) -> Self {
         let (tx, rx) = mpsc::channel();
         let (tx_cmd, rx_cmd) = mpsc::channel::<Packet>();
         let running = Arc::new(AtomicBool::new(true));
 
         let thread_running = running.clone();
         thread::spawn(move || {
-            read_loop(device, tx, rx_cmd, thread_running);
+            read_loop(link, tx, rx_cmd, thread_running);
         });
 
         // Kick off the handshake; the read loop continues it on responses.
@@ -76,7 +96,7 @@ impl HidConnection {
             running,
         };
         conn.send(CMD_GET_FW_VERSION, &[]);
-        Ok(conn)
+        conn
     }
 
     /// Queue a command packet for the device.
@@ -107,41 +127,55 @@ impl Drop for HidConnection {
 }
 
 /// Frame a report for hidapi: report ID byte, then the 32-byte report.
-fn hid_buffer(cmd: u8, params: &[u8]) -> [u8; PACKET_SIZE] {
+fn hid_buffer(report: &[u8; REPORT_SIZE]) -> [u8; PACKET_SIZE] {
     let mut buf = [0u8; PACKET_SIZE];
     buf[0] = REPORT_ID;
-    buf[1..].copy_from_slice(&encode_packet(cmd, params));
+    buf[1..].copy_from_slice(report);
     buf
 }
 
-fn write_packet(device: &hidapi::HidDevice, cmd: u8, params: &[u8]) -> Result<(), ZappError> {
-    device.write(&hid_buffer(cmd, params))?;
-    Ok(())
+/// hidapi's raw HID interface, opened non-blocking.
+struct HidLink(hidapi::HidDevice);
+
+impl ReportLink for HidLink {
+    fn send(&mut self, report: &[u8; REPORT_SIZE]) -> io::Result<()> {
+        self.0.write(&hid_buffer(report)).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = [0u8; PACKET_SIZE];
+        match self.0.read(&mut buf).map_err(io::Error::other)? {
+            0 => {
+                thread::sleep(timeout);
+                Ok(None)
+            }
+            n => Ok(Some(buf[..n].to_vec())),
+        }
+    }
 }
 
 fn read_loop(
-    device: hidapi::HidDevice,
+    mut link: impl ReportLink,
     tx: mpsc::Sender<HidEvent>,
     rx_cmd: mpsc::Receiver<Packet>,
     running: Arc<AtomicBool>,
 ) {
-    let mut buf = [0u8; PACKET_SIZE];
-
     while running.load(Ordering::Relaxed) {
         // Flush queued outgoing commands.
         while let Ok((cmd, params)) = rx_cmd.try_recv() {
-            if write_packet(&device, cmd, &params).is_err() {
+            if link.send(&encode_packet(cmd, &params)).is_err() {
                 let _ = tx.send(HidEvent::Disconnected);
                 return;
             }
         }
 
-        match device.read(&mut buf) {
-            Ok(0) => thread::sleep(IDLE_POLL),
-            Ok(n) => {
-                let (event, replies) = process_packet(&buf[..n]);
+        match link.receive(IDLE_POLL) {
+            Ok(None) => {}
+            Ok(Some(report)) => {
+                let (event, replies) = process_packet(&report);
                 for (cmd, params) in replies {
-                    if write_packet(&device, cmd, &params).is_err() {
+                    if link.send(&encode_packet(cmd, &params)).is_err() {
                         let _ = tx.send(HidEvent::Disconnected);
                         return;
                     }
@@ -152,7 +186,8 @@ fn read_loop(
                     return; // receiver gone
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                log::debug!("report link closed: {err}");
                 let _ = tx.send(HidEvent::Disconnected);
                 return;
             }
@@ -166,9 +201,85 @@ mod tests {
 
     #[test]
     fn hid_buffer_prepends_report_id() {
-        let buf = hid_buffer(CMD_SET_LAYER, &[1, 3]);
+        let buf = hid_buffer(&encode_packet(CMD_SET_LAYER, &[1, 3]));
         assert_eq!(buf.len(), PACKET_SIZE);
         assert_eq!(&buf[..4], &[REPORT_ID, CMD_SET_LAYER, 1, 3]);
         assert!(buf[4..].iter().all(|&b| b == 0));
+    }
+
+    /// Answers the firmware-version request with a serial, and records every
+    /// report written.
+    struct Scripted {
+        sent: mpsc::Sender<[u8; REPORT_SIZE]>,
+        pending: Vec<Vec<u8>>,
+    }
+
+    impl ReportLink for Scripted {
+        fn send(&mut self, report: &[u8; REPORT_SIZE]) -> io::Result<()> {
+            if report[0] == CMD_GET_FW_VERSION {
+                let mut answer = b"\x00abc/def".to_vec();
+                answer.push(zapp_hid_proto::STOP_BIT);
+                self.pending.push(answer);
+            }
+            let _ = self.sent.send(*report);
+            Ok(())
+        }
+
+        fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+            if self.pending.is_empty() {
+                thread::sleep(timeout);
+                return Ok(None);
+            }
+            Ok(Some(self.pending.remove(0)))
+        }
+    }
+
+    #[test]
+    fn any_link_carries_the_same_handshake() {
+        let (sent, written) = mpsc::channel();
+        let connection = HidConnection::over(Scripted {
+            sent,
+            pending: Vec::new(),
+        });
+
+        assert_eq!(
+            connection.recv_timeout(Duration::from_secs(2)),
+            Some(HidEvent::FirmwareVersion {
+                layout_id: "abc".into(),
+                revision_id: "def".into(),
+            })
+        );
+        let opcodes: Vec<u8> = (0..3)
+            .map(|_| written.recv_timeout(Duration::from_secs(2)).unwrap()[0])
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                CMD_GET_FW_VERSION,
+                zapp_hid_proto::CMD_INIT_PAIRING,
+                zapp_hid_proto::CMD_GET_PROTOCOL_VERSION
+            ]
+        );
+    }
+
+    struct Broken;
+
+    impl ReportLink for Broken {
+        fn send(&mut self, _: &[u8; REPORT_SIZE]) -> io::Result<()> {
+            Err(io::Error::other("gone"))
+        }
+
+        fn receive(&mut self, _: Duration) -> io::Result<Option<Vec<u8>>> {
+            Err(io::Error::other("gone"))
+        }
+    }
+
+    #[test]
+    fn a_link_that_fails_ends_the_connection() {
+        let connection = HidConnection::over(Broken);
+        assert_eq!(
+            connection.recv_timeout(Duration::from_secs(2)),
+            Some(HidEvent::Disconnected)
+        );
     }
 }

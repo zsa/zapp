@@ -956,10 +956,9 @@ impl Central {
             Characteristics,
         }
 
-        let missing = || {
-            BleError::NotFound(format!(
-                "{key} does not carry characteristic {characteristic:032x}"
-            ))
+        let missing = || BleError::Missing {
+            device: key.to_string(),
+            characteristic,
         };
 
         let mut asked = Vec::new();
