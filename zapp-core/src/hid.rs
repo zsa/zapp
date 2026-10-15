@@ -57,6 +57,7 @@ pub struct HidConnection {
     rx: mpsc::Receiver<HidEvent>,
     tx_cmd: mpsc::Sender<Packet>,
     running: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl HidConnection {
@@ -85,7 +86,7 @@ impl HidConnection {
         let running = Arc::new(AtomicBool::new(true));
 
         let thread_running = running.clone();
-        thread::spawn(move || {
+        let reader = thread::spawn(move || {
             read_loop(link, tx, rx_cmd, thread_running);
         });
 
@@ -94,6 +95,7 @@ impl HidConnection {
             rx,
             tx_cmd,
             running,
+            reader: Some(reader),
         };
         conn.send(CMD_GET_FW_VERSION, &[]);
         conn
@@ -117,6 +119,15 @@ impl HidConnection {
     /// Block until the next event is available or `timeout` elapses.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<HidEvent> {
         self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// Stops the reader thread and waits for it, so the link is dropped
+    /// before this returns.
+    pub fn close(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -260,6 +271,33 @@ mod tests {
                 zapp_hid_proto::CMD_GET_PROTOCOL_VERSION
             ]
         );
+    }
+
+    /// Idle until dropped, then says so.
+    struct Watched(mpsc::Sender<()>);
+
+    impl ReportLink for Watched {
+        fn send(&mut self, _: &[u8; REPORT_SIZE]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn receive(&mut self, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+            thread::sleep(timeout);
+            Ok(None)
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn close_drops_the_link_before_returning() {
+        let (dropped, watch) = mpsc::channel();
+        HidConnection::over(Watched(dropped)).close();
+        assert_eq!(watch.try_recv(), Ok(()));
     }
 
     struct Broken;

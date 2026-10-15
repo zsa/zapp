@@ -6,6 +6,8 @@ mod zsab;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -19,8 +21,8 @@ use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
-    BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus, Nav,
-    NavReport, PmicRails, PmicRailsReport, Telemetry,
+    BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
+    HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
@@ -111,6 +113,21 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
+    /// Print the Oryx live events a board sends over Bluetooth
+    #[command(
+        long_about = "Print the Oryx live events a board sends over Bluetooth.\n\n\
+            Opens the live session on a bonded board and prints one line per \
+            event until Ctrl-C or the link closes.",
+        after_long_help = "Examples:\n  \
+            zapp live\n  \
+            zapp live --device \"Voyager\""
+    )]
+    Live {
+        /// Which board, by advertised name or by the handle the device list
+        /// shows.
+        #[arg(long, short = 'd')]
+        device: Option<String>,
+    },
 }
 
 /// Runs the command the arguments name, and says one line about a failure.
@@ -142,6 +159,7 @@ fn dispatch(command: Commands) -> Result<()> {
         }
         Commands::Update => cmd_update(),
         Commands::Devices { scan, verbose } => cmd_devices(scan, verbose),
+        Commands::Live { device } => cmd_live(device.as_deref()),
         Commands::Bond { key, show } => {
             if show {
                 if key.is_some() {
@@ -153,6 +171,54 @@ fn dispatch(command: Commands) -> Result<()> {
             }
         }
     }
+}
+
+/// How often `live` checks for Ctrl-C between events.
+const LIVE_POLL: Duration = Duration::from_millis(100);
+
+fn cmd_live(device: Option<&str>) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handler_stop = stop.clone();
+    ctrlc::set_handler(move || handler_stop.store(true, Ordering::Relaxed))
+        .context("cannot catch Ctrl-C")?;
+
+    let (connection, payload) = zapp_ble::oryx::open_session(device)?;
+    // The channel reports ATT payload; the ATT MTU adds the 3-byte header.
+    println!("ATT MTU: {}", payload + 3);
+
+    while !stop.load(Ordering::Relaxed) {
+        let Some(event) = connection.recv_timeout(LIVE_POLL) else {
+            continue;
+        };
+        match event {
+            HidEvent::FirmwareVersion {
+                layout_id,
+                revision_id,
+            } => println!("handshake: layout {layout_id}, revision {revision_id}"),
+            HidEvent::ProtocolVersion(version) => println!("protocol version: {version:#04x}"),
+            HidEvent::LayerChanged(layer) => println!("layer: {layer}"),
+            HidEvent::Key {
+                column,
+                row,
+                pressed,
+            } => println!(
+                "key {}: column {column}, row {row}",
+                if pressed { "down" } else { "up" }
+            ),
+            HidEvent::ToggleSmartLayer => println!("smart layer: toggle"),
+            HidEvent::TriggerSmartLayer => println!("smart layer: trigger"),
+            HidEvent::PairingFail => println!("pairing failed"),
+            HidEvent::Disconnected => {
+                println!("link closed");
+                break;
+            }
+            other => println!("other: {other:?}"),
+        }
+    }
+
+    // Joins the reader, so the channels are dropped (BlueZ StopNotify) before exit.
+    connection.close();
+    Ok(())
 }
 
 /// How long to give the radio. Without `--scan`, just long enough for the first

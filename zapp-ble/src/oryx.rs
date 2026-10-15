@@ -53,6 +53,11 @@ pub enum OryxError {
 /// listing shows. Events are subscribed before the first command is written,
 /// so the firmware-version answer cannot be missed.
 pub fn open(hint: Option<&str>) -> Result<HidConnection, OryxError> {
+    open_session(hint).map(|(connection, _)| connection)
+}
+
+/// [`open`], plus the ATT payload one command write can carry.
+pub fn open_session(hint: Option<&str>) -> Result<(HidConnection, usize), OryxError> {
     let mut backend = backend::for_platform(&[]).ok_or(BleError::NoAdapter)?;
     let sightings = backend.sightings()?;
     let key = select(&sightings, hint)?.key.clone();
@@ -65,7 +70,8 @@ pub fn open(hint: Option<&str>) -> Result<HidConnection, OryxError> {
         .open_as(&key, ORYX_SERVICE, ORYX_COMMAND, Usage::STREAM)
         .map_err(missing_service)?;
 
-    Ok(HidConnection::over(GattLink { commands, events }))
+    let mtu = commands.mtu();
+    Ok((HidConnection::over(GattLink { commands, events }), mtu))
 }
 
 /// A characteristic the board lacks is firmware without the service.
