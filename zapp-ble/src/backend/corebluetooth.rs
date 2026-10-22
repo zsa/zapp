@@ -1414,8 +1414,21 @@ define_class!(
         fn did_update_state(&self, central: &CBCentralManager) {
             let state = unsafe { central.state() };
             log::debug!("CoreBluetooth central state {}", state.0);
+            // Leaving the powered-on state takes every link down with it, but
+            // CoreBluetooth sends no didDisconnectPeripheral for them. Left
+            // marked connected, the next connect would hand out the dead
+            // session and lose its channel to the didConnect that follows.
+            let down = state != CBManagerState::PoweredOn;
+            if down {
+                self.ivars().watched.borrow_mut().clear();
+            }
             self.ivars().shared.update(|events| {
                 events.power = Some(state.0);
+                if down {
+                    for link in events.links.values_mut().filter(|link| link.connected) {
+                        link.reset(false);
+                    }
+                }
                 events.generation += 1;
             });
         }
