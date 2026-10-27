@@ -46,17 +46,16 @@ enum Commands {
         long_about = "Flash firmware from a local file or Oryx URL.\n\n\
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
             bundles carrying both wireless halves, and Oryx layout URLs. A \
-            .zsab bundle and a Voyager 2 keyboard image go over the cable when \
-            the keyboard is on USB and over Bluetooth otherwise; any other \
-            keyboard's firmware goes over the cable. A bundle's two halves are \
-            written together, the right one first.",
+            Voyager 2 keyboard image goes over the cable when the keyboard is \
+            on USB and over Bluetooth otherwise. A .zsab bundle goes over the \
+            cable only. Any other keyboard's firmware goes over the cable. A \
+            bundle's two halves are written together, the right one first.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
             zapp flash .build/zsa_voyager_tng_default.bin\n  \
             zapp flash .build/zsa_voyager_tng_default.bin --device \"Voyager\"\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash voyager2_0.1.9.zsab --force\n  \
-            zapp flash voyager2_0.1.9.zsab --device \"Voyager\"\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
@@ -68,7 +67,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
         /// Which board, by advertised name or by the handle the device list
-        /// shows. Applies over Bluetooth only.
+        /// shows. Applies to keyboard images over Bluetooth only.
         #[arg(long, short = 'd')]
         device: Option<String>,
     },
@@ -904,10 +903,9 @@ fn is_voyager2_image(pid: u16) -> bool {
 
 /// A Voyager 2 keyboard image, over whichever way the keyboard is reachable.
 ///
-/// The same choice a bundle makes, for the same reasons: the cable whenever the
-/// Voyager 2 is on it, Bluetooth only for a keyboard that is not plugged in at
-/// all. Over the cable `named` is ignored, as there is only ever one keyboard
-/// plugged in.
+/// The cable whenever the Voyager 2 is on it, Bluetooth only for a keyboard
+/// that is not plugged in at all. Over the cable `named` is ignored, as there
+/// is only ever one keyboard plugged in.
 fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
     let over = route();
     print_firmware_info(fw, over);
@@ -924,7 +922,11 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
     Ok(())
 }
 
-/// A bundle, over whichever way the keyboard is reachable.
+/// Whether a .zsab bundle may go over Bluetooth. Off for now: a bundle needs
+/// the keyboard on the cable. The Bluetooth path stays in place behind this.
+const BLUETOOTH_BUNDLES: bool = false;
+
+/// A bundle, over the cable, or over Bluetooth when `BLUETOOTH_BUNDLES` is on.
 ///
 /// The cable wins whenever the Voyager 2 is on it, whether it is already in its
 /// bootloader or still running its own firmware — the wired path waits for the
@@ -938,11 +940,19 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
 /// radio, or the update goes down a wire the bundle can never reach the board
 /// through and stops asking for a reset button that would not help.
 ///
+/// With `BLUETOOTH_BUNDLES` off, a keyboard not on the cable is an error.
+///
 /// `named` picks between bonded boards over Bluetooth. The cable ignores it:
 /// there is only ever one keyboard plugged in.
 fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
     if route() == Transport::Usb {
         return nrf_wired::flash(path, force);
+    }
+    if !BLUETOOTH_BUNDLES {
+        bail!(
+            "A .zsab bundle needs the keyboard fully wired: plugged into your \
+             computer with the USB cable, and both halves connected with their cable."
+        );
     }
 
     zsab::update(path, force, named)
