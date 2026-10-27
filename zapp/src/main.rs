@@ -1,3 +1,4 @@
+mod diag;
 mod flash_log;
 mod nrf_wired;
 mod screen;
@@ -127,6 +128,20 @@ enum Commands {
         #[arg(long, short = 'd')]
         device: Option<String>,
     },
+    /// Read a Voyager 2's diagnostic records over USB
+    #[command(
+        long_about = "Read a Voyager 2's diagnostic records over USB.\n\n\
+            Asks the keyboard over the cable for what its keyboard MCU (STM32) \
+            and its left half (nRF) recorded about this boot and the previous \
+            one: uptime, reset reason, link state, error counters and stalls. \
+            Prints them as plain text, with anything unusual listed at the \
+            end. The keyboard must be running its own firmware, not its \
+            bootloader.",
+        after_long_help = "Examples:\n  \
+            zapp diag\n  \
+            zapp diag > voyager2-diag.txt"
+    )]
+    Diag,
 }
 
 /// Runs the command the arguments name, and says one line about a failure.
@@ -159,6 +174,7 @@ fn dispatch(command: Commands) -> Result<()> {
         Commands::Update => cmd_update(),
         Commands::Devices { scan, verbose } => cmd_devices(scan, verbose),
         Commands::Live { device } => cmd_live(device.as_deref()),
+        Commands::Diag => diag::run(),
         Commands::Bond { key, show } => {
             if show {
                 if key.is_some() {

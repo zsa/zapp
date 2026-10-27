@@ -30,6 +30,16 @@ pub use zapp_hid_proto::{
     PMIC_RAILS_REPORT_VERSION, PMIC_RAILS_SIZE, PmicRails, PmicRailsReport, Source, Telemetry,
     USAGE_PAGE, VbusInStatus, decode_battery_detail, decode_pmic_rails, parse_pmic_rails_report,
 };
+pub use zapp_hid_proto::{
+    CMD_GET_DIAG, DIAG_AGE_UNKNOWN, DIAG_FETCH, DIAG_NEVER, DIAG_PAGE_VERSION, DiagPage,
+    DiagRecord, DiagStatus, LEFT_DIAG_BLE_HOST, LEFT_DIAG_STM32_LINK, LEFT_DIAG_STM32_SLEEP,
+    LEFT_DIAG_STM32_TRRS, LEFT_DIAG_STM32_USB, LEFT_DIAG_THREADS, LEFT_DIAG_UART_RX_OFF,
+    LEFT_DIAG_VBUS, LeftDiag, NRF_RESET_DOG0, NRF_RESET_DOG1, NRF_RESET_LOCKUP, NRF_RESET_SREQ,
+    STM32_DIAG_BLE_HOST, STM32_DIAG_LINK_UP, STM32_DIAG_NRF_VBUS, STM32_DIAG_RIGHT_LEDS,
+    STM32_DIAG_TRRS, STM32_DIAG_USB_HOST, STM32_DIAG_VBUS_SEEN, STM32_RESET_IWDG, STM32_RESET_WWDG,
+    Stm32Diag, ThreadStall, assemble_diag_record, diag_page_count, diag_request, nrf_reset_causes,
+    parse_left_diag, parse_stm32_diag, stm32_reset_causes,
+};
 
 /// Write packet size: report ID byte + 32-byte report.
 const PACKET_SIZE: usize = REPORT_SIZE + 1;

@@ -41,6 +41,10 @@ pub const CMD_GET_CHARGE_TELEMETRY: u8 = 0x0E;
 /// and what its input regulator and charger are set to. Answered with
 /// `EVT_PMIC_RAILS`.
 pub const CMD_GET_PMIC_RAILS: u8 = 0x0F;
+// 0x10 is the firmware's ORYX_CMD_GET_SCAN_DIAG, unused by zapp.
+/// Ask the board for one page of a diagnostic record: params are record,
+/// page and flags (`DIAG_FETCH`). Answered with `EVT_DIAG`.
+pub const CMD_GET_DIAG: u8 = 0x11;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -65,6 +69,9 @@ pub const EVT_CHARGE_TELEMETRY: u8 = 0x0E;
 /// Answer to `CMD_GET_PMIC_RAILS`. Binary and STOP_BIT-free for the same
 /// reason as `EVT_TELEMETRY`: a 0xFE among the millivolts is a value.
 pub const EVT_PMIC_RAILS: u8 = 0x0F;
+// 0x10 is the firmware's ORYX_EVT_GET_SCAN_DIAG, unused by zapp.
+/// Answer to `CMD_GET_DIAG`. Binary and STOP_BIT-free: a 0xFE in it is data.
+pub const EVT_DIAG: u8 = 0x11;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
@@ -760,6 +767,391 @@ pub struct ChargeTelemetry {
     pub right: HalfDetail,
 }
 
+/// `EVT_DIAG` page format this host understands. A board answering 0 has the
+/// command but no diagnostics.
+pub const DIAG_PAGE_VERSION: u8 = 1;
+/// Layout version of the STM32 and left nRF records this host understands.
+pub const DIAG_RECORD_VERSION: u8 = 1;
+/// `EVT_DIAG` payload size: the bytes after the opcode.
+pub const DIAG_PAGE_SIZE: usize = 31;
+/// Record bytes carried per page.
+pub const DIAG_PAGE_DATA: usize = 24;
+/// `CMD_GET_DIAG` flag: re-fetch both left nRF records from the nRF now.
+pub const DIAG_FETCH: u8 = 0x01;
+/// `DiagPage::age_ms` for a page 65.5 s old or older, or of unknown age.
+pub const DIAG_AGE_UNKNOWN: u16 = 0xFFFF;
+/// A record's age field that never started counting.
+pub const DIAG_NEVER: u32 = 0xFFFF_FFFF;
+/// STM32 record size, layout version 1.
+pub const STM32_DIAG_SIZE: usize = 48;
+/// Left nRF record size, layout version 1.
+pub const LEFT_DIAG_SIZE: usize = 90;
+
+/// Byte offsets inside the `EVT_DIAG` payload.
+mod diag_page_offset {
+    pub const VERSION: usize = 0;
+    pub const RECORD: usize = 1;
+    pub const PAGE: usize = 2;
+    pub const STATUS: usize = 3;
+    pub const TOTAL_LEN: usize = 4;
+    pub const AGE_MS: usize = 5;
+    pub const DATA: usize = 7;
+}
+
+/// The four records `CMD_GET_DIAG` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DiagRecord {
+    Stm32 = 0,
+    Stm32Previous = 1,
+    Left = 2,
+    LeftPrevious = 3,
+}
+
+impl DiagRecord {
+    pub const ALL: [DiagRecord; 4] = [
+        DiagRecord::Stm32,
+        DiagRecord::Stm32Previous,
+        DiagRecord::Left,
+        DiagRecord::LeftPrevious,
+    ];
+
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// Records the STM32 caches from the left nRF.
+    pub fn is_left(self) -> bool {
+        matches!(self, DiagRecord::Left | DiagRecord::LeftPrevious)
+    }
+}
+
+/// Request params for `CMD_GET_DIAG`.
+pub fn diag_request(record: DiagRecord, page: u8, flags: u8) -> [u8; 3] {
+    [record.id(), page, flags]
+}
+
+/// Whether the board had the page asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagStatus {
+    Ok,
+    /// No such record, or never received from the nRF.
+    NoRecord,
+    /// Unknown record, or a page past the end.
+    OutOfRange,
+    Other(u8),
+}
+
+impl DiagStatus {
+    fn from_wire(raw: u8) -> Self {
+        match raw {
+            0 => DiagStatus::Ok,
+            1 => DiagStatus::NoRecord,
+            2 => DiagStatus::OutOfRange,
+            other => DiagStatus::Other(other),
+        }
+    }
+}
+
+/// One `EVT_DIAG` answer: a slice of a record and its header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagPage {
+    pub version: u8,
+    pub record: u8,
+    pub page: u8,
+    pub status: DiagStatus,
+    /// Record size in bytes; 0 unless `status` is `Ok`.
+    pub total_len: u8,
+    /// Left records: ms since the page arrived from the nRF. 0 for STM32.
+    pub age_ms: u16,
+    pub data: [u8; DIAG_PAGE_DATA],
+}
+
+/// Decode an `EVT_DIAG` payload, the bytes after the opcode. `None` when short.
+pub fn parse_diag_page(params: &[u8]) -> Option<DiagPage> {
+    use diag_page_offset as at;
+
+    let params = params.get(..DIAG_PAGE_SIZE)?;
+    let mut data = [0u8; DIAG_PAGE_DATA];
+    data.copy_from_slice(&params[at::DATA..at::DATA + DIAG_PAGE_DATA]);
+    Some(DiagPage {
+        version: params[at::VERSION],
+        record: params[at::RECORD],
+        page: params[at::PAGE],
+        status: DiagStatus::from_wire(params[at::STATUS]),
+        total_len: params[at::TOTAL_LEN],
+        age_ms: le16(params, at::AGE_MS),
+        data,
+    })
+}
+
+/// Pages a record of `total_len` bytes spans.
+pub fn diag_page_count(total_len: u8) -> u8 {
+    total_len.div_ceil(DIAG_PAGE_DATA as u8)
+}
+
+/// Joins a record's pages, given in order from page 0, into its bytes.
+///
+/// `None` unless every page is `Ok`, of the same record and size, and all of
+/// them are there.
+pub fn assemble_diag_record(pages: &[DiagPage]) -> Option<Vec<u8>> {
+    let first = pages.first()?;
+    if pages.len() != usize::from(diag_page_count(first.total_len).max(1)) {
+        return None;
+    }
+    let consistent = pages.iter().enumerate().all(|(index, page)| {
+        page.status == DiagStatus::Ok
+            && usize::from(page.page) == index
+            && page.record == first.record
+            && page.total_len == first.total_len
+    });
+    if !consistent {
+        return None;
+    }
+    let mut bytes: Vec<u8> = pages.iter().flat_map(|page| page.data).collect();
+    bytes.truncate(usize::from(first.total_len));
+    Some(bytes)
+}
+
+fn le16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn le32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// The first `size` bytes of a record whose version this host knows.
+///
+/// A record shorter than `size`, by its `len` byte or by the bytes present, is
+/// refused whole; a longer one decodes its known prefix.
+fn diag_record(bytes: &[u8], size: usize) -> Option<&[u8]> {
+    let version = *bytes.first()?;
+    let len = usize::from(*bytes.get(1)?);
+    if version != DIAG_RECORD_VERSION || len + 2 < size {
+        return None;
+    }
+    bytes.get(..size)
+}
+
+// STM32 record `flags` bits.
+pub const STM32_DIAG_LINK_UP: u8 = 0x01;
+pub const STM32_DIAG_NRF_VBUS: u8 = 0x02;
+pub const STM32_DIAG_USB_HOST: u8 = 0x04;
+pub const STM32_DIAG_BLE_HOST: u8 = 0x08;
+pub const STM32_DIAG_TRRS: u8 = 0x10;
+pub const STM32_DIAG_RIGHT_LEDS: u8 = 0x20;
+pub const STM32_DIAG_VBUS_SEEN: u8 = 0x40;
+
+// STM32 record `reset_flags` bits (RCC_CSR[31:24]).
+pub const STM32_RESET_IWDG: u8 = 0x20;
+pub const STM32_RESET_WWDG: u8 = 0x40;
+
+const STM32_RESET_CAUSES: &[(u8, &str)] = &[
+    (0x02, "option-byte load"),
+    (0x04, "reset pin"),
+    (0x08, "power-on"),
+    (0x10, "software reset"),
+    (STM32_RESET_IWDG, "watchdog"),
+    (STM32_RESET_WWDG, "window watchdog"),
+    (0x80, "low-power reset"),
+];
+
+/// Names of the causes set in an STM32 record's `reset_flags`.
+pub fn stm32_reset_causes(flags: u8) -> Vec<&'static str> {
+    bit_names(flags, STM32_RESET_CAUSES)
+}
+
+/// The STM32's own record of a boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stm32Diag {
+    pub boot_count: u16,
+    pub uptime_s: u32,
+    pub reset_flags: u8,
+    pub flags: u8,
+    /// 0 pending, 1 Bluetooth, 2 USB.
+    pub transport: u8,
+    /// 0 active, otherwise asleep or staged.
+    pub idle_step: u8,
+    /// 0 absent, 1 OK, 2 version mismatch, 0xFF unknown.
+    pub right_link: u8,
+    /// 0 waiting for a verdict, 1 ok, 2 critical battery, 3 done/shipping.
+    pub power_gate: u8,
+    pub link_ups: u16,
+    pub sd_overruns: u16,
+    pub sd_framing: u16,
+    pub sd_noise: u16,
+    pub sd_parity: u16,
+    pub sd_queue_full: u16,
+    pub parser_resyncs: u16,
+    pub crc_errors: u16,
+    pub frame_aborts: u16,
+    pub frames_rx: u32,
+    pub frames_tx: u32,
+    /// `DIAG_NEVER` when no frame has arrived.
+    pub rx_age_ms: u32,
+    pub max_rx_gap_ms: u32,
+}
+
+/// Decode an STM32 record (see [`diag_record`] for the length rule).
+pub fn parse_stm32_diag(bytes: &[u8]) -> Option<Stm32Diag> {
+    let b = diag_record(bytes, STM32_DIAG_SIZE)?;
+    Some(Stm32Diag {
+        boot_count: le16(b, 2),
+        uptime_s: le32(b, 4),
+        reset_flags: b[8],
+        flags: b[9],
+        transport: b[10],
+        idle_step: b[11],
+        right_link: b[12],
+        power_gate: b[13],
+        link_ups: le16(b, 14),
+        sd_overruns: le16(b, 16),
+        sd_framing: le16(b, 18),
+        sd_noise: le16(b, 20),
+        sd_parity: le16(b, 22),
+        sd_queue_full: le16(b, 24),
+        parser_resyncs: le16(b, 26),
+        crc_errors: le16(b, 28),
+        frame_aborts: le16(b, 30),
+        frames_rx: le32(b, 32),
+        frames_tx: le32(b, 36),
+        rx_age_ms: le32(b, 40),
+        max_rx_gap_ms: le32(b, 44),
+    })
+}
+
+// Left nRF record `flags` bits.
+pub const LEFT_DIAG_STM32_LINK: u8 = 0x01;
+pub const LEFT_DIAG_STM32_SLEEP: u8 = 0x02;
+pub const LEFT_DIAG_STM32_USB: u8 = 0x04;
+pub const LEFT_DIAG_STM32_TRRS: u8 = 0x08;
+pub const LEFT_DIAG_BLE_HOST: u8 = 0x10;
+pub const LEFT_DIAG_UART_RX_OFF: u8 = 0x20;
+pub const LEFT_DIAG_VBUS: u8 = 0x40;
+
+// nRF54L15 RESET.RESETREAS bits.
+pub const NRF_RESET_DOG0: u32 = 1 << 1;
+pub const NRF_RESET_DOG1: u32 = 1 << 2;
+pub const NRF_RESET_SREQ: u32 = 1 << 6;
+pub const NRF_RESET_LOCKUP: u32 = 1 << 7;
+
+const NRF_RESET_CAUSES: &[(u32, &str)] = &[
+    (1 << 0, "reset pin"),
+    (NRF_RESET_DOG0, "watchdog 0"),
+    (NRF_RESET_DOG1, "watchdog 1"),
+    (1 << 3, "debugger soft reset"),
+    (1 << 4, "debugger hard reset"),
+    (1 << 5, "debugger reset pin"),
+    (NRF_RESET_SREQ, "software reset"),
+    (NRF_RESET_LOCKUP, "CPU lockup"),
+    (1 << 8, "wake from System OFF"),
+    (1 << 9, "LPCOMP wake"),
+    (1 << 10, "debug interface wake"),
+    (1 << 11, "GRTC wake"),
+    (1 << 12, "NFC wake"),
+    (1 << 13, "tamper detector"),
+];
+
+/// Names of the causes set in a RESETREAS word; 0 is power-on or brownout.
+pub fn nrf_reset_causes(resetreas: u32) -> Vec<&'static str> {
+    if resetreas == 0 {
+        return vec!["power-on or brownout"];
+    }
+    NRF_RESET_CAUSES
+        .iter()
+        .filter(|(bit, _)| resetreas & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// One left nRF thread's wait: current and longest this boot, in ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadStall {
+    pub stall_ms: u32,
+    pub max_stall_ms: u32,
+}
+
+/// Names of `LeftDiag::threads`, in order.
+pub const LEFT_DIAG_THREADS: [&str; 4] = ["main loop", "HID queue", "system workqueue", "UART RX"];
+
+/// The left nRF's record of a boot. Its u16 counters wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeftDiag {
+    pub boot_count: u16,
+    pub uptime_s: u32,
+    pub resetreas: u32,
+    pub flags: u8,
+    /// 0xFF none.
+    pub ble_slot: u8,
+    /// 0 absent, 1 OK, 2 mismatch.
+    pub esb_link: u8,
+    pub stm32_idle_step: u8,
+    /// 1.25 ms units, 0 = no host.
+    pub conn_interval: u16,
+    pub conn_latency: u16,
+    /// 10 ms units.
+    pub conn_timeout: u16,
+    pub uart_frames: u16,
+    pub uart_bad_frames: u16,
+    pub uart_rx_errors: u16,
+    pub uart_rx_overruns: u16,
+    pub uart_rx_line_errors: u16,
+    pub uart_ring_drops: u16,
+    pub uart_rx_restarts: u16,
+    pub kbd_reports: u16,
+    pub kbd_dropped: u16,
+    pub ble_send_errors: u16,
+    pub notify_errors: u16,
+    pub esb_hops: u16,
+    pub esb_timeouts: u16,
+    pub hid_send_max_ms: u16,
+    /// `DIAG_NEVER` when no byte has arrived.
+    pub uart_rx_age_ms: u32,
+    /// `DIAG_NEVER` when no packet has arrived.
+    pub esb_rx_age_ms: u32,
+    /// In `LEFT_DIAG_THREADS` order.
+    pub threads: [ThreadStall; 4],
+}
+
+/// Decode a left nRF record (see [`diag_record`] for the length rule).
+pub fn parse_left_diag(bytes: &[u8]) -> Option<LeftDiag> {
+    let b = diag_record(bytes, LEFT_DIAG_SIZE)?;
+    let thread = |index: usize| ThreadStall {
+        stall_ms: le32(b, 58 + index * 8),
+        max_stall_ms: le32(b, 62 + index * 8),
+    };
+    Some(LeftDiag {
+        boot_count: le16(b, 2),
+        uptime_s: le32(b, 4),
+        resetreas: le32(b, 8),
+        flags: b[12],
+        ble_slot: b[13],
+        esb_link: b[14],
+        stm32_idle_step: b[15],
+        conn_interval: le16(b, 16),
+        conn_latency: le16(b, 18),
+        conn_timeout: le16(b, 20),
+        uart_frames: le16(b, 22),
+        uart_bad_frames: le16(b, 24),
+        uart_rx_errors: le16(b, 26),
+        uart_rx_overruns: le16(b, 28),
+        uart_rx_line_errors: le16(b, 30),
+        uart_ring_drops: le16(b, 32),
+        uart_rx_restarts: le16(b, 34),
+        kbd_reports: le16(b, 36),
+        kbd_dropped: le16(b, 38),
+        ble_send_errors: le16(b, 40),
+        notify_errors: le16(b, 42),
+        esb_hops: le16(b, 44),
+        esb_timeouts: le16(b, 46),
+        hid_send_max_ms: le16(b, 48),
+        uart_rx_age_ms: le32(b, 50),
+        esb_rx_age_ms: le32(b, 54),
+        threads: [thread(0), thread(1), thread(2), thread(3)],
+    })
+}
+
 /// Events from a connected keyboard's raw HID interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidEvent {
@@ -794,6 +1186,8 @@ pub enum HidEvent {
     ChargeTelemetry(ChargeTelemetry),
     /// The board answered `CMD_GET_PMIC_RAILS`.
     PmicRails(PmicRailsReport),
+    /// The board answered `CMD_GET_DIAG` with one page of a record.
+    Diag(DiagPage),
     /// The read loop ended (device unplugged or errored).
     Disconnected,
 }
@@ -818,7 +1212,10 @@ pub fn parse_packet(data: &[u8]) -> Option<(u8, &[u8])> {
     if cmd == STOP_BIT {
         return Some((EVT_GET_PROTOCOL_VERSION, &data[1..data.len().min(2)]));
     }
-    if cmd == EVT_TELEMETRY || cmd == EVT_CHARGE_TELEMETRY || cmd == EVT_PMIC_RAILS {
+    if matches!(
+        cmd,
+        EVT_TELEMETRY | EVT_CHARGE_TELEMETRY | EVT_PMIC_RAILS | EVT_DIAG
+    ) {
         // Binary payload carrying its own length: 0xFE in it is a value, not
         // a terminator, and truncating there would eat a 254% battery or a
         // reserved byte the board deliberately set.
@@ -1086,6 +1483,10 @@ pub fn process_packet(data: &[u8]) -> (Option<HidEvent>, Vec<Packet>) {
         },
         EVT_PMIC_RAILS => match parse_pmic_rails_report(params) {
             Some(report) => HidEvent::PmicRails(report),
+            None => return (None, Vec::new()),
+        },
+        EVT_DIAG => match parse_diag_page(params) {
+            Some(page) => HidEvent::Diag(page),
             None => return (None, Vec::new()),
         },
         EVT_GET_PROTOCOL_VERSION => match params.first() {
@@ -2162,5 +2563,268 @@ mod tests {
         let report = parse_pmic_rails_report(&payload).unwrap();
         assert_eq!(report.left, None);
         assert_eq!(report.right.unwrap().vbus_mv, 4580);
+    }
+
+    /// An STM32 record built field by field, in wire order.
+    fn stm32_record() -> Vec<u8> {
+        let mut b = vec![DIAG_RECORD_VERSION, (STM32_DIAG_SIZE - 2) as u8];
+        b.extend_from_slice(&7u16.to_le_bytes()); // boot_count
+        b.extend_from_slice(&8040u32.to_le_bytes()); // uptime_s
+        b.push(STM32_RESET_IWDG | 0x04); // reset_flags
+        b.push(STM32_DIAG_LINK_UP | STM32_DIAG_USB_HOST | STM32_DIAG_TRRS); // flags
+        b.push(2); // transport
+        b.push(0); // idle_step
+        b.push(1); // right_link
+        b.push(1); // power_gate
+        for value in [3u16, 1, 2, 3, 4, 5, 6, 7, 0xFE] {
+            // link_ups, sd_*, parser_resyncs, crc_errors, frame_aborts
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [123_456u32, 23_456, 12, 0x0001_FEFE] {
+            // frames_rx, frames_tx, rx_age_ms, max_rx_gap_ms
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(b.len(), STM32_DIAG_SIZE);
+        b
+    }
+
+    /// A left nRF record built field by field, in wire order.
+    fn left_record() -> Vec<u8> {
+        let mut b = vec![DIAG_RECORD_VERSION, (LEFT_DIAG_SIZE - 2) as u8];
+        b.extend_from_slice(&2u16.to_le_bytes()); // boot_count
+        b.extend_from_slice(&300u32.to_le_bytes()); // uptime_s
+        b.extend_from_slice(&NRF_RESET_SREQ.to_le_bytes()); // resetreas
+        b.push(LEFT_DIAG_STM32_LINK | LEFT_DIAG_BLE_HOST); // flags
+        b.push(0xFF); // ble_slot
+        b.push(2); // esb_link
+        b.push(1); // stm32_idle_step
+        for value in [12u16, 0, 400] {
+            // conn_interval, conn_latency, conn_timeout
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in 1u16..=14 {
+            // uart_frames .. hid_send_max_ms
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        b.extend_from_slice(&DIAG_NEVER.to_le_bytes()); // uart_rx_age_ms
+        b.extend_from_slice(&5u32.to_le_bytes()); // esb_rx_age_ms
+        for (stall, max) in [(0u32, 47_200u32), (0, 3), (0, 1), (900, 900)] {
+            b.extend_from_slice(&stall.to_le_bytes());
+            b.extend_from_slice(&max.to_le_bytes());
+        }
+        assert_eq!(b.len(), LEFT_DIAG_SIZE);
+        b
+    }
+
+    /// An `EVT_DIAG` report carrying `data` as page `page` of `record`.
+    fn diag_report(record: u8, page: u8, total_len: u8, age_ms: u16, data: &[u8]) -> Vec<u8> {
+        let mut r = vec![EVT_DIAG, DIAG_PAGE_VERSION, record, page, 0, total_len];
+        r.extend_from_slice(&age_ms.to_le_bytes());
+        r.extend_from_slice(data);
+        r.resize(REPORT_SIZE, 0);
+        r
+    }
+
+    /// The pages a record is served as.
+    fn paged(record: u8, bytes: &[u8]) -> Vec<DiagPage> {
+        let total = bytes.len() as u8;
+        (0..diag_page_count(total))
+            .map(|page| {
+                let start = usize::from(page) * DIAG_PAGE_DATA;
+                let end = (start + DIAG_PAGE_DATA).min(bytes.len());
+                let report = diag_report(record, page, total, 0, &bytes[start..end]);
+                match process_packet(&report).0 {
+                    Some(HidEvent::Diag(page)) => page,
+                    other => panic!("not a diag page: {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_diag_reply_is_not_cut_at_a_0xfe_byte() {
+        let report = diag_report(0, 1, 48, 0, &[0xFE; DIAG_PAGE_DATA]);
+        let (evt, params) = parse_packet(&report).unwrap();
+        assert_eq!(evt, EVT_DIAG);
+        assert_eq!(params.len(), DIAG_PAGE_SIZE);
+        let page = parse_diag_page(params).unwrap();
+        assert_eq!(page.data, [0xFE; DIAG_PAGE_DATA]);
+    }
+
+    #[test]
+    fn a_diag_page_decodes_its_header_and_data() {
+        let report = diag_report(3, 2, 90, 0x1234, &[9, 8, 7]);
+        let (event, replies) = process_packet(&report);
+        assert!(replies.is_empty());
+        let Some(HidEvent::Diag(page)) = event else {
+            panic!("not a diag page: {event:?}");
+        };
+        assert_eq!(page.version, DIAG_PAGE_VERSION);
+        assert_eq!((page.record, page.page, page.total_len), (3, 2, 90));
+        assert_eq!(page.status, DiagStatus::Ok);
+        assert_eq!(page.age_ms, 0x1234);
+        assert_eq!(&page.data[..4], &[9, 8, 7, 0]);
+
+        let mut none = diag_report(2, 0, 0, DIAG_AGE_UNKNOWN, &[]);
+        let status = |raw: u8, none: &mut Vec<u8>| {
+            none[4] = raw;
+            parse_diag_page(&none[1..]).unwrap().status
+        };
+        assert_eq!(status(1, &mut none), DiagStatus::NoRecord);
+        assert_eq!(status(2, &mut none), DiagStatus::OutOfRange);
+        assert_eq!(status(9, &mut none), DiagStatus::Other(9));
+
+        // Short replies are dropped.
+        assert_eq!(parse_diag_page(&report[1..DIAG_PAGE_SIZE]), None);
+        assert_eq!(process_packet(&report[..8]).0, None);
+    }
+
+    #[test]
+    fn a_diag_request_is_record_page_flags() {
+        let packet = encode_packet(CMD_GET_DIAG, &diag_request(DiagRecord::Left, 0, DIAG_FETCH));
+        assert_eq!(&packet[..5], &[0x11, 2, 0, 0x01, 0]);
+        assert_eq!(DiagRecord::LeftPrevious.id(), 3);
+        assert!(DiagRecord::Left.is_left() && !DiagRecord::Stm32Previous.is_left());
+    }
+
+    #[test]
+    fn page_count_rounds_up() {
+        assert_eq!(diag_page_count(0), 0);
+        assert_eq!(diag_page_count(24), 1);
+        assert_eq!(diag_page_count(25), 2);
+        assert_eq!(diag_page_count(STM32_DIAG_SIZE as u8), 2);
+        assert_eq!(diag_page_count(LEFT_DIAG_SIZE as u8), 4);
+    }
+
+    #[test]
+    fn pages_reassemble_into_the_record() {
+        let left = left_record();
+        let pages = paged(2, &left);
+        assert_eq!(assemble_diag_record(&pages).unwrap(), left);
+
+        // Missing, reordered or mismatched pages are refused.
+        assert_eq!(assemble_diag_record(&pages[..3]), None);
+        let mut swapped = pages.clone();
+        swapped.swap(1, 2);
+        assert_eq!(assemble_diag_record(&swapped), None);
+        let mut mixed = pages.clone();
+        mixed[1].record = 3;
+        assert_eq!(assemble_diag_record(&mixed), None);
+        let mut failed = pages;
+        failed[3].status = DiagStatus::NoRecord;
+        assert_eq!(assemble_diag_record(&failed), None);
+        assert_eq!(assemble_diag_record(&[]), None);
+    }
+
+    #[test]
+    fn the_stm32_record_decodes_field_by_field() {
+        let diag = parse_stm32_diag(&stm32_record()).unwrap();
+        assert_eq!(
+            diag,
+            Stm32Diag {
+                boot_count: 7,
+                uptime_s: 8040,
+                reset_flags: 0x24,
+                flags: 0x15,
+                transport: 2,
+                idle_step: 0,
+                right_link: 1,
+                power_gate: 1,
+                link_ups: 3,
+                sd_overruns: 1,
+                sd_framing: 2,
+                sd_noise: 3,
+                sd_parity: 4,
+                sd_queue_full: 5,
+                parser_resyncs: 6,
+                crc_errors: 7,
+                frame_aborts: 0xFE,
+                frames_rx: 123_456,
+                frames_tx: 23_456,
+                rx_age_ms: 12,
+                max_rx_gap_ms: 0x0001_FEFE,
+            }
+        );
+    }
+
+    #[test]
+    fn the_left_record_decodes_field_by_field() {
+        let diag = parse_left_diag(&left_record()).unwrap();
+        assert_eq!(diag.boot_count, 2);
+        assert_eq!(diag.uptime_s, 300);
+        assert_eq!(diag.resetreas, NRF_RESET_SREQ);
+        assert_eq!(diag.flags, LEFT_DIAG_STM32_LINK | LEFT_DIAG_BLE_HOST);
+        assert_eq!(diag.ble_slot, 0xFF);
+        assert_eq!(diag.esb_link, 2);
+        assert_eq!(diag.stm32_idle_step, 1);
+        assert_eq!(diag.conn_interval, 12);
+        assert_eq!(diag.conn_latency, 0);
+        assert_eq!(diag.conn_timeout, 400);
+        let counters = [
+            diag.uart_frames,
+            diag.uart_bad_frames,
+            diag.uart_rx_errors,
+            diag.uart_rx_overruns,
+            diag.uart_rx_line_errors,
+            diag.uart_ring_drops,
+            diag.uart_rx_restarts,
+            diag.kbd_reports,
+            diag.kbd_dropped,
+            diag.ble_send_errors,
+            diag.notify_errors,
+            diag.esb_hops,
+            diag.esb_timeouts,
+            diag.hid_send_max_ms,
+        ];
+        assert_eq!(counters, core::array::from_fn(|i| i as u16 + 1));
+        assert_eq!(diag.uart_rx_age_ms, DIAG_NEVER);
+        assert_eq!(diag.esb_rx_age_ms, 5);
+        let stalls = diag.threads.map(|t| (t.stall_ms, t.max_stall_ms));
+        assert_eq!(stalls, [(0, 47_200), (0, 3), (0, 1), (900, 900)]);
+    }
+
+    #[test]
+    fn a_record_of_another_version_is_refused() {
+        let mut stm32 = stm32_record();
+        stm32[0] = DIAG_RECORD_VERSION + 1;
+        assert_eq!(parse_stm32_diag(&stm32), None);
+        let mut left = left_record();
+        left[0] = 0;
+        assert_eq!(parse_left_diag(&left), None);
+    }
+
+    #[test]
+    fn a_short_record_is_refused_and_a_longer_one_decodes() {
+        let stm32 = stm32_record();
+        assert_eq!(parse_stm32_diag(&stm32[..STM32_DIAG_SIZE - 1]), None);
+        assert_eq!(parse_stm32_diag(&stm32[..2]), None);
+        assert_eq!(parse_stm32_diag(&[]), None);
+
+        // A len byte that stops short refuses it even when the bytes are there.
+        let mut short_len = stm32.clone();
+        short_len[1] -= 1;
+        assert_eq!(parse_stm32_diag(&short_len), None);
+
+        let mut longer = left_record();
+        longer[1] += 2;
+        longer.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(parse_left_diag(&longer), parse_left_diag(&left_record()));
+    }
+
+    #[test]
+    fn reset_causes_are_named() {
+        assert_eq!(nrf_reset_causes(0), ["power-on or brownout"]);
+        assert_eq!(nrf_reset_causes(NRF_RESET_SREQ), ["software reset"]);
+        assert_eq!(
+            nrf_reset_causes(1 | NRF_RESET_DOG1 | NRF_RESET_LOCKUP | 1 << 13),
+            ["reset pin", "watchdog 1", "CPU lockup", "tamper detector"]
+        );
+        assert!(nrf_reset_causes(1 << 20).is_empty());
+        assert_eq!(stm32_reset_causes(0x0C), ["reset pin", "power-on"]);
+        assert_eq!(
+            stm32_reset_causes(STM32_RESET_IWDG | 0x04),
+            ["reset pin", "watchdog"]
+        );
+        assert!(stm32_reset_causes(0x01).is_empty());
     }
 }
