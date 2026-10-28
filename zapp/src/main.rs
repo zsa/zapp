@@ -84,11 +84,14 @@ enum Commands {
             Wired boards are read straight from USB. Bluetooth boards are listed \
             when they are connected to this machine, bonded to it, or advertising \
             in range, and --scan holds a discovery window open for boards that have \
-            never been paired.")]
+            never been paired. --skip-bluetooth lists the USB boards only.")]
     Devices {
         /// Scan for boards that have never been paired to this machine
         #[arg(long)]
         scan: bool,
+        /// Only list boards on USB; skip the Bluetooth search
+        #[arg(long, conflicts_with = "scan")]
+        skip_bluetooth: bool,
         /// Also ask each half what its cell and its charger are reading
         #[arg(long, short = 'v')]
         verbose: bool,
@@ -172,7 +175,11 @@ fn dispatch(command: Commands) -> Result<()> {
             }
         }
         Commands::Update => cmd_update(),
-        Commands::Devices { scan, verbose } => cmd_devices(scan, verbose),
+        Commands::Devices {
+            scan,
+            skip_bluetooth,
+            verbose,
+        } => cmd_devices(scan, skip_bluetooth, verbose),
         Commands::Live { device } => cmd_live(device.as_deref()),
         Commands::Diag => diag::run(),
         Commands::Bond { key, show } => {
@@ -242,7 +249,7 @@ fn cmd_live(device: Option<&str>) -> Result<()> {
 const BLE_SETTLE: Duration = Duration::from_millis(750);
 const BLE_SCAN: Duration = Duration::from_secs(7);
 
-fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
+fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
     let wired = device::list_devices();
 
     // The Bluetooth identities the boards on the cable named, which the roster
@@ -268,6 +275,10 @@ fn cmd_devices(scan: bool, verbose: bool) -> Result<()> {
             }
         }
         Err(err) => println!("  cannot scan: {err}"),
+    }
+
+    if skip_bluetooth {
+        return Ok(());
     }
 
     let monitor = BleMonitor::start(&[]);
