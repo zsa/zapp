@@ -18,12 +18,17 @@ CrabNebula Cloud, where `zapp upgrade` looks for updates.
 Set these under Settings → Secrets and variables → Actions, next to the existing
 Apple and Azure signing secrets.
 
+The three downloads secrets (`DOWNLOADS_CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `DOWNLOADS_DISPATCH_TOKEN`) live in the `release`
+environment (Settings → Environments → `release`), not at repo level; the
+`downloads` job reads them from there.
+
 | Secret | What it is |
 | --- | --- |
 | `CN_API_KEY` | CrabNebula Cloud API key with read/write, from the org's API keys tab |
 | `ZAPP_UPDATER_PRIVATE_KEY` | Contents of `~/.tauri/zapp.key`, the updater signing key |
 | `DOWNLOADS_CLOUDFLARE_API_TOKEN` | Cloudflare API token with R2 write access to the `zsa-downloads` bucket (Object Read & Write, scoped to that bucket) |
-| `DOWNLOADS_CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account ID that owns `zsa-downloads` |
+| `CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account ID that owns `zsa-downloads` |
 | `DOWNLOADS_DISPATCH_TOKEN` | Fine-grained GitHub token limited to `zsa/downloads`, with Contents read and write |
 
 ```sh

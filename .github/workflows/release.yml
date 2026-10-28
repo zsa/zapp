@@ -414,6 +414,7 @@ jobs:
   downloads:
     needs: release
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
 
@@ -443,7 +444,7 @@ jobs:
       - name: Upload to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.DOWNLOADS_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.DOWNLOADS_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           version=${GITHUB_REF_NAME#v}
           for file in downloads/*; do
