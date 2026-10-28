@@ -2,6 +2,7 @@ mod diag;
 mod flash_log;
 mod nrf_wired;
 mod screen;
+mod upgrade;
 mod zsab;
 
 use std::fs::File;
@@ -145,6 +146,25 @@ enum Commands {
             zapp diag > voyager2-diag.txt"
     )]
     Diag,
+    /// Update zapp itself to the newest release
+    #[command(
+        long_about = "Update zapp itself to the newest release.\n\n\
+            Asks the ZSA update server for a newer zapp, shows its release \
+            notes, and on confirmation downloads it, checks its signature and \
+            replaces this zapp with it. --check only reports.",
+        after_long_help = "Examples:\n  \
+            zapp upgrade\n  \
+            zapp upgrade --check\n  \
+            zapp upgrade --yes"
+    )]
+    Upgrade {
+        /// Install without asking
+        #[arg(long, short = 'y', conflicts_with = "check")]
+        yes: bool,
+        /// Only report whether a newer zapp exists
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// Runs the command the arguments name, and says one line about a failure.
@@ -182,6 +202,7 @@ fn dispatch(command: Commands) -> Result<()> {
         } => cmd_devices(scan, skip_bluetooth, verbose),
         Commands::Live { device } => cmd_live(device.as_deref()),
         Commands::Diag => diag::run(),
+        Commands::Upgrade { yes, check } => upgrade::run(yes, check),
         Commands::Bond { key, show } => {
             if show {
                 if key.is_some() {

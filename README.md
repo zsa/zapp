@@ -180,6 +180,16 @@ This reads the layout and revision from the keyboard's USB serial number, checks
 
 > **Note:** This only works if your keyboard is currently flashed with firmware from Oryx and is not in bootloader mode.
 
+### Update zapp itself
+
+```sh
+zapp upgrade          # show what's new and ask before installing
+zapp upgrade --check  # only report
+zapp upgrade --yes    # install without asking
+```
+
+Copies installed through Nix, Homebrew, mise or a Linux package manager are updated through that package manager instead.
+
 ### Flashing process
 
 After loading or downloading firmware, zapp waits for the keyboard to enter bootloader mode. Reset your keyboard (e.g., press the reset button or use a key combo), and zapp will detect it and flash automatically:
