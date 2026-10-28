@@ -10,9 +10,36 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CN_APPLICATION: zsa-technology-labs-inc/io-zsa-zapp
 
 jobs:
+  # Fails the tag before anything is built or published.
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check release notes
+        run: |
+          file="release-notes/$GITHUB_REF_NAME.md"
+          if [ ! -s "$file" ] || [ -z "$(tr -d '[:space:]' < "$file")" ]; then
+            echo "::error::$file is missing or empty"
+            exit 1
+          fi
+
+      # zapp upgrade compares the server's version with the binary's own.
+      - name: Check tag matches the crate version
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' zapp/Cargo.toml | head -n 1)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match zapp/Cargo.toml version $crate"
+            exit 1
+          fi
+
   build:
+    needs: preflight
     strategy:
       matrix:
         include:
@@ -259,8 +286,124 @@ jobs:
       #   with:
       #     subject-path: "artifacts/*"
 
+      # Writes <archive>.sig next to each archive, for zapp upgrade.
+      - name: Sign archives for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.ZAPP_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          for file in artifacts/*.tar.gz artifacts/*.zip; do
+            npx --yes @tauri-apps/cli@2 signer sign "$file"
+            test -s "$file.sig"
+          done
+
+      - name: Read version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Draft Cloud release
+        id: cn_draft
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release draft ${{ env.CN_APPLICATION }} ${{ steps.version.outputs.version }}
+            --notes-file release-notes/${{ github.ref_name }}.md
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      # The command prints a version line before its JSON.
+      - name: Read Cloud release id
+        id: cn_release
+        env:
+          CN_STDOUT: ${{ steps.cn_draft.outputs.stdout }}
+        run: |
+          json=$(printf '%s\n' "$CN_STDOUT" | sed -n '/^{/,$p')
+          id=$(printf '%s\n' "$json" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            echo "::error::could not read the release id from the draft output"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$json" | jq -r '.notes // empty')" = "" ]; then
+            echo "::error::the draft came back without notes"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "release $id"
+
+      - name: Upload linux-x86_64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform linux-x86_64
+            --public-platform cli-linux-x86_64
+            --file artifacts/zapp-linux-x86_64.tar.gz
+            --signature artifacts/zapp-linux-x86_64.tar.gz.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      - name: Upload linux-aarch64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform linux-aarch64
+            --public-platform cli-linux-aarch64
+            --file artifacts/zapp-linux-aarch64.tar.gz
+            --signature artifacts/zapp-linux-aarch64.tar.gz.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      - name: Upload windows-x86_64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform windows-x86_64
+            --public-platform cli-windows-x86_64
+            --file artifacts/zapp-windows-x86_64.zip
+            --signature artifacts/zapp-windows-x86_64.zip.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      - name: Upload windows-aarch64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform windows-aarch64
+            --public-platform cli-windows-aarch64
+            --file artifacts/zapp-windows-aarch64.zip
+            --signature artifacts/zapp-windows-aarch64.zip.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      # Cloud has no universal platform: the universal archive answers both arches.
+      - name: Upload darwin-x86_64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform darwin-x86_64
+            --public-platform cli-darwin-x86_64
+            --file artifacts/zapp-macos-universal.tar.gz
+            --signature artifacts/zapp-macos-universal.tar.gz.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
+      - name: Upload darwin-aarch64
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: >-
+            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+            --update-platform darwin-aarch64
+            --public-platform cli-darwin-aarch64
+            --file artifacts/zapp-macos-universal.tar.gz
+            --signature artifacts/zapp-macos-universal.tar.gz.sig
+          api-key: ${{ secrets.CN_API_KEY }}
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-notes/${{ github.ref_name }}.md
           files: artifacts/*
+
+      - name: Publish Cloud release
+        uses: crabnebula-dev/cloud-release@v0
+        with:
+          command: release publish ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
+          api-key: ${{ secrets.CN_API_KEY }}
