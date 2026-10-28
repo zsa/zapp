@@ -15,6 +15,8 @@ mod bluez;
 mod bluez_gatt;
 #[cfg(target_os = "macos")]
 mod corebluetooth;
+#[cfg(target_os = "windows")]
+mod winrt;
 
 /// An open link to one characteristic on one board.
 ///
@@ -146,7 +148,11 @@ pub fn read_charge_detail(key: &str) -> Option<ChargeDetail> {
     {
         corebluetooth::read_charge_detail(key)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        winrt::read_charge_detail(key)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = key;
         None
@@ -178,7 +184,15 @@ pub fn for_platform(known: &[String]) -> Option<Box<dyn Backend>> {
         Some(Box::new(corebluetooth::CoreBluetooth::new(known)))
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // Always a backend, for the same reason. Windows keeps its own bonding
+    // database, so there is nothing for `known` to seed.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = known;
+        Some(Box::new(winrt::WinRt::new()))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = known;
         None

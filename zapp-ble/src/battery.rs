@@ -27,7 +27,7 @@ const LEFT: u16 = 0x010D;
 const RIGHT: u16 = 0x010E;
 
 /// Which half a Battery Service instance speaks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
     /// The board as a whole, which is the lower of the two halves.
     Keyboard,

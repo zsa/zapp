@@ -98,13 +98,20 @@ impl BleBoard {
 /// The Bluetooth address a platform handle spells out, or `None`.
 ///
 /// BlueZ names a device by the address it is bonded to — `dev_FE_DB_E9_A8_B1_36`
-/// at the end of the object path — so the handle already carries the identity
-/// and no round trip to the board is needed for it. Handles of any other shape,
-/// which is every other platform's, carry no address to read.
+/// at the end of the object path — and Windows by the adapter's address and the
+/// device's — `BluetoothLE#BluetoothLEb4:8c:9d:35:f7:86-fe:db:e9:a8:b1:36` — so
+/// the handle already carries the identity and no round trip to the board is
+/// needed for it. CoreBluetooth's handles carry no address to read.
 fn address_from_key(key: &str) -> Option<String> {
-    let tail = key.rsplit('/').next()?.strip_prefix("dev_")?;
+    let tail = match key.strip_prefix("BluetoothLE#") {
+        Some(windows) => windows.rsplit('-').next()?,
+        None => key.rsplit('/').next()?.strip_prefix("dev_")?,
+    };
 
-    let octets: Vec<String> = tail.split('_').map(|o| o.to_ascii_uppercase()).collect();
+    let octets: Vec<String> = tail
+        .split(['_', ':'])
+        .map(|o| o.to_ascii_uppercase())
+        .collect();
     let well_formed = octets.len() == 6
         && octets
             .iter()
@@ -181,6 +188,20 @@ mod tests {
         assert_eq!(
             address_from_key("dev_fe_db_e9_a8_b1_36").as_deref(),
             Some("FE:DB:E9:A8:B1:36")
+        );
+    }
+
+    #[test]
+    fn a_windows_handle_carries_the_device_address_after_the_adapters() {
+        assert_eq!(
+            address_from_key("BluetoothLE#BluetoothLEb4:8c:9d:35:f7:86-fe:db:e9:a8:b1:36")
+                .as_deref(),
+            Some("FE:DB:E9:A8:B1:36")
+        );
+        // The adapter's own address is not the board's.
+        assert_eq!(
+            address_from_key("BluetoothLE#BluetoothLEb4:8c:9d:35:f7:86"),
+            None
         );
     }
 
