@@ -23,6 +23,17 @@ use crate::WiredError;
 /// How many events to keep for a caller trying to explain a failure.
 const EVENT_HISTORY: usize = 16;
 
+/// How long a left read waits for its first byte before sending a lone
+/// newline, which wakes MCUboot's serial recovery if it slept on a whole
+/// request. MCUboot drops the blank line.
+const NUDGE_FIRST: Duration = Duration::from_millis(250);
+
+/// The wait between further newlines while the left half stays silent.
+const NUDGE_EVERY: Duration = Duration::from_secs(1);
+
+/// The most newlines one read sends; MCUboot has 8 line buffers.
+const NUDGE_MAX: u32 = 4;
+
 /// The half of a transport that does not depend on how frames are split.
 struct Wired<L: IgnitionLink> {
     ignition: Ignition<L>,
@@ -84,8 +95,15 @@ impl<L: IgnitionLink> Wired<L> {
     }
 
     /// The next SMP frame, or nothing by `timeout`.
+    ///
+    /// On the left, a read that has received nothing sends wake-up newlines
+    /// after [`NUDGE_FIRST`], then every [`NUDGE_EVERY`], at most
+    /// [`NUDGE_MAX`] times.
     fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, WiredError> {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut nudges = 0;
+        let mut next_nudge = (self.target == Target::Left).then_some(start + NUDGE_FIRST);
         loop {
             if let Some(frame) = self.drain()? {
                 return Ok(Some(frame));
@@ -95,13 +113,39 @@ impl<L: IgnitionLink> Wired<L> {
                 self.log_held();
                 return Ok(None);
             }
-            let bytes = self.ignition.receive(left)?;
+            let until_nudge = next_nudge
+                .map(|at| at.saturating_duration_since(Instant::now()))
+                .filter(|wait| *wait < left);
+            let bytes = self.ignition.receive(until_nudge.unwrap_or(left))?;
             if bytes.is_empty() {
-                // The link waited out the time there was and nothing came.
-                self.log_held();
-                return Ok(None);
+                if until_nudge.is_none() {
+                    // The link waited out the time there was and nothing came.
+                    self.log_held();
+                    return Ok(None);
+                }
+                self.nudge(start);
+                nudges += 1;
+                next_nudge = (nudges < NUDGE_MAX).then(|| Instant::now() + NUDGE_EVERY);
+                continue;
             }
+            next_nudge = None;
             self.messages.push(&bytes);
+        }
+    }
+
+    /// Sends the left half a lone newline; a failure is only logged.
+    fn nudge(&mut self, start: Instant) {
+        log::debug!(
+            "{:?}: no reply after {} ms, sending a wake-up newline",
+            self.target,
+            start.elapsed().as_millis()
+        );
+        let sent = self
+            .ignition
+            .send(self.target, b"\n")
+            .and_then(|()| self.ignition.flush(self.target));
+        if let Err(err) = sent {
+            log::debug!("{:?}: wake-up newline not sent: {err}", self.target);
         }
     }
 
@@ -268,6 +312,8 @@ mod tests {
         written: Vec<Vec<u8>>,
         inbound: VecDeque<Vec<u8>>,
         status: Vec<u8>,
+        /// The timeout of every `bulk_in`, which returns at once either way.
+        waits: Vec<Duration>,
     }
 
     impl IgnitionLink for Wire {
@@ -286,7 +332,8 @@ mod tests {
             self.written.push(message.to_vec());
             Ok(())
         }
-        fn bulk_in(&mut self, _timeout: Duration) -> Result<Vec<u8>, WiredError> {
+        fn bulk_in(&mut self, timeout: Duration) -> Result<Vec<u8>, WiredError> {
+            self.waits.push(timeout);
             Ok(self.inbound.pop_front().unwrap_or_default())
         }
     }
@@ -483,5 +530,100 @@ mod tests {
         let err = transport.read(Duration::from_secs(30)).unwrap_err();
         assert!(matches!(err, TransportError::Closed), "{err}");
         assert_eq!(transport.events(), [event]);
+    }
+
+    /// The newlines a read sent, one `DATA` and one `FLUSH` each.
+    fn nudges(written: &[Vec<u8>]) -> usize {
+        let newlines = payloads(written)
+            .iter()
+            .filter(|payload| payload.as_slice() == b"\n")
+            .count();
+        assert_eq!(payloads(written).len(), newlines, "only newlines were sent");
+        newlines
+    }
+
+    #[test]
+    fn a_silent_left_half_gets_a_bounded_number_of_wake_up_newlines() {
+        let mut transport =
+            LeftTransport::with_payload_budget(Ignition::new(Wire::default()), 1024);
+        assert_eq!(transport.read(Duration::from_secs(30)).unwrap(), None);
+
+        let wire = transport.into_ignition().into_link();
+        assert_eq!(nudges(&wire.written), NUDGE_MAX as usize);
+        assert_eq!(wire.written.len(), 2 * NUDGE_MAX as usize);
+        assert!(wire
+            .written
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|message| *message == pipe::flush(Target::Left)));
+        // Waits sliced at the nudge times, then the rest of the timeout.
+        assert_eq!(wire.waits.len(), NUDGE_MAX as usize + 1);
+        assert!(wire.waits[0] <= NUDGE_FIRST);
+        assert!(wire.waits[1..NUDGE_MAX as usize]
+            .iter()
+            .all(|wait| *wait <= NUDGE_EVERY && *wait > NUDGE_EVERY / 2));
+        assert!(wire.waits[NUDGE_MAX as usize] > Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_left_read_shorter_than_the_first_nudge_sends_nothing() {
+        let mut transport =
+            LeftTransport::with_payload_budget(Ignition::new(Wire::default()), 1024);
+        assert_eq!(transport.read(Duration::from_millis(5)).unwrap(), None);
+        assert!(transport.into_ignition().into_link().written.is_empty());
+    }
+
+    #[test]
+    fn a_silent_right_half_gets_no_wake_up_newlines() {
+        let mut transport =
+            RightTransport::with_payload_budget(Ignition::new(Wire::default()), 1024);
+        assert_eq!(transport.read(Duration::from_secs(30)).unwrap(), None);
+
+        let wire = transport.into_ignition().into_link();
+        assert!(wire.written.is_empty());
+        assert_eq!(wire.waits.len(), 1);
+    }
+
+    #[test]
+    fn a_left_reply_that_is_already_there_gets_no_wake_up_newline() {
+        let frame = b"the reply".to_vec();
+        let mut inbound = VecDeque::new();
+        inbound.push_back(pipe::data(Target::Left, &nlip::encode_concat(&frame).unwrap()).unwrap());
+
+        let mut transport = LeftTransport::with_payload_budget(
+            Ignition::new(Wire {
+                inbound,
+                ..Wire::default()
+            }),
+            1024,
+        );
+        assert_eq!(
+            transport.read(Duration::from_secs(30)).unwrap(),
+            Some(frame)
+        );
+        assert!(transport.into_ignition().into_link().written.is_empty());
+    }
+
+    #[test]
+    fn a_left_read_stops_nudging_once_bytes_arrive() {
+        let frame = b"the reply".to_vec();
+        let message = pipe::data(Target::Left, &nlip::encode_concat(&frame).unwrap()).unwrap();
+        let front = &message[..message.len() / 2];
+        // Silent once, then the front of a reply, then silent until the deadline.
+        let inbound = VecDeque::from([Vec::new(), front.to_vec()]);
+
+        let mut transport = LeftTransport::with_payload_budget(
+            Ignition::new(Wire {
+                inbound,
+                ..Wire::default()
+            }),
+            1024,
+        );
+        assert_eq!(transport.read(Duration::from_secs(30)).unwrap(), None);
+        let wire = transport.into_ignition().into_link();
+        assert_eq!(nudges(&wire.written), 1);
+        // The wait after the bytes is the rest of the timeout, not a slice.
+        assert!(wire.waits[2] > Duration::from_secs(20));
     }
 }
