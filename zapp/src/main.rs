@@ -44,6 +44,15 @@ enum Commands {
             coming from Oryx and is not currently in bootloader mode."
     )]
     Update,
+    /// Open Oryx URL for your current keyboard layout.
+    #[command(
+        long_about = "Open Oryx URL for your current keyboard layout.\n\n\
+            Detects a connected ZSA keyboard, reads its layout, and opens its \
+            Oryx layout page in your default browser. \n\
+            Note: This only works if your keyboard is currently flashed with a firmware \
+            coming from Oryx and is not currently in bootloader mode."
+    )]
+    Edit
 }
 
 fn main() -> Result<()> {
@@ -62,6 +71,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Update => cmd_update(),
+        Commands::Edit => cmd_edit()
     }
 }
 
@@ -141,6 +151,40 @@ fn cmd_update() -> Result<()> {
     let fw = download_firmware(&latest, variant)?;
     print_firmware_info(&fw);
     wait_and_flash(&fw)
+}
+
+fn cmd_edit() -> Result<()> {
+    let connected = device::find_keyboard().context("Failed to scan USB devices")?;
+    println!("Found {} connected", connected.keyboard);
+
+    // Same process of reading the keyboard as Update
+    let Some((layout_id, _)) = connected.serial.split_once('/') else {
+        bail!(
+            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
+        );
+    };
+
+    if layout_id.is_empty(){
+        bail!(
+            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
+        );
+    }
+
+    // Open the given webpage, doing some keyboard type magic to make the URL
+    let path_string = format!("https://configure.zsa.io/{}/layouts/{}/latest", 
+        connected.keyboard.to_string().to_lowercase().replace(" ", "-"), layout_id);
+
+    let path = path_string.trim();
+
+    match open::that(path){
+        Ok(_) => println!("Opened Oryx URL for layout {} successfully.\n\
+                If your browser was not automatically opened, please use the following URL:\n\
+                \t{}", layout_id, path),
+        Err(err) => eprintln!("An error occurred when opening Oryx URL for layout {}: {}\n\
+                \t{}", layout_id, err, path),
+    }
+
+    Ok(())
 }
 
 /// Print the commit message attached to a revision. A revision may carry no
