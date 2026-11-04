@@ -1,4 +1,4 @@
-//! `zapp diag`: the Voyager 2's diagnostic records, read over USB raw HID.
+//! `zapp diag`: the Wireless Voyager's diagnostic records, read over USB raw HID.
 
 use std::fmt::Write as _;
 use std::thread;
@@ -31,7 +31,7 @@ const FRESH_SLACK_MS: u128 = 100;
 const NO_ANSWER: &str = "The keyboard firmware did not answer the diagnostic request. \
     It may predate this feature; update it and retry.";
 
-/// Reads every record off the attached Voyager 2 and prints them.
+/// Reads every record off the attached Wireless Voyager and prints them.
 pub fn run() -> Result<()> {
     let devices = device::list_devices().context("could not list USB devices")?;
     let (device, count) = pick(&devices)?;
@@ -59,7 +59,7 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// The first Voyager 2 running its keyboard firmware, and how many there are.
+/// The first Wireless Voyager running its keyboard firmware, and how many there are.
 fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
     let voyagers: Vec<&UsbDevice> = devices
         .iter()
@@ -72,11 +72,11 @@ fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
         .collect();
     match running.first() {
         Some(device) => Ok((device, running.len())),
-        None if voyagers.is_empty() => bail!("No Voyager 2 found on USB."),
+        None if voyagers.is_empty() => bail!("No Wireless Voyager found on USB."),
         None => bail!(
-            "The Voyager 2 is in its bootloader. Restart it into the keyboard firmware (hold \
-             any left-half key for 5 seconds, or run a zapp command that restarts it), then \
-             run `zapp diag` again."
+            "The Wireless Voyager is in its bootloader. Restart it into the keyboard \
+             firmware (hold any left-half key for 5 seconds, or run a zapp command that \
+             restarts it), then run `zapp diag` again."
         ),
     }
 }
@@ -85,7 +85,7 @@ fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
 struct Header {
     product: String,
     serial: Option<String>,
-    /// Further Voyager 2 keyboards on USB, not read.
+    /// Further Wireless Voyager keyboards on USB, not read.
     others: usize,
     firmware: Option<(String, String)>,
     protocol: Option<u8>,
@@ -283,7 +283,7 @@ fn render(header: &Header, report: &Report) -> String {
     if header.others > 0 {
         let _ = writeln!(
             out,
-            "note: {} more Voyager 2 on USB, not read",
+            "note: {} more Wireless Voyager on USB, not read",
             header.others
         );
     }
@@ -1037,7 +1037,7 @@ mod tests {
 
     fn header() -> Header {
         Header {
-            product: "Voyager 2".into(),
+            product: "Wireless Voyager".into(),
             serial: Some("abc/def".into()),
             others: 0,
             firmware: Some(("abc".into(), "def".into())),
@@ -1164,7 +1164,7 @@ mod tests {
         };
         let text = render(&header(), &report);
         for line in [
-            "keyboard: Voyager 2 (USB serial abc/def)",
+            "keyboard: Wireless Voyager (USB serial abc/def)",
             "Oryx protocol: 0x04",
             "\nKeyboard MCU (STM32), previous boot\n  no record\n",
             "  uptime: 2 h 14 min\n",
@@ -1356,7 +1356,7 @@ mod tests {
         };
         let running = || usb(Some(Keyboard::Voyager2), None, 0x1978);
 
-        assert_eq!(refused(&[other()]), "No Voyager 2 found on USB.");
+        assert_eq!(refused(&[other()]), "No Wireless Voyager found on USB.");
         assert!(refused(&[other(), booting()]).contains("is in its bootloader"));
 
         let devices = [other(), booting(), running(), running()];

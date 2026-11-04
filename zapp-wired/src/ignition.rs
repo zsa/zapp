@@ -16,7 +16,7 @@ use zapp_smp::Half;
 use crate::pipe::{self, Target};
 use crate::WiredError;
 
-/// ZSA, and the Voyager 2 running ignition.
+/// ZSA, and the Wireless Voyager running ignition.
 pub const VID: u16 = 0x3297;
 pub const PID: u16 = 0x0792;
 
@@ -221,7 +221,7 @@ impl std::fmt::Display for IgnitionVersion {
 }
 
 /// The version an Ignition puts in its device descriptor, for one too old to
-/// answer [`REQ_VERSION`]: BCD `0xJJMN`, so 0x0203 is 2.0.3. Every Voyager 2
+/// answer [`REQ_VERSION`]: BCD `0xJJMN`, so 0x0203 is 2.0.3. Every Wireless Voyager
 /// Ignition before 2.0.3 reports 0x0200 whatever it is.
 pub fn bcd_version(bcd: u16) -> String {
     let digit = |shift: u16| (bcd >> shift) & 0xf;

@@ -54,7 +54,7 @@ const DEFAULT_MTU: usize = 244;
 /// property — is the *ATT* MTU, the whole PDU, not the value that fits in it.
 /// Subtracting this is what turns it into bytes of payload.
 ///
-/// Proven on a Voyager 2 (`CONFIG_BT_L2CAP_TX_MTU=252`), which is what this
+/// Proven on a Wireless Voyager (`CONFIG_BT_L2CAP_TX_MTU=252`), which is what this
 /// constant is here to stop being re-guessed: BlueZ reported 252, echo requests
 /// of 249 bytes came back, and 250 through 256 were dropped by the ATT layer
 /// with no error anywhere. A request that exactly filled the reported MTU was
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn an_att_mtu_becomes_the_payload_that_fits_in_it() {
-        // The figures that matter: what a Voyager 2 negotiates, what BlueZ
+        // The figures that matter: what a Wireless Voyager negotiates, what BlueZ
         // reported when a full-MTU request was being dropped, and the smallest
         // ATT MTU there is.
         assert_eq!(payload_of(252).unwrap(), 249);

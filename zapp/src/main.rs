@@ -45,7 +45,7 @@ struct Cli {
 /// What `zapp update` updates besides the Oryx layout.
 #[derive(Clone, Copy, ValueEnum)]
 enum UpdateTarget {
-    /// The latest Voyager 2 radio firmware.
+    /// The latest Wireless Voyager radio firmware.
     Radio,
 }
 
@@ -56,8 +56,8 @@ enum Commands {
         long_about = "Flash firmware from a local file or an Oryx URL.\n\n\
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
             bundles carrying both wireless halves, and Oryx layout URLs. For the \
-            latest Voyager 2 radio firmware, run `zapp update radio`. A \
-            Voyager 2 keyboard image goes over the cable when the keyboard is \
+            latest Wireless Voyager radio firmware, run `zapp update radio`. A \
+            Wireless Voyager keyboard image goes over the cable when the keyboard is \
             on USB and over Bluetooth otherwise. A .zsab bundle goes over the \
             cable only. Any other keyboard's firmware goes over the cable. A \
             bundle's two halves are written together, the right one first.",
@@ -87,7 +87,7 @@ enum Commands {
         long_about = "Check Oryx for updates on your layout and flash if available.\n\n\
             Reads a connected ZSA keyboard's layout and revision from its USB serial \
             number, and downloads and flashes the newest revision Oryx has for it.\n\n\
-            `zapp update radio` downloads the latest Voyager 2 radio firmware bundle \
+            `zapp update radio` downloads the latest Wireless Voyager radio firmware bundle \
             from the ZSA update server and flashes it like a .zsab file, with the \
             keyboard fully wired.",
         after_long_help = "Examples:\n  \
@@ -156,9 +156,9 @@ enum Commands {
         #[arg(long, short = 'd')]
         device: Option<String>,
     },
-    /// Read a Voyager 2's diagnostic records over USB
+    /// Read a Wireless Voyager's diagnostic records over USB
     #[command(
-        long_about = "Read a Voyager 2's diagnostic records over USB.\n\n\
+        long_about = "Read a Wireless Voyager's diagnostic records over USB.\n\n\
             Asks the keyboard over the cable for what its keyboard MCU (STM32) \
             and its left half (nRF) recorded about this boot and the previous \
             one: uptime, reset reason, link state, error counters and stalls. \
@@ -408,7 +408,7 @@ fn latest_radio() -> Option<Release> {
         .flatten()
 }
 
-/// What a Bluetooth Voyager 2 runs, asked over its Oryx service. Only for a
+/// What a Bluetooth Wireless Voyager runs, asked over its Oryx service. Only for a
 /// board connected to this machine and not already read over the cable.
 fn ble_radio(board: &zapp_ble::BleBoard, on_usb: &[String]) -> Option<RadioInfo> {
     let on_cable = board
@@ -517,7 +517,7 @@ fn hex(bytes: &[u8]) -> String {
 /// read both halves directly, and the Bluetooth view of a wired board is
 /// whatever the radio last carried. Firmware without the command simply never
 /// answers, so an empty result here is the normal old-firmware case and says
-/// nothing. Only Voyager 2 has a battery or pointing-device header to report
+/// nothing. Only the Wireless Voyager has a battery or pointing-device header to report
 /// on; the rest have neither, so there is nothing worth asking them.
 fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
     if device.keyboard != Some(ids::Keyboard::Voyager2) {
@@ -1050,7 +1050,7 @@ fn state(presence: Presence, address: Option<&str>, on_usb: &[String]) -> &'stat
     }
 }
 
-/// " · ignition 2.0.3 (fa2b805b6f)" for a Voyager 2 sitting in Ignition, and
+/// " · ignition 2.0.3 (fa2b805b6f)" for a Wireless Voyager sitting in Ignition, and
 /// nothing for anything else. Asked over the bridge's own vendor interface,
 /// so a bootloader another program has open falls back to its descriptor.
 fn bootloader_version(device: &UsbDevice) -> String {
@@ -1104,7 +1104,7 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
 
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
 
-    // A Voyager 2 image can go either way, so it picks the way and says which
+    // A Wireless Voyager image can go either way, so it picks the way and says which
     // one it picked; everything else is a wired update and has nothing to pick
     // between.
     if let Firmware::DfuBinary { data, pid, .. } = &fw
@@ -1121,14 +1121,14 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
     wait_and_flash(&fw)
 }
 
-/// Whether a DFU suffix names a Voyager 2, either revision.
+/// Whether a DFU suffix names a Wireless Voyager, either revision.
 fn is_voyager2_image(pid: u16) -> bool {
     matches!(pid, 0x1978 | 0x0792)
 }
 
-/// A Voyager 2 keyboard image, over whichever way the keyboard is reachable.
+/// A Wireless Voyager keyboard image, over whichever way the keyboard is reachable.
 ///
-/// The cable whenever the Voyager 2 is on it, Bluetooth only for a keyboard
+/// The cable whenever the Wireless Voyager is on it, Bluetooth only for a keyboard
 /// that is not plugged in at all. Over the cable `named` is ignored, as there
 /// is only ever one keyboard plugged in.
 fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
@@ -1154,7 +1154,7 @@ const BLUETOOTH_BUNDLES: bool = false;
 /// A bundle, over the way `bundle_route` picked: the cable, or Bluetooth when
 /// `BLUETOOTH_BUNDLES` is on.
 ///
-/// The cable wins whenever the Voyager 2 is on it, whether it is already in its
+/// The cable wins whenever the Wireless Voyager is on it, whether it is already in its
 /// bootloader or still running its own firmware — the wired path waits for the
 /// bootloader and asks for the reset press. Bluetooth is for a keyboard that
 /// is not plugged in at all, not for one that is plugged in and simply has not
@@ -1162,9 +1162,9 @@ const BLUETOOTH_BUNDLES: bool = false;
 /// way through, and sending it over the radio instead would be a surprise.
 ///
 /// The model is what decides, not "some ZSA board is on USB": a user with an
-/// original Voyager on the cable and a Voyager 2 on Bluetooth has to get the
-/// radio, or the update goes down a wire the bundle can never reach the board
-/// through and stops asking for a reset button that would not help.
+/// original Voyager on the cable and a Wireless Voyager on Bluetooth has to get
+/// the radio, or the update goes down a wire the bundle can never reach the
+/// board through and stops asking for a reset button that would not help.
 ///
 /// With `BLUETOOTH_BUNDLES` off, a keyboard not on the cable is an error.
 ///

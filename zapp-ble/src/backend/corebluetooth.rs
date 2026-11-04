@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn a_pnp_id_reads_as_the_modalias_bluez_would_have_made_of_it() {
-        // USB vendor source, 0x3297:0x1978, version 0x0100: a Voyager 2.
+        // USB vendor source, 0x3297:0x1978, version 0x0100: a Wireless Voyager.
         let pnp = [0x02, 0x97, 0x32, 0x78, 0x19, 0x00, 0x01];
         let modalias = modalias_from_pnp(&pnp).unwrap();
         assert_eq!(modalias, "usb:v3297p1978d0100");

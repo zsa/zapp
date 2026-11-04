@@ -17,7 +17,7 @@ pub const HALFKAY_PID: u16 = 0x0478;
 pub const ZSA_BLE_DFU_SERVICE: u128 = 0x32970001_e5aa_4f42_a596_1ea5a0200001;
 
 /// The Oryx live protocol over BLE: the raw-HID 0xFF60 reports, one per write
-/// and one per notification. Served by the Voyager 2's left half.
+/// and one per notification. Served by the Wireless Voyager's left half.
 pub const ZSA_BLE_ORYX_SERVICE: u128 = 0x32970301_e5aa_4f42_a596_1ea5a0200001;
 
 /// Known ZSA keyboard models.
@@ -37,7 +37,7 @@ impl std::fmt::Display for Keyboard {
             Self::PlanckEz => write!(f, "Planck EZ"),
             Self::Moonlander => write!(f, "Moonlander"),
             Self::Voyager => write!(f, "Voyager"),
-            Self::Voyager2 => write!(f, "Voyager 2"),
+            Self::Voyager2 => write!(f, "Wireless Voyager"),
         }
     }
 }
@@ -52,7 +52,7 @@ pub enum BootloaderKind {
     /// ZSA Ignition bootloader on a GD32 chip (flash at 0x0800_2000).
     IgnitionGd32,
     /// ZSA Ignition v2 bootloader, 16 KiB reserved (flash at 0x0800_4000).
-    /// Used by the Voyager 2.
+    /// Used by the Wireless Voyager.
     IgnitionV2,
     /// Legacy HALFKAY (Teensy) bootloader for original Ergodox EZ.
     Halfkay,
@@ -103,7 +103,7 @@ pub fn friendly_name(vid: u16, pid: u16) -> &'static str {
         (STM32_VID, STM32_DFU_PID) => "Keyboard in Reset Mode (STM32 DFU)",
         (ZSA_VID, 0x0791) => "Voyager (Ignition STM32)",
         (ZSA_VID, 0x1791) => "Voyager (Ignition GD32)",
-        (ZSA_VID, 0x0792) => "Voyager 2 (Ignition)",
+        (ZSA_VID, 0x0792) => "Wireless Voyager (Ignition)",
         (ZSA_VID, 0x2000) => "Ergodox EZ Glow (Ignition)",
         (ZSA_VID, 0x2001) => "Ergodox EZ Shine (Ignition)",
         (ZSA_VID, 0x2002) => "Ergodox EZ Original (Ignition)",
@@ -158,11 +158,11 @@ pub fn target_name_for_pid(pid: u16) -> &'static str {
         0xC6CF => "Planck EZ Glow",
         0x1969 | 0x1972 => "Moonlander MK1",
         0x1977 => "Voyager",
-        0x1978 => "Voyager 2",
+        0x1978 => "Wireless Voyager",
         // Bootloader PIDs that may appear in firmware suffixes
         0x0791 => "Voyager (STM32)",
         0x1791 => "Voyager (GD32)",
-        0x0792 => "Voyager 2",
+        0x0792 => "Wireless Voyager",
         0x2000 => "Ergodox EZ Glow",
         0x2001 => "Ergodox EZ Shine",
         0x2002 => "Ergodox EZ Original",
@@ -198,7 +198,8 @@ mod tests {
             identify_bootloader(ZSA_VID, 0x2003),
             Some(BootloaderKind::IgnitionStm32)
         );
-        // Voyager 2 has its own kind — reusing IgnitionStm32 would flash at the wrong base
+        // The Wireless Voyager has its own kind; reusing IgnitionStm32 would flash
+        // at the wrong base
         assert_eq!(
             identify_bootloader(ZSA_VID, 0x0792),
             Some(BootloaderKind::IgnitionV2)
@@ -235,7 +236,7 @@ mod tests {
         assert_eq!(identify_keyboard(ZSA_VID, 0x1977), Some(Keyboard::Voyager));
         assert_eq!(identify_keyboard(ZSA_VID, 0x1978), Some(Keyboard::Voyager2));
         assert_eq!(target_name_for_pid(0x1977), "Voyager");
-        assert_eq!(target_name_for_pid(0x1978), "Voyager 2");
+        assert_eq!(target_name_for_pid(0x1978), "Wireless Voyager");
     }
 
     #[test]

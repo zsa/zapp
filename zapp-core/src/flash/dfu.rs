@@ -21,7 +21,7 @@ const STM32_START_ADDRESS: u32 = 0x0800_0000;
 const STM32_END_ADDRESS: u32 = 0x0804_0000;
 const IGNITION_START_ADDRESS: u32 = 0x0800_2000;
 const IGNITION_END_ADDRESS: u32 = 0x0804_0000;
-// Ignition v2 (Voyager 2) reserves 16 KiB for the bootloader and exposes
+// Ignition v2 (Wireless Voyager) reserves 16 KiB for the bootloader and exposes
 // 120 * 2 KiB above it, ending at the top of the STM32F303CCT6's 256 KiB flash.
 const IGNITION_V2_START_ADDRESS: u32 = 0x0800_4000;
 const IGNITION_V2_END_ADDRESS: u32 = 0x0804_0000;

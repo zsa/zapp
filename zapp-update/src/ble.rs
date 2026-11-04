@@ -74,7 +74,7 @@ pub(crate) const BLE_BOOTLOADER_WAIT: Duration = Duration::from_secs(30);
 /// across writes carries no sequence numbers and no checksum — neither Zephyr's
 /// nor the left relay's — so a fragment lost anywhere discards the request
 /// silently and no reply ever comes; the more writes a request spans, the more
-/// of that exposure it buys. Measured on a Voyager 2's left half (reports 2475,
+/// of that exposure it buys. Measured on a Wireless Voyager's left half (reports 2475,
 /// 249 per write): os_mgmt echo answers up to 8 writes and stops dead at 9, and
 /// an upload of a 316 KB image takes 51 s at one write, 25 s at five, 22 s at
 /// eight. Five keeps margin under the ceiling for most of the gain.
@@ -1126,7 +1126,7 @@ fn check_battery(battery: Battery, charging: bool) -> Result<()> {
 /// Whether the pack is on the charger.
 ///
 /// The nRF publishes no charging state over Bluetooth, so the only thing that
-/// says so from here is the wire: a Voyager 2 on USB is one with VBUS present,
+/// says so from here is the wire: a Wireless Voyager on USB is one with VBUS present,
 /// which is exactly what the firmware's own gate tests. A second ZSA board on
 /// the same machine would read as charging, which errs towards letting an
 /// update run — the direction this whole check leans anyway.

@@ -2,7 +2,7 @@
 name = "zapp-update"
 version = "0.1.0"
 edition = "2024"
-description = "Updating a Voyager 2's firmware, over Bluetooth or the cable, without a terminal"
+description = "Updating a Wireless Voyager's firmware, over Bluetooth or the cable, without a terminal"
 
 [dependencies]
 # The orchestration builds its failures the way the CLI always has, as context

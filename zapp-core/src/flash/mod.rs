@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn matching_base_is_accepted() {
-        // Voyager 2 image on a Voyager 2 bootloader
+        // Wireless Voyager image on a Wireless Voyager bootloader
         assert!(
             check(
                 BootloaderKind::IgnitionV2,

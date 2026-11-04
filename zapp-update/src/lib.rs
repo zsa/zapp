@@ -1,4 +1,4 @@
-//! Updating a Voyager 2, as a library.
+//! Updating a Wireless Voyager, as a library.
 //!
 //! The order an update is done in, what is checked first, and how a pair of
 //! halves is kept or put back, for any front end: the `zapp` CLI draws it on a

@@ -282,7 +282,7 @@ mod tests {
 
     const SHA: [u8; 32] = [0x5a; 32];
 
-    /// The 243 bytes a Voyager 2's right half actually sent, read off the
+    /// The 243 bytes a Wireless Voyager's right half actually sent, read off the
     /// board with `zapp-wired`'s `read_right` example.
     ///
     /// Its spare slot was armed for a permanent swap, which is what makes the
@@ -517,7 +517,7 @@ mod tests {
             HEADER_LEN + upload_request(0, off, 300_000, Some(&SHA), &vec![0u8; data]).len()
         };
 
-        // 249 is what one write carries on a Voyager 2; 2475 is the buffer it
+        // 249 is what one write carries on a Wireless Voyager; 2475 is the buffer it
         // reassembles a fragmented request into.
         for limit in [64usize, 100, 244, 249, 251, 512, 2048, 2475] {
             for off in [0u32, 1, 23, 24, 255, 256, 65535, 65536, 200_000] {

@@ -406,7 +406,7 @@ mod tests {
     use crate::dfu::CMD_START;
     use crate::BleError;
 
-    /// The bits of a Voyager 2's left half this protocol touches.
+    /// The bits of a Wireless Voyager's left half this protocol touches.
     ///
     /// Written as the firmware behaves rather than as the client hopes:
     /// notifications only on a state change, the byte count only on a read, and

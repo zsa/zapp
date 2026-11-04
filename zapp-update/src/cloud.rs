@@ -1,4 +1,4 @@
-//! Releases on CrabNebula Cloud: zapp itself, and the Voyager 2 radio firmware.
+//! Releases on CrabNebula Cloud: zapp itself, and the Wireless Voyager radio firmware.
 //!
 //! The server answers `GET <org>/<app>/<platform>/<current version>` with 204
 //! when `current` string-equals its latest release, and with that release
@@ -25,7 +25,7 @@ pub const RADIO_PLATFORM: &str = "voyager2";
 /// firmware bundles are signed with.
 pub const RADIO_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdEQ0EzNjhDQjUwNjMwNTAKUldSUU1BYTFqRGJLZmJWaW14Z3V0elVyQmJHNkplU05RajgwcDNLN0RtcVNLUzZldmo2NmpMU3kK";
 /// What the radio firmware is called in messages.
-const RADIO_SUBJECT: &str = "radio firmware release";
+const RADIO_SUBJECT: &str = "radio firmware release for the Wireless Voyager";
 
 /// The version to ask with for the latest release, whatever is installed.
 pub const ANY_VERSION: &str = "0.0.0";
@@ -84,7 +84,7 @@ pub fn release_url(app: &str, platform: &str, current: &str) -> String {
 }
 
 /// The release the server offers against `current`, or `None` for 204.
-/// `subject` names the release in messages ("zapp release").
+/// `subject` names the release in messages ("zapp release for linux-x86_64").
 pub fn check(
     client: &reqwest::blocking::Client,
     app: &str,
@@ -98,7 +98,7 @@ pub fn check(
         .map_err(network_error)?;
     let status = response.status().as_u16();
     let body = response.bytes().map_err(network_error)?;
-    parse_response(status, &body, subject, platform)
+    parse_response(status, &body, subject)
 }
 
 /// Downloads a release and checks it against its signature and `public_key`.
@@ -224,18 +224,13 @@ fn newer_than(offered: Option<Release>, current: Option<&str>) -> Result<Option<
 }
 
 /// The release in a reply, or `None` for 204 (nothing newer).
-pub fn parse_response(
-    status: u16,
-    body: &[u8],
-    subject: &str,
-    platform: &str,
-) -> Result<Option<Release>> {
+pub fn parse_response(status: u16, body: &[u8], subject: &str) -> Result<Option<Release>> {
     match status {
         200 => serde_json::from_slice(body)
             .map(Some)
             .map_err(|_| anyhow!("The update server sent an unreadable reply.")),
         204 => Ok(None),
-        400 | 404 => bail!("The update server has no {subject} for {platform}."),
+        400 | 404 => bail!("The update server has no {subject}."),
         other => bail!("The update server answered with HTTP {other}."),
     }
 }
@@ -309,7 +304,7 @@ mod tests {
     #[test]
     fn no_content_means_up_to_date() {
         assert_eq!(
-            parse_response(204, b"", "zapp release", "linux-x86_64").unwrap(),
+            parse_response(204, b"", "zapp release for linux-x86_64").unwrap(),
             None
         );
     }
@@ -318,7 +313,7 @@ mod tests {
     fn release_reply() {
         let body = br#"{"version":"1.1.11","notes":"- Fixes","pub_date":"2026-10-28T00:00:00Z",
             "url":"https://cdn.example/zapp.tar.gz","signature":"c2ln","format":"tar.gz"}"#;
-        let release = parse_response(200, body, "zapp release", "linux-x86_64")
+        let release = parse_response(200, body, "zapp release for linux-x86_64")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -335,7 +330,7 @@ mod tests {
     #[test]
     fn release_reply_without_notes() {
         let body = br#"{"version":"1.1.11","url":"u","signature":"s"}"#;
-        let release = parse_response(200, body, "zapp release", "linux-x86_64")
+        let release = parse_response(200, body, "zapp release for linux-x86_64")
             .unwrap()
             .unwrap();
         assert_eq!(release.notes, None);
@@ -353,18 +348,18 @@ mod tests {
 
     #[test]
     fn bad_replies() {
-        assert!(parse_response(200, b"<html>", "zapp release", "linux-x86_64").is_err());
-        let err = parse_response(400, b"", "zapp release", "linux-x86_64").unwrap_err();
+        assert!(parse_response(200, b"<html>", "zapp release for linux-x86_64").is_err());
+        let err = parse_response(400, b"", "zapp release for linux-x86_64").unwrap_err();
         assert_eq!(
             err.to_string(),
             "The update server has no zapp release for linux-x86_64."
         );
-        let err = parse_response(404, b"", RADIO_SUBJECT, RADIO_PLATFORM).unwrap_err();
+        let err = parse_response(404, b"", RADIO_SUBJECT).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "The update server has no radio firmware release for voyager2."
+            "The update server has no radio firmware release for the Wireless Voyager."
         );
-        let err = parse_response(500, b"", "zapp release", "linux-x86_64").unwrap_err();
+        let err = parse_response(500, b"", "zapp release for linux-x86_64").unwrap_err();
         assert_eq!(err.to_string(), "The update server answered with HTTP 500.");
     }
 

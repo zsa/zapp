@@ -1,7 +1,7 @@
 //! ZSA's update-session commands: mcumgr group 67.
 //!
 //! The host half of `shared/include/zsa_update_mgmt.h`, and the reason it
-//! exists is `shared/include/zsa_update_session.h`: over Bluetooth a Voyager 2
+//! exists is `shared/include/zsa_update_session.h`: over Bluetooth a Wireless Voyager
 //! accepts one shape of update and nothing else. A host declares, up front, both
 //! halves' images and the build they came from, and every write after that is
 //! checked against the statement. Without it the board cannot tell a sanctioned
@@ -63,7 +63,7 @@ impl Declared {
     /// carries no hash: there is nothing to declare it by.
     ///
     /// The declared slot hash is the leading [`HASH_LEN`] bytes of what the
-    /// trailer carries. A Voyager 2 signs with SHA-512, so the trailer's hash is
+    /// trailer carries. A Wireless Voyager signs with SHA-512, so the trailer's hash is
     /// 64 bytes while the wire field and the firmware's own view of a slot hash
     /// are both 32 — the leading half is what the two ends compare.
     pub fn of(image: &[u8]) -> Option<Self> {
@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// A signed image with one hash TLV of the given length, so the trailer can
-    /// be a SHA-512 the way a Voyager 2's is.
+    /// be a SHA-512 the way a Wireless Voyager's is.
     fn signed(hash_len: usize) -> Vec<u8> {
         const MCUBOOT_MAGIC: u32 = 0x96f3_b83d;
         let payload = 64usize;

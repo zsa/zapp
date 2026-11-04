@@ -20,7 +20,7 @@ const TLV_MAGIC: u16 = 0x6907;
 /// The hash TLVs MCUboot may name an image by, and the length each one is.
 ///
 /// Which one a build uses is a build-time choice — `CONFIG_BOOT_IMG_HASH_ALG_*`
-/// — and a Voyager 2 signs with SHA-512, so assuming SHA-256 would find
+/// — and a Wireless Voyager signs with SHA-512, so assuming SHA-256 would find
 /// nothing. The length is checked with the type because mcumgr checks both.
 const HASH_TLVS: [(u16, usize); 3] = [(0x10, 32), (0x11, 48), (0x12, 64)];
 
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn the_hash_a_board_names_an_image_by_comes_out_of_its_trailer() {
         // SHA-256, SHA-384 and SHA-512, since which one is there is a build
-        // choice and a Voyager 2 signs with the last of the three.
+        // choice and a Wireless Voyager signs with the last of the three.
         for (kind, len) in HASH_TLVS {
             let found = signed_hash(&signed((kind, len), false)).expect("a hash");
             assert_eq!(found, vec![0xEE; len], "tlv {kind:#x}");

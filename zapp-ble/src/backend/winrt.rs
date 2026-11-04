@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn a_pnp_id_reads_as_the_modalias_bluez_would_have_made_of_it() {
-        // What the GATT service interfaces of a bonded Voyager 2 carry.
+        // What the GATT service interfaces of a bonded Wireless Voyager carry.
         assert_eq!(
             modalias(Some(2), Some(0x3297), Some(0x1978), Some(0x0100)).as_deref(),
             Some("usb:v3297p1978d0100")

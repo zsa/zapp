@@ -150,7 +150,7 @@ zapp flash firmware.bin
 zapp flash firmware.hex
 ```
 
-### Update to the latest radio firmware (Voyager 2)
+### Update to the latest radio firmware (Wireless Voyager)
 
 Downloads the newest radio firmware bundle from ZSA's update server, checks its signature, and flashes it like a `.zsab` file (keyboard fully wired):
 

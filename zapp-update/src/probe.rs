@@ -28,14 +28,14 @@ impl Transport {
     }
 }
 
-/// Which way a Voyager 2 update goes: the cable whenever the keyboard is on it,
+/// Which way a Wireless Voyager update goes: the cable whenever the keyboard is on it,
 /// in its bootloader or running its own firmware, Bluetooth otherwise.
 ///
 /// Bluetooth is for a keyboard that is not plugged in at all, not for one that
 /// is plugged in and simply has not been put in its bootloader yet: that one is
 /// a cable update the user is part way through, and sending it over the radio
 /// instead would be a surprise. The model is what decides, not "some ZSA board
-/// is on USB": a user with an original Voyager on the cable and a Voyager 2 on
+/// is on USB": a user with an original Voyager on the cable and a Wireless Voyager on
 /// Bluetooth has to get the radio.
 pub fn route() -> Transport {
     if bootloader_present() || voyager2_present() {
@@ -70,7 +70,7 @@ pub fn bootloader_present() -> bool {
     }
 }
 
-/// Whether a Voyager 2 running its own firmware is plugged in right now.
+/// Whether a Wireless Voyager running its own firmware is plugged in right now.
 ///
 /// For deciding which way to send a bundle, alongside [`bootloader_present`]:
 /// between them they are every USB state a bundle can be written from.
@@ -85,7 +85,7 @@ pub(crate) fn attached() -> Option<Vec<UsbDevice>> {
         .ok()
 }
 
-/// The attached Voyager 2 running its own firmware, if one is there.
+/// The attached Wireless Voyager running its own firmware, if one is there.
 ///
 /// The model is checked, not just "a ZSA keyboard": an original Voyager on the
 /// same cable is a board no bundle can be written to, and counting it sends the
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn another_zsa_keyboard_on_the_cable_is_not_a_voyager_2() {
-        // The bug this guards: a wired Voyager plugged in while the Voyager 2
+        // The bug this guards: a wired Voyager plugged in while the Wireless Voyager
         // is on Bluetooth used to count as "a keyboard on USB", so the bundle
         // went down the cable and sat waiting for a reset button on a board it
         // could never be written to.
@@ -274,7 +274,7 @@ mod tests {
             let pid = other.pid;
             assert!(
                 voyager2_among(&[other]).is_none(),
-                "{pid:#06x} was taken for a Voyager 2"
+                "{pid:#06x} was taken for a Wireless Voyager"
             );
         }
         assert!(voyager2_among(&the_other_models()).is_none());

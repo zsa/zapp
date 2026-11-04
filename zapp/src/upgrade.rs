@@ -28,7 +28,13 @@ pub fn run(yes: bool, check: bool) -> Result<()> {
         )
     })?;
     let client = cloud::client(USER_AGENT)?;
-    let release = match cloud::check(&client, APP, platform, CURRENT, "zapp release")? {
+    let release = match cloud::check(
+        &client,
+        APP,
+        platform,
+        CURRENT,
+        &format!("zapp release for {platform}"),
+    )? {
         Some(release) if cloud::is_newer(&release.version, CURRENT)? => release,
         _ => {
             println!("zapp {CURRENT} is up to date.");
