@@ -44,10 +44,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: zapp-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: zapp-linux-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -95,7 +95,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           # Restrict default mirrors to amd64 (they don't host arm64 packages).
-          # Ubuntu 24.04 (ubuntu-latest) uses deb822 sources at ubuntu.sources;
+          # Ubuntu 24.04 uses deb822 sources at ubuntu.sources;
           # earlier versions use the classic sources.list. Handle both.
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
             sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
