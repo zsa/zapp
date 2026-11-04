@@ -85,6 +85,8 @@ pub enum Wait {
     Bootloader,
     /// For ignition to find the right half on the TRRS bus.
     RightHalf,
+    /// The same wait, once it has gone on long enough to ask for the cable.
+    RightHalfCable,
     /// For the keyboard to come back on USB after the update.
     KeyboardRestart,
 }
@@ -100,6 +102,9 @@ impl Wait {
             Wait::Confirming => "Confirming both halves...",
             Wait::Bootloader => "Waiting for keyboard in bootloader mode...",
             Wait::RightHalf => "Waiting for the right half...",
+            Wait::RightHalfCable => {
+                "Waiting for the right half, make sure both halves are connected with a TRRS cable..."
+            }
             Wait::KeyboardRestart => "Waiting for the keyboard to restart...",
         }
     }

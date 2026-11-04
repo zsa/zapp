@@ -38,6 +38,7 @@
 //! the same separate question: whether the keyboard is up and typing.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,7 +64,7 @@ use crate::event::{Chip, Event, Phase, Reporter, Wait};
 use crate::guard::{going_backwards, ordering_of};
 use crate::probe::{attached, usb_telemetry, voyager2_among};
 use crate::text::{named, short, titled};
-use crate::{Options, Outcome};
+use crate::{Cancel, Options, Outcome};
 
 /// How long to give ignition's entry sequence.
 ///
@@ -114,6 +115,9 @@ const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
 /// Announcing the wait once it is clearly a wait, rather than once an attempt
 /// has failed, is the difference between a line and a blank terminal.
 const RIGHT_SPINNER_AFTER: Duration = Duration::from_secs(1);
+
+/// How long the right-half wait is up before it asks for the TRRS cable.
+const CABLE_HINT_AFTER: Duration = Duration::from_secs(3);
 
 /// How long both halves get to swap and come back up before the confirm gives
 /// up on them.
@@ -230,14 +234,35 @@ pub fn update_bundle(
 
 fn flash(bundle: &Bundle, options: &Options, reporter: &mut Reporter) -> Result<Outcome> {
     reporter.phase(Phase::Connecting);
-    let shared = Shared::new(open_waiting(options.timings.bootloader_wait, reporter)?);
+    let link = open_waiting(options.timings.bootloader_wait, &options.cancel, reporter)?;
+    let shared = Shared::with_cancel(link, options.cancel.clone());
+    flash_over(&shared, bundle, options, reporter, &mut |reporter| {
+        came_back(options.timings.keyboard_restart, reporter)
+    })
+}
+
+/// [`flash`] on a link already open. `look` is the check that the keyboard
+/// came back, run once the STM32 has been reset.
+fn flash_over<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    bundle: &Bundle,
+    options: &Options,
+    reporter: &mut Reporter,
+    look: &mut dyn FnMut(&mut Reporter) -> bool,
+) -> Result<Outcome> {
+    // Leave a keyboard, not a bootloader, whichever way this returns.
+    let mut restart = Restart::new(shared);
     let mut ignition = Ignition::new(shared.clone());
     // Into the log before anything can go wrong, so a capture always says
     // which bridge it came from.
     log::debug!("ignition {}", ignition_version(&mut ignition));
 
-    match run(&shared, &mut ignition, bundle, options, reporter) {
+    match run(shared, &mut ignition, bundle, options, reporter) {
         Ok(outcome) => {
+            // Both halves were booted out by `write_half`; END and the reset
+            // below are the rest of what `restart` would do.
+            restart.disarm();
+
             // Only once everything landed: an END on the way out of a failure
             // would throw away the STATUS the failure is explained from.
             if let Err(err) = ignition.end() {
@@ -265,40 +290,30 @@ fn flash(bundle: &Bundle, options: &Options, reporter: &mut Reporter) -> Result<
             // The last check, and not an optional one: the halves keep their
             // new images only once they have proved their links, and this is
             // the only point in the run where they can.
-            finish(outcome, || came_back(options.timings.keyboard_restart, reporter))?;
+            finish(outcome, || look(reporter))?;
             Ok(outcome)
         }
         Err(err) => {
-            // Leave a keyboard, not a bootloader, on failure too. Nothing
-            // unmarked boots any different for it, and a half that was
-            // already marked for test reverts now instead of on the next
-            // power cycle — either way both halves come back on the build
-            // they ran. Best-effort: a half the bus lost cannot hear a reset.
-            //
             // Unless someone is debugging: a reset zeroes the halves' own
             // counters, which are the only record of what a failed exchange
             // did. `keep_state_on_failure` leaves everything as it is,
             // bootloader included, so it can be read over SWD afterwards.
             if options.keep_state_on_failure {
+                restart.disarm();
                 reporter.emit(Event::KeptStateOnFailure);
                 return Err(err);
             }
 
-            if let Err(err) = ignition.release_md() {
-                log::debug!("could not release MD after the failure: {err}");
-            }
-            for half in [Half::Left, Half::Right] {
-                if let Err(err) = ignition.reset_target(half) {
-                    log::debug!("could not reset the {half} half after the failure: {err}");
-                }
-            }
-            if let Err(err) = ignition.end() {
-                log::debug!("could not end the session after the failure: {err}");
-            }
-            if let Err(err) = ignition.reset_self() {
-                log::debug!("the bootloader went down with the reset: {err}");
-            }
+            // Leave a keyboard, not a bootloader, on failure too: whatever is
+            // still in MCUboot boots its own firmware, then the STM32 leaves
+            // ignition. A half already running its application is left
+            // alone; the right has no reset but the one into MCUboot, and
+            // restarting only the left would split the pair across builds.
+            restart.restart();
 
+            if shared.cancelled() {
+                return Err(cancelled(err));
+            }
             Err(err)
         }
     }
@@ -956,10 +971,13 @@ fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
 /// already closed. Asking again for half a minute is the same procedure with
 /// enough room in it to work.
 fn open_session<L: IgnitionLink>(
-    ignition: &mut Ignition<L>,
+    ignition: &mut Ignition<Shared<L>>,
     limit: Duration,
     reporter: &mut Reporter,
 ) -> Result<Status> {
+    // From BEGIN on the halves may be in MCUboot, whether or not the session
+    // opens: the left is reset into it before the right is even looked for.
+    ignition.link_mut().hold(Halves::BOTH);
     keep_asking(limit, reporter, |waiting| {
         // No END between attempts: `begin` already closes a session it finds
         // in the way, and ending one here would throw away the fault the last
@@ -1008,21 +1026,46 @@ fn right_missing(error: u16) -> bool {
 /// is where the first eleven seconds of it are spent.
 struct Waiting<'a, 'r> {
     reporter: &'a mut Reporter<'r>,
-    shown: bool,
+    /// When the line went up.
+    shown: Option<Instant>,
+    /// Whether the line asks for the TRRS cable yet.
+    cable: bool,
 }
 
-impl Waiting<'_, '_> {
-    /// Puts the line up, if it is not up already.
+impl<'a, 'r> Waiting<'a, 'r> {
+    fn new(reporter: &'a mut Reporter<'r>) -> Self {
+        Self {
+            reporter,
+            shown: None,
+            cable: false,
+        }
+    }
+
+    /// Puts the line up, or switches it to the cable line once it has been up
+    /// for [`CABLE_HINT_AFTER`]. Otherwise a no-op.
     fn show(&mut self) {
-        if !self.shown {
-            self.shown = true;
-            self.reporter.wait(Wait::RightHalf);
+        self.show_at(Instant::now());
+    }
+
+    fn show_at(&mut self, now: Instant) {
+        match self.shown {
+            None => {
+                self.shown = Some(now);
+                self.reporter.wait(Wait::RightHalf);
+            }
+            Some(since)
+                if !self.cable && now.saturating_duration_since(since) >= CABLE_HINT_AFTER =>
+            {
+                self.cable = true;
+                self.reporter.wait(Wait::RightHalfCable);
+            }
+            Some(_) => {}
         }
     }
 
     /// Gives the line back.
     fn clear(self) {
-        if self.shown {
+        if self.shown.is_some() {
             self.reporter.clear();
         }
     }
@@ -1038,10 +1081,7 @@ where
     F: FnMut(&mut Waiting) -> std::result::Result<Status, NotOpened>,
 {
     let started = Instant::now();
-    let mut waiting = Waiting {
-        reporter,
-        shown: false,
-    };
+    let mut waiting = Waiting::new(reporter);
     loop {
         let outcome = attempt(&mut waiting);
         let done = match &outcome {
@@ -1206,7 +1246,7 @@ fn write_half<L: IgnitionLink + 'static>(
 /// put them in their bootloaders, and END does not take them out. How they leave
 /// differs, because only the left has a reset line.
 fn boot_out<L: IgnitionLink>(
-    ignition: &mut Ignition<L>,
+    ignition: &mut Ignition<Shared<L>>,
     client: &mut SmpClient,
     half: Half,
 ) -> Result<()> {
@@ -1220,6 +1260,7 @@ fn boot_out<L: IgnitionLink>(
             ignition
                 .reset_target(half)
                 .context("Could not restart the left half")?;
+            ignition.link_mut().freed(half);
         }
         Half::Right => {
             // RESET_TARGET is the wrong instrument here: with the MCP23018
@@ -1231,6 +1272,7 @@ fn boot_out<L: IgnitionLink>(
             client
                 .reset()
                 .context("Could not restart the right half out of MCUboot")?;
+            ignition.link_mut().freed(half);
 
             // Point the bridge away before the reboot finishes. Ignition polls
             // whichever half is selected, so leaving it on the right means it
@@ -1960,7 +2002,11 @@ pub(crate) const WAIT_FOR_BOOTLOADER: Duration = Duration::from_secs(60);
 /// The link comes back wrapped in `Retrying`, which absorbs the control stall
 /// ignition answers with in the gap `BEGIN` opens. Nothing above here has to
 /// know that, which is the point of it being the link's own behaviour.
-fn open_waiting(limit: Duration, reporter: &mut Reporter) -> Result<Retrying<UsbLink>> {
+fn open_waiting(
+    limit: Duration,
+    cancel: &Cancel,
+    reporter: &mut Reporter,
+) -> Result<Retrying<UsbLink>> {
     let deadline = Instant::now() + limit;
     let mut grace = AccessGrace::default();
 
@@ -1980,6 +2026,10 @@ fn open_waiting(limit: Duration, reporter: &mut Reporter) -> Result<Retrying<Usb
     reporter.wait(Wait::Bootloader);
 
     loop {
+        if cancel.is_cancelled() {
+            reporter.clear();
+            return Err(kind_of(ErrorKind::Cancelled, None, anyhow!("The update was cancelled.")));
+        }
         match UsbLink::open() {
             Ok(link) => {
                 reporter.clear();
@@ -2042,23 +2092,86 @@ fn access_denied(cause: &str) -> anyhow::Error {
 /// requests that sit between the uploads — SELECT, RELEASE_MD, RESET_TARGET —
 /// need a second handle on the same link. Nothing here is concurrent: the mutex
 /// is shared ownership, not synchronisation.
-struct Shared<L: IgnitionLink>(Arc<Mutex<L>>);
+///
+/// The second field is the run's [`Gate`]: every transfer is refused once the
+/// run is cancelled, except the ones [`Restart`] makes.
+struct Shared<L: IgnitionLink>(Arc<Mutex<L>>, Arc<Gate>);
+
+/// What a cable run knows about itself across its handles on the link.
+#[derive(Default)]
+struct Gate {
+    cancel: Cancel,
+    /// Set while [`Restart`] runs, so a cancel does not stop it.
+    restarting: AtomicBool,
+    /// The halves this run may have left in MCUboot, as [`Halves`] bits: set
+    /// before BEGIN, cleared as each half is booted out.
+    held: AtomicU16,
+}
+
+/// What a transfer refused after a cancel says. Replaced by the cancel's own
+/// sentence before it reaches anyone.
+const CANCELLED: &str = "the update was cancelled";
+
+/// The longest one `bulk_in` waits before the cancel flag is looked at again.
+const CANCEL_SLICE: Duration = Duration::from_millis(250);
 
 impl<L: IgnitionLink> Shared<L> {
+    #[cfg(test)]
     fn new(link: L) -> Self {
-        Self(Arc::new(Mutex::new(link)))
+        Self::with_cancel(link, Cancel::default())
+    }
+
+    fn with_cancel(link: L, cancel: Cancel) -> Self {
+        let gate = Gate {
+            cancel,
+            ..Gate::default()
+        };
+        Self(Arc::new(Mutex::new(link)), Arc::new(gate))
+    }
+
+    /// The link, also after a panic elsewhere poisoned the mutex: [`Restart`]
+    /// still has to reach the board while a panic unwinds.
+    fn link(&self) -> std::sync::MutexGuard<'_, L> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn open(&self) -> Result<(), WiredError> {
+        let gate = &self.1;
+        if gate.cancel.is_cancelled() && !gate.restarting.load(Ordering::SeqCst) {
+            return Err(WiredError::Usb(CANCELLED.into()));
+        }
+        Ok(())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.1.cancel.is_cancelled()
+    }
+
+    /// Marks these halves as possibly in MCUboot.
+    fn hold(&self, halves: Halves) {
+        self.1.held.fetch_or(halves.bits(), Ordering::SeqCst);
+    }
+
+    /// Marks one half as booted out of MCUboot.
+    fn freed(&self, half: Half) {
+        self.1.held.fetch_and(!Halves::of(half).bits(), Ordering::SeqCst);
+    }
+
+    fn holds(&self, half: Half) -> bool {
+        self.1.held.load(Ordering::SeqCst) & Halves::of(half).bits() != 0
     }
 }
 
 impl<L: IgnitionLink> Clone for Shared<L> {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        Self(Arc::clone(&self.0), Arc::clone(&self.1))
     }
 }
 
 impl<L: IgnitionLink> IgnitionLink for Shared<L> {
     fn control_out(&mut self, request: u8, value: u16) -> Result<(), WiredError> {
-        self.0.lock().unwrap().control_out(request, value)
+        self.open()?;
+        self.link().control_out(request, value)
     }
 
     fn control_out_data(
@@ -2067,7 +2180,8 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
         value: u16,
         data: &[u8],
     ) -> Result<(), WiredError> {
-        self.0.lock().unwrap().control_out_data(request, value, data)
+        self.open()?;
+        self.link().control_out_data(request, value, data)
     }
 
     fn control_in(
@@ -2076,16 +2190,152 @@ impl<L: IgnitionLink> IgnitionLink for Shared<L> {
         value: u16,
         length: usize,
     ) -> Result<Vec<u8>, WiredError> {
-        self.0.lock().unwrap().control_in(request, value, length)
+        self.open()?;
+        self.link().control_in(request, value, length)
     }
 
     fn bulk_out(&mut self, message: &[u8]) -> Result<(), WiredError> {
-        self.0.lock().unwrap().bulk_out(message)
+        self.open()?;
+        self.link().bulk_out(message)
     }
 
+    /// Waits in slices of at most [`CANCEL_SLICE`], so a cancel is seen during
+    /// a long wait for a reply. A link that returns before its slice is up is
+    /// taken at its word, as before.
     fn bulk_in(&mut self, timeout: Duration) -> Result<Vec<u8>, WiredError> {
-        self.0.lock().unwrap().bulk_in(timeout)
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.open()?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            let slice = left.min(CANCEL_SLICE);
+            let asked = Instant::now();
+            let got = self.link().bulk_in(slice)?;
+            if !got.is_empty() || left <= CANCEL_SLICE || asked.elapsed() < slice {
+                return Ok(got);
+            }
+        }
     }
+}
+
+/// Restarts what a cable run left in a bootloader, on every way out of it.
+///
+/// Armed from the moment the link is open. Dropped armed, it runs: an early
+/// return, a cancel or an unwinding panic still leaves a keyboard rather than
+/// a left half in MCUboot with no USB and no radio. Only the halves the run
+/// still [`Shared::holds`] are restarted, the right through MCUboot's SMP reset
+/// (RESET_TARGET would ask a running right to enter MCUboot), the left by
+/// releasing MD and resetting it. Then END and a reset of the STM32 out of
+/// ignition. Best effort and quick: every failure is logged and skipped.
+struct Restart<L: IgnitionLink + 'static> {
+    shared: Shared<L>,
+    ignition: Ignition<Shared<L>>,
+    armed: bool,
+}
+
+/// How long the right half gets to answer the reset [`Restart`] sends it.
+const RESTART_REPLY: Duration = Duration::from_secs(1);
+
+/// How long [`Restart`] waits for an entry sequence still running to settle,
+/// past ignition's own 5 s mailbox poll.
+const RESTART_PENDING: Duration = Duration::from_secs(7);
+
+impl<L: IgnitionLink + 'static> Restart<L> {
+    fn new(shared: &Shared<L>) -> Self {
+        Self {
+            shared: shared.clone(),
+            ignition: Ignition::new(shared.clone()),
+            armed: true,
+        }
+    }
+
+    /// For the ways out that restart the board themselves, or are asked to
+    /// leave it as it is.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn restart(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.shared.1.restarting.store(true, Ordering::SeqCst);
+        log::debug!("restarting what the run left in a bootloader");
+
+        if self.shared.holds(Half::Right) {
+            self.restart_right();
+        }
+        if self.shared.holds(Half::Left) {
+            if let Err(err) = self.ignition.release_md() {
+                log::debug!("restart: could not release MD: {err}");
+            }
+            match self.ignition.reset_target(Half::Left) {
+                Ok(()) => self.shared.freed(Half::Left),
+                Err(err) => log::debug!("restart: could not reset the left half: {err}"),
+            }
+        }
+        if let Err(err) = self.ignition.end() {
+            log::debug!("restart: could not end the session: {err}");
+        }
+        if let Err(err) = self.ignition.reset_self() {
+            log::debug!("restart: the bootloader went down with the reset: {err}");
+        }
+    }
+
+    /// MCUboot's own reset, which needs the session that put the right there.
+    fn restart_right(&mut self) {
+        let deadline = Instant::now() + RESTART_PENDING;
+        let status = loop {
+            match self.ignition.status() {
+                Ok(status) if status.state == SessionState::Pending && Instant::now() < deadline => {
+                    std::thread::sleep(STATUS_POLL);
+                }
+                Ok(status) => break status,
+                Err(err) => {
+                    log::debug!("restart: no STATUS, the right half is left as it is: {err}");
+                    return;
+                }
+            }
+        };
+        if status.state != SessionState::Active || status.right_state != TargetState::McuBoot {
+            log::debug!(
+                "restart: no session holds the right half in MCUboot ({:?}, right {})",
+                status.state,
+                running(status.right_state)
+            );
+            return;
+        }
+        if let Err(err) = self.ignition.select(Half::Right) {
+            log::debug!("restart: could not point the bridge at the right half: {err}");
+            return;
+        }
+        if let Err(err) = self.ignition.send(Half::Right.into(), b"\n") {
+            log::debug!("restart: could not send the right half a resync newline: {err}");
+        }
+        let mut client = connect(&self.shared, Half::Right, status.payload_budget(), RESTART_REPLY);
+        match client.reset() {
+            Ok(()) => self.shared.freed(Half::Right),
+            Err(err) => log::debug!("restart: the right half did not take its reset: {err}"),
+        }
+        if let Err(err) = self.ignition.select(Half::Left) {
+            log::debug!("restart: could not point the bridge back at the left half: {err}");
+        }
+    }
+}
+
+impl<L: IgnitionLink + 'static> Drop for Restart<L> {
+    fn drop(&mut self) {
+        if self.armed {
+            log::debug!("the cable run ended early");
+            self.restart();
+        }
+    }
+}
+
+/// The error a cancelled run returns, the cause it stopped on kept in the log.
+fn cancelled(err: anyhow::Error) -> anyhow::Error {
+    log::debug!("cancelled; the run stopped on: {err:#}");
+    kind_of(ErrorKind::Cancelled, None, anyhow!("The update was cancelled."))
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,7 +2362,9 @@ pub fn bond(
 
 fn bond_inner(config: &EsbConfig, options: &Options, reporter: &mut Reporter) -> Result<Bonded> {
     reporter.phase(Phase::Connecting);
-    let shared = Shared::new(open_waiting(options.timings.bootloader_wait, reporter)?);
+    let link = open_waiting(options.timings.bootloader_wait, &options.cancel, reporter)?;
+    let shared = Shared::with_cancel(link, options.cancel.clone());
+    let mut restart = Restart::new(&shared);
     let mut ignition = Ignition::new(shared.clone());
 
     let right_half_wait = options.timings.right_half_wait;
@@ -2120,12 +2372,13 @@ fn bond_inner(config: &EsbConfig, options: &Options, reporter: &mut Reporter) ->
         Ok(()) => {
             // Both halves have the bundle and read it back; put the session
             // away and let each reboot into its application to reload it.
+            restart.disarm();
             end_and_reset(&mut ignition);
             Ok(Bonded {
                 came_back: came_back(options.timings.keyboard_restart, reporter),
             })
         }
-        Err(err) => Err(bond_failed(&mut ignition, err)),
+        Err(err) => Err(bond_failed(&mut restart, &shared, err)),
     }
 }
 
@@ -2153,18 +2406,30 @@ pub fn bond_show(
 
 fn bond_show_inner(options: &Options, reporter: &mut Reporter) -> Result<ShowReport> {
     reporter.phase(Phase::Connecting);
-    let shared = Shared::new(open_waiting(options.timings.bootloader_wait, reporter)?);
+    let link = open_waiting(options.timings.bootloader_wait, &options.cancel, reporter)?;
+    let shared = Shared::with_cancel(link, options.cancel.clone());
+    bond_show_over(&shared, options, reporter)
+}
+
+/// [`bond_show`] on a link already open.
+fn bond_show_over<L: IgnitionLink + 'static>(
+    shared: &Shared<L>,
+    options: &Options,
+    reporter: &mut Reporter,
+) -> Result<ShowReport> {
+    let mut restart = Restart::new(shared);
     let mut ignition = Ignition::new(shared.clone());
 
     let right_half_wait = options.timings.right_half_wait;
-    match bond_show_run(&shared, &mut ignition, options.reply_timeout, right_half_wait, reporter) {
+    match bond_show_run(shared, &mut ignition, options.reply_timeout, right_half_wait, reporter) {
         Ok(report) => {
             // A read-only look still opened a session, which left both halves
             // in their bootloaders; boot them back the same way.
+            restart.disarm();
             end_and_reset(&mut ignition);
             Ok(report)
         }
-        Err(err) => Err(bond_failed(&mut ignition, err)),
+        Err(err) => Err(bond_failed(&mut restart, shared, err)),
     }
 }
 
@@ -2399,6 +2664,7 @@ fn reboot_half<L: IgnitionLink + 'static>(
             client
                 .reset()
                 .context("Could not restart the right half out of MCUboot")?;
+            ignition.link_mut().freed(half);
             ignition
                 .select(Half::Left)
                 .context("Could not point the bridge away from the right half")?;
@@ -2410,6 +2676,7 @@ fn reboot_half<L: IgnitionLink + 'static>(
             ignition
                 .reset_target(Half::Left)
                 .context("Could not restart the left half")?;
+            ignition.link_mut().freed(half);
         }
     }
     Ok(())
@@ -2431,13 +2698,16 @@ fn end_and_reset<L: IgnitionLink>(ignition: &mut Ignition<Shared<L>>) {
     }
 }
 
-/// The failure epilogue shared by both bond commands.
-fn bond_failed<L: IgnitionLink>(
-    ignition: &mut Ignition<Shared<L>>,
+/// The failure epilogue shared by both bond commands: whatever is still in
+/// MCUboot is restarted, then the STM32 leaves ignition.
+fn bond_failed<L: IgnitionLink + 'static>(
+    restart: &mut Restart<L>,
+    shared: &Shared<L>,
     err: anyhow::Error,
 ) -> anyhow::Error {
-    if let Err(err) = ignition.end() {
-        log::debug!("could not end the session after the failure: {err}");
+    restart.restart();
+    if shared.cancelled() {
+        return cancelled(err);
     }
     err
 }
@@ -3929,7 +4199,7 @@ mod tests {
             asked += 1;
             waiting.show();
             waiting.show();
-            lines.push(waiting.shown);
+            lines.push(waiting.shown.is_some());
             if asked > 2 {
                 return Ok(faulted(0, 0, 0));
             }
@@ -3943,6 +4213,26 @@ mod tests {
         assert_eq!(lines, [true, true, true]);
         // One line put up and taken down once, however often it was asked for.
         assert_eq!(said, ["Wait(RightHalf)", "WaitOver"]);
+    }
+
+    #[test]
+    fn the_wait_asks_for_the_cable_once_it_has_been_up_three_seconds() {
+        let mut said = Vec::new();
+        let mut record = |event: Event| said.push(format!("{event:?}"));
+        let mut reporter = Reporter::new(&mut record);
+        let mut waiting = Waiting::new(&mut reporter);
+        let up = Instant::now();
+        waiting.show_at(up);
+        waiting.show_at(up + CABLE_HINT_AFTER - Duration::from_millis(1));
+        waiting.show_at(up + CABLE_HINT_AFTER);
+        waiting.show_at(up + CABLE_HINT_AFTER * 5);
+        waiting.clear();
+
+        // The cable line replaces the first one, once, and goes down once.
+        assert_eq!(
+            said,
+            ["Wait(RightHalf)", "Wait(RightHalfCable)", "WaitOver"]
+        );
     }
 
     // ---- One version across the keyboard -------------------------------
@@ -4457,5 +4747,261 @@ mod tests {
         let mut other = *config.as_bytes();
         other[14] ^= 0xff;
         assert!(!keys_agree(config.as_bytes(), &other));
+    }
+
+    // ---- Restarting what a run leaves behind -----------------------------
+
+    /// What `flash_over` came to against the in-memory keyboard.
+    struct Over {
+        result: Result<Outcome>,
+        control: Vec<(u8, u16)>,
+        device: LoopbackDevice,
+    }
+
+    /// Runs `flash_over` on the in-memory keyboard. `cue` sees every event
+    /// with the run's cancel flag; the keyboard always comes back.
+    fn flash_over_loopback(
+        blob: &[u8],
+        setup: impl FnOnce(&LoopbackDevice),
+        keep_state_on_failure: bool,
+        mut cue: impl FnMut(&Event, &Cancel),
+    ) -> Over {
+        let bundle = bundle::parse(blob).expect("a bundle");
+        let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        setup(&device);
+        let cancel = Cancel::new();
+        let shared = Shared::with_cancel(link, cancel.clone());
+        let options = Options {
+            reply_timeout: Duration::from_millis(50),
+            keep_state_on_failure,
+            timings: crate::Timings {
+                settle: Duration::ZERO,
+                ..crate::Timings::default()
+            },
+            cancel: cancel.clone(),
+            ..Options::default()
+        };
+        let mut events = |event: Event| cue(&event, &cancel);
+        let mut reporter = Reporter::new(&mut events);
+        let result = flash_over(&shared, &bundle, &options, &mut reporter, &mut |_| true);
+        let control = shared.link().control.clone();
+        Over {
+            result,
+            control,
+            device,
+        }
+    }
+
+    /// Cancels the run as it reaches `phase`.
+    fn cancel_at(phase: Phase) -> impl FnMut(&Event, &Cancel) {
+        move |event, cancel| {
+            if matches!(event, Event::Phase(seen) if *seen == phase) {
+                cancel.cancel();
+            }
+        }
+    }
+
+    /// The vendor requests from the last `from` on, STATUS polls dropped.
+    fn after(control: &[(u8, u16)], from: (u8, u16)) -> Vec<(u8, u16)> {
+        let start = control.iter().rposition(|sent| *sent == from).expect("the marker");
+        control[start..]
+            .iter()
+            .copied()
+            .filter(|(request, _)| *request != ignition::REQ_STATUS)
+            .collect()
+    }
+
+    fn sent(control: &[(u8, u16)], request: (u8, u16)) -> usize {
+        control.iter().filter(|sent| **sent == request).count()
+    }
+
+    /// The left's restart, END, and the STM32's restart, in that order and last.
+    const LEFT_THEN_STM32: [(u8, u16); 4] = [
+        (ignition::REQ_RELEASE_MD, 0),
+        (ignition::REQ_RESET_TARGET, 1),
+        (ignition::REQ_END, 0),
+        (ignition::REQ_RESET_TARGET, 0),
+    ];
+
+    #[test]
+    fn a_run_that_finishes_restarts_everything_once() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let run = flash_over_loopback(&blob, a_whole_run, false, |_, _| {});
+        assert_eq!(run.result.unwrap(), Outcome::Flashed);
+
+        // `boot_out` restarted each half once and the success path reset the
+        // STM32 once; the guard added nothing after it.
+        assert_eq!(sent(&run.control, (ignition::REQ_RELEASE_MD, 0)), 1);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 1)), 1);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 0)), 1);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 2)), 0);
+        assert_eq!(count(&run.device, (client::OS_GROUP, client::OS_CMD_RESET)), 1);
+        assert_eq!(run.control.last(), Some(&(ignition::REQ_RESET_TARGET, 0)));
+    }
+
+    #[test]
+    fn a_run_that_fails_before_either_half_restarts_both_and_the_stm32() {
+        // Refused at the right half's downgrade check, with both halves still
+        // in MCUboot from BEGIN.
+        let blob = bundled(
+            &signed_v(0x11, &[0xAA; 32], (0, 1, 0)),
+            &signed_v(0x22, &[0xBB; 32], (0, 1, 0)),
+        );
+        let run = flash_over_loopback(&blob, |_| {}, false, |_, _| {});
+        assert!(run.result.is_err());
+
+        // The right by its own SMP reset, then the left, END and the STM32.
+        assert_eq!(count(&run.device, (client::OS_GROUP, client::OS_CMD_RESET)), 1);
+        let tail = after(&run.control, (ignition::REQ_SELECT, 2));
+        assert_eq!(tail[0], (ignition::REQ_SELECT, 2));
+        assert!(tail.ends_with(&LEFT_THEN_STM32), "{tail:?}");
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 2)), 0);
+    }
+
+    #[test]
+    fn a_run_cancelled_before_the_right_half_restarts_both_and_says_cancelled() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let run = flash_over_loopback(&blob, a_whole_run, false, cancel_at(Phase::Writing(Half::Right)));
+
+        let err = classify(run.result.unwrap_err());
+        assert_eq!(err.kind(), &ErrorKind::Cancelled);
+        assert_eq!(err.message(), "The update was cancelled.");
+        // Nothing was written, and both halves were restarted out of MCUboot.
+        assert_eq!(count(&run.device, (img::GROUP, img::CMD_UPLOAD)), 0);
+        assert_eq!(count(&run.device, (client::OS_GROUP, client::OS_CMD_RESET)), 1);
+        let tail = after(&run.control, (ignition::REQ_SELECT, 2));
+        assert!(tail.ends_with(&LEFT_THEN_STM32), "{tail:?}");
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 2)), 0);
+    }
+
+    #[test]
+    fn a_run_cancelled_after_the_right_half_restarts_only_the_left_again() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let run = flash_over_loopback(&blob, a_whole_run, false, cancel_at(Phase::Writing(Half::Left)));
+
+        assert_eq!(classify(run.result.unwrap_err()).kind(), &ErrorKind::Cancelled);
+        // The right was already booted out by its own turn and is not reset
+        // a second time; the left still is.
+        assert_eq!(count(&run.device, (client::OS_GROUP, client::OS_CMD_RESET)), 1);
+        let tail = after(&run.control, (ignition::REQ_SELECT, 1));
+        assert_eq!(tail, [&[(ignition::REQ_SELECT, 1)][..], &LEFT_THEN_STM32[..]].concat());
+    }
+
+    #[test]
+    fn a_panic_mid_run_still_restarts_the_left_and_the_stm32() {
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let bundle = bundle::parse(&blob).expect("a bundle");
+        let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        a_whole_run(&device);
+        let shared = Shared::new(link);
+        let options = Options {
+            reply_timeout: Duration::from_millis(50),
+            timings: crate::Timings {
+                settle: Duration::ZERO,
+                ..crate::Timings::default()
+            },
+            ..Options::default()
+        };
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut events = |event: Event| {
+                if matches!(event, Event::Phase(Phase::Writing(Half::Left))) {
+                    panic!("a front end that panics");
+                }
+            };
+            let mut reporter = Reporter::new(&mut events);
+            let _ = flash_over(&shared, &bundle, &options, &mut reporter, &mut |_| true);
+        }));
+        assert!(unwound.is_err());
+
+        let control = shared.link().control.clone();
+        let tail = after(&control, (ignition::REQ_RELEASE_MD, 0));
+        assert_eq!(tail, LEFT_THEN_STM32);
+    }
+
+    #[test]
+    fn keeping_the_state_on_failure_restarts_nothing() {
+        let blob = bundled(
+            &signed_v(0x11, &[0xAA; 32], (0, 1, 0)),
+            &signed_v(0x22, &[0xBB; 32], (0, 1, 0)),
+        );
+        let run = flash_over_loopback(&blob, |_| {}, true, |_, _| {});
+        assert!(run.result.is_err());
+
+        assert_eq!(count(&run.device, (client::OS_GROUP, client::OS_CMD_RESET)), 0);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 1)), 0);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 0)), 0);
+        assert_eq!(sent(&run.control, (ignition::REQ_END, 0)), 0);
+    }
+
+    #[test]
+    fn a_pair_put_back_is_not_sent_back_into_mcuboot_on_the_way_out() {
+        // The revert booted both halves out; the failure that follows only
+        // ends the session and restarts the STM32. RESET_TARGET on the right
+        // would ask its running application to enter MCUboot.
+        let blob = bundled(&signed(0x11, &BUNDLE_HASH), &signed(0x22, &BUNDLE_HASH));
+        let run = flash_over_loopback(
+            &blob,
+            |device| {
+                a_whole_run(device);
+                device.answers_confirm(
+                    Half::Left,
+                    ConfirmAnswer {
+                        hash: Some(DEVICE_HASH.to_vec()),
+                        ..ConfirmAnswer::default()
+                    },
+                );
+            },
+            false,
+            |_, _| {},
+        );
+        assert!(run.result.is_err());
+
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 2)), 0);
+        // One left restart per pass (write and revert), none from the guard.
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 1)), 2);
+        assert_eq!(sent(&run.control, (ignition::REQ_RESET_TARGET, 0)), 1);
+        assert_eq!(run.control.last(), Some(&(ignition::REQ_RESET_TARGET, 0)));
+    }
+
+    #[test]
+    fn a_cancelled_bond_show_restarts_both_halves_and_the_stm32() {
+        let (link, device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        let cancel = Cancel::new();
+        let shared = Shared::with_cancel(link, cancel.clone());
+        let options = Options {
+            reply_timeout: Duration::from_millis(50),
+            cancel: cancel.clone(),
+            ..Options::default()
+        };
+        let mut events = |event: Event| {
+            if matches!(event, Event::Phase(Phase::OpeningSession)) {
+                cancel.cancel();
+            }
+        };
+        let mut reporter = Reporter::new(&mut events);
+        let result = bond_show_over(&shared, &options, &mut reporter);
+
+        assert_eq!(classify(result.unwrap_err()).kind(), &ErrorKind::Cancelled);
+        assert_eq!(count(&device, (client::OS_GROUP, client::OS_CMD_RESET)), 1);
+        let control = shared.link().control.clone();
+        let tail = after(&control, (ignition::REQ_SELECT, 2));
+        assert!(tail.ends_with(&LEFT_THEN_STM32), "{tail:?}");
+    }
+
+    #[test]
+    fn a_cancelled_link_refuses_transfers_until_the_restart_runs() {
+        let (link, _device) = LoopbackLink::new(pipe::MAX_PAYLOAD as u16);
+        let cancel = Cancel::new();
+        let mut shared = Shared::with_cancel(link, cancel.clone());
+        cancel.cancel();
+        assert!(shared.control_out(ignition::REQ_SELECT, 1).is_err());
+        assert!(shared.bulk_in(Duration::from_secs(5)).is_err());
+
+        Restart::new(&shared).restart();
+        // Nothing was held, so only END and the STM32's restart went out.
+        assert_eq!(
+            shared.link().control.clone(),
+            vec![(ignition::REQ_END, 0), (ignition::REQ_RESET_TARGET, 0)]
+        );
     }
 }

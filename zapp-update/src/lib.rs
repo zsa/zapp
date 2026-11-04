@@ -27,10 +27,15 @@
 //! });
 //! ```
 //!
-//! There is no cancellation: an update stopped half-way is what the confirm
-//! step exists to recover from, not something to offer as a button.
+//! A cable run can be stopped through [`Options::cancel`]: it returns
+//! [`ErrorKind::Cancelled`] after restarting whatever it left in a bootloader,
+//! both halves and the STM32. Leaving a cable run any other way, an error or a
+//! panic that unwinds, restarts them the same way. The Bluetooth path ignores
+//! the flag.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -81,6 +86,31 @@ pub struct Options {
     pub link: BleLink,
     /// How long each wait may take.
     pub timings: Timings,
+    /// Stops a cable run from another thread. Bluetooth ignores it.
+    pub cancel: Cancel,
+}
+
+/// A flag that stops a running cable update.
+///
+/// Clones share the flag. The run stops at its next USB transfer, restarts
+/// both halves and the STM32 out of their bootloaders, and returns
+/// [`ErrorKind::Cancelled`].
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks the run to stop.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for Options {
@@ -93,6 +123,7 @@ impl Default for Options {
             keep_ignition: false,
             link: BleLink::default(),
             timings: Timings::default(),
+            cancel: Cancel::default(),
         }
     }
 }

@@ -10,7 +10,7 @@ use zapp_smp::image;
 use zapp_smp::settings::{self, EsbConfig};
 use zapp_update::text::{named, short, sizes};
 use zapp_update::wired::{self, HalfKey, MatchState, ShowReport};
-use zapp_update::{Bundle, Half, Options, Outcome};
+use zapp_update::{Bundle, Cancel, Half, Options, Outcome};
 
 use crate::screen::Screen;
 use crate::zsab::UP_TO_DATE;
@@ -39,6 +39,24 @@ fn reply_timeout() -> Duration {
         .unwrap_or(Options::default().reply_timeout)
 }
 
+/// A cancel flag Ctrl-C sets, so a run it stops still restarts the keyboard on
+/// its way out. A second Ctrl-C quits at once.
+fn cancel_on_ctrl_c() -> Cancel {
+    let cancel = Cancel::new();
+    let flag = cancel.clone();
+    let handler = ctrlc::set_handler(move || {
+        if flag.is_cancelled() {
+            std::process::exit(130);
+        }
+        eprintln!("\nStopping and restarting the keyboard. Press Ctrl-C again to quit now.");
+        flag.cancel();
+    });
+    if let Err(err) = handler {
+        log::debug!("cannot catch Ctrl-C: {err}");
+    }
+    cancel
+}
+
 /// Writes both halves from one bundle.
 pub fn flash(bundle: &Bundle, force: bool) -> Result<()> {
     announce(bundle);
@@ -48,6 +66,7 @@ pub fn flash(bundle: &Bundle, force: bool) -> Result<()> {
         reply_timeout: reply_timeout(),
         keep_state_on_failure: keep_state_on_failure(),
         keep_ignition: keep_ignition(),
+        cancel: cancel_on_ctrl_c(),
         ..Options::default()
     };
     let mut screen = Screen::default();
@@ -103,6 +122,7 @@ pub fn bond(key: Option<&str>) -> Result<()> {
 
     let options = Options {
         reply_timeout: reply_timeout(),
+        cancel: cancel_on_ctrl_c(),
         ..Options::default()
     };
     let mut screen = Screen::default();
@@ -116,8 +136,12 @@ pub fn bond(key: Option<&str>) -> Result<()> {
 ///
 /// Prints the two fingerprints and whether they agree.
 pub fn bond_show() -> Result<()> {
+    let options = Options {
+        cancel: cancel_on_ctrl_c(),
+        ..Options::default()
+    };
     let mut screen = Screen::default();
-    let report = wired::bond_show(&Options::default(), &mut |event| screen.show(event))?;
+    let report = wired::bond_show(&options, &mut |event| screen.show(event))?;
     print_show(&report);
     Ok(())
 }

@@ -80,6 +80,9 @@ pub enum ErrorKind {
     /// Both halves kept the update, but the keyboard did not come back on USB
     /// with both halves reporting.
     NotBackOnUsb,
+    /// The run was cancelled through [`crate::Options::cancel`]; what it had
+    /// left in a bootloader was restarted.
+    Cancelled,
     /// Anything else.
     Other,
 }
