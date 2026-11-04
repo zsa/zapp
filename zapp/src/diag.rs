@@ -367,7 +367,7 @@ fn page_age(age_ms: u16) -> String {
 
 fn stm32_lines(d: &Stm32Diag) -> Vec<String> {
     let flag = |bit: u8| d.flags & bit != 0;
-    vec![
+    let mut lines = vec![
         format!("boot count: {}", d.boot_count),
         format!("uptime: {}", duration(u64::from(d.uptime_s) * 1000)),
         format!(
@@ -412,7 +412,15 @@ fn stm32_lines(d: &Stm32Diag) -> Vec<String> {
             "longest gap between left nRF frames: {}",
             duration(u64::from(d.max_rx_gap_ms))
         ),
-    ]
+    ];
+    if let (Some(probes), Some(resets)) = (d.left_probes, d.left_resets) {
+        lines.push(format!(
+            "left radio rescue: {probes} {}, {resets} {}",
+            if probes == 1 { "probe" } else { "probes" },
+            if resets == 1 { "restart" } else { "restarts" }
+        ));
+    }
+    lines
 }
 
 fn left_lines(d: &LeftDiag) -> Vec<String> {
@@ -1035,6 +1043,23 @@ mod tests {
             firmware: Some(("abc".into(), "def".into())),
             protocol: Some(4),
         }
+    }
+
+    #[test]
+    fn the_left_radio_rescue_line_shows_only_when_the_board_sends_it() {
+        let rescue = |d: &Stm32Diag| {
+            stm32_lines(d)
+                .into_iter()
+                .filter(|line| line.starts_with("left radio rescue"))
+                .collect::<Vec<_>>()
+        };
+        assert!(rescue(&stm32()).is_empty());
+        let counted = Stm32Diag {
+            left_probes: Some(2),
+            left_resets: Some(1),
+            ..stm32()
+        };
+        assert_eq!(rescue(&counted), ["left radio rescue: 2 probes, 1 restart"]);
     }
 
     #[test]

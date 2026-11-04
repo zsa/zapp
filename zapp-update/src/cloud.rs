@@ -12,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
 
-use crate::Bundle;
+use crate::{Bundle, Half};
 
 /// ZSA's update endpoints on CrabNebula Cloud.
 pub const ORG_ENDPOINT: &str = "https://cdn.crabnebula.app/update/zsa-technology-labs-inc";
@@ -63,6 +63,17 @@ pub fn client(user_agent: &str) -> Result<reqwest::blocking::Client> {
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("could not set up the HTTP client")
+}
+
+/// An HTTP client for a quick look at the update server, giving up after
+/// `timeout` in all.
+pub fn quick_client(user_agent: &str, timeout: Duration) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(timeout)
+        .timeout(timeout)
         .build()
         .context("could not set up the HTTP client")
 }
@@ -139,6 +150,69 @@ pub fn fetch_latest_radio(user_agent: &str) -> Result<RadioRelease> {
     let release = check_radio(&client, None)?
         .ok_or_else(|| anyhow!("The update server has no {RADIO_SUBJECT}."))?;
     download_radio(&client, release)
+}
+
+/// The first bytes of each half's image hash in a radio firmware release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadioHashes {
+    /// The release the bundle came from.
+    pub version: String,
+    pub left: Vec<u8>,
+    pub right: Vec<u8>,
+}
+
+impl RadioHashes {
+    /// The hashes of `bundle`, released as `version`.
+    pub fn of(version: &str, bundle: &Bundle) -> Option<Self> {
+        Some(Self {
+            version: version.to_string(),
+            left: bundle.hash(Half::Left)?,
+            right: bundle.hash(Half::Right)?,
+        })
+    }
+}
+
+/// What a board says its halves run, as `EVT_RADIO_INFO` carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningRadio<'a> {
+    /// Left version, `major.minor.revision`.
+    pub left_version: &'a str,
+    /// Leading bytes of the left image hash.
+    pub left_hash: &'a [u8],
+    /// Leading bytes of the right image hash, when the board knows it.
+    pub right_tag: Option<&'a [u8]>,
+}
+
+/// Whether radio firmware `latest` is an update for a board running `running`.
+///
+/// A later version is. The same version is when `hashes` of that release are
+/// at hand and either half's image differs from them. A version that does not
+/// parse is not.
+pub fn radio_offered(running: &RunningRadio, latest: &str, hashes: Option<&RadioHashes>) -> bool {
+    let (Ok(newer), Ok(older)) = (
+        is_newer(latest, running.left_version),
+        is_newer(running.left_version, latest),
+    ) else {
+        return false;
+    };
+    if newer {
+        return true;
+    }
+    if older {
+        return false;
+    }
+    let Some(hashes) = hashes.filter(|hashes| same_version(&hashes.version, latest)) else {
+        return false;
+    };
+    !hashes.left.starts_with(running.left_hash)
+        || running
+            .right_tag
+            .is_some_and(|tag| !hashes.right.starts_with(tag))
+}
+
+/// Whether two versions are the same release, by semver.
+fn same_version(a: &str, b: &str) -> bool {
+    matches!((is_newer(a, b), is_newer(b, a)), (Ok(false), Ok(false)))
 }
 
 /// `offered` when it is later than `current`, or whenever `current` is `None`.
@@ -318,6 +392,62 @@ mod tests {
         assert_eq!(newer_than(Some(release("0.1.20")), Some("0.1.20")).unwrap(), None);
         assert_eq!(newer_than(None, Some("0.1.20")).unwrap(), None);
         assert!(newer_than(Some(release("x")), Some("0.1.20")).is_err());
+    }
+
+    const LEFT: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const RIGHT: [u8; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
+
+    fn running<'a>(version: &'a str, left: &'a [u8], right: Option<&'a [u8]>) -> RunningRadio<'a> {
+        RunningRadio {
+            left_version: version,
+            left_hash: left,
+            right_tag: right,
+        }
+    }
+
+    fn hashes(version: &str) -> RadioHashes {
+        let full = |prefix: [u8; 8]| [prefix.as_slice(), &[0xEE; 24]].concat();
+        RadioHashes {
+            version: version.into(),
+            left: full(LEFT),
+            right: full(RIGHT),
+        }
+    }
+
+    #[test]
+    fn a_later_release_is_offered_by_version() {
+        let board = running("0.1.19", &LEFT, Some(&RIGHT));
+        assert!(radio_offered(&board, "0.1.20", None));
+        assert!(radio_offered(&board, "0.2.0", None));
+        assert!(!radio_offered(&board, "0.1.19", None));
+        assert!(!radio_offered(&board, "0.1.18", None));
+        assert!(!radio_offered(&board, "nonsense", None));
+        assert!(!radio_offered(&running("x", &LEFT, None), "0.1.20", None));
+    }
+
+    #[test]
+    fn the_same_version_is_offered_only_when_an_image_differs() {
+        let release = hashes("0.1.20");
+        let same = running("0.1.20", &LEFT, Some(&RIGHT));
+        assert!(!radio_offered(&same, "0.1.20", Some(&release)));
+
+        let right_old = running("0.1.20", &LEFT, Some(&[0; 8]));
+        assert!(radio_offered(&right_old, "0.1.20", Some(&release)));
+        let left_other = running("0.1.20", &[0; 8], Some(&RIGHT));
+        assert!(radio_offered(&left_other, "0.1.20", Some(&release)));
+        // A right half the board could not tell about is left out.
+        assert!(!radio_offered(&running("0.1.20", &LEFT, None), "0.1.20", Some(&release)));
+        // Without the release's hashes, the version alone decides.
+        assert!(!radio_offered(&right_old, "0.1.20", None));
+        // Hashes of another release say nothing about this one.
+        assert!(!radio_offered(&right_old, "0.1.20", Some(&hashes("0.1.19"))));
+    }
+
+    #[test]
+    fn a_board_ahead_of_the_feed_is_never_offered_it() {
+        let release = hashes("0.1.20");
+        let ahead = running("0.1.21", &[0; 8], Some(&[0; 8]));
+        assert!(!radio_offered(&ahead, "0.1.20", Some(&release)));
     }
 
     #[test]

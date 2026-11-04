@@ -45,6 +45,9 @@ pub const CMD_GET_PMIC_RAILS: u8 = 0x0F;
 /// Ask the board for one page of a diagnostic record: params are record,
 /// page and flags (`DIAG_FETCH`). Answered with `EVT_DIAG`.
 pub const CMD_GET_DIAG: u8 = 0x11;
+/// Ask the board which radio firmware each half runs. Only for boards at
+/// `RADIO_INFO_PROTOCOL` or later. Answered with `EVT_RADIO_INFO`.
+pub const CMD_GET_RADIO_INFO: u8 = 0x12;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -72,6 +75,9 @@ pub const EVT_PMIC_RAILS: u8 = 0x0F;
 // 0x10 is the firmware's ORYX_EVT_GET_SCAN_DIAG, unused by zapp.
 /// Answer to `CMD_GET_DIAG`. Binary and STOP_BIT-free: a 0xFE in it is data.
 pub const EVT_DIAG: u8 = 0x11;
+/// Answer to `CMD_GET_RADIO_INFO`. Binary and STOP_BIT-free: a 0xFE in a hash
+/// is data.
+pub const EVT_RADIO_INFO: u8 = 0x12;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
@@ -784,6 +790,8 @@ pub const DIAG_AGE_UNKNOWN: u16 = 0xFFFF;
 pub const DIAG_NEVER: u32 = 0xFFFF_FFFF;
 /// STM32 record size, layout version 1.
 pub const STM32_DIAG_SIZE: usize = 48;
+/// STM32 record size with the left nRF rescue counters appended.
+pub const STM32_DIAG_SIZE_RESCUE: usize = 50;
 /// Left nRF record size, layout version 1.
 pub const LEFT_DIAG_SIZE: usize = 90;
 
@@ -991,11 +999,18 @@ pub struct Stm32Diag {
     /// `DIAG_NEVER` when no frame has arrived.
     pub rx_age_ms: u32,
     pub max_rx_gap_ms: u32,
+    /// MCUboot probes sent to a silent left nRF; saturates. `None` from
+    /// firmware whose record stops at [`STM32_DIAG_SIZE`].
+    pub left_probes: Option<u8>,
+    /// Left nRF resets after MCUboot answered a probe; saturates.
+    pub left_resets: Option<u8>,
 }
 
 /// Decode an STM32 record (see [`diag_record`] for the length rule).
 pub fn parse_stm32_diag(bytes: &[u8]) -> Option<Stm32Diag> {
     let b = diag_record(bytes, STM32_DIAG_SIZE)?;
+    // The rescue counters, when the record's `len` and its bytes both reach them.
+    let rescue = diag_record(bytes, STM32_DIAG_SIZE_RESCUE);
     Some(Stm32Diag {
         boot_count: le16(b, 2),
         uptime_s: le32(b, 4),
@@ -1018,6 +1033,8 @@ pub fn parse_stm32_diag(bytes: &[u8]) -> Option<Stm32Diag> {
         frames_tx: le32(b, 36),
         rx_age_ms: le32(b, 40),
         max_rx_gap_ms: le32(b, 44),
+        left_probes: rescue.map(|r| r[48]),
+        left_resets: rescue.map(|r| r[49]),
     })
 }
 
@@ -1152,6 +1169,118 @@ pub fn parse_left_diag(bytes: &[u8]) -> Option<LeftDiag> {
     })
 }
 
+/// First Oryx protocol version that answers `CMD_GET_RADIO_INFO`.
+pub const RADIO_INFO_PROTOCOL: u8 = 0x06;
+/// `EVT_RADIO_INFO` payload format this host understands.
+pub const RADIO_INFO_FORMAT: u8 = 1;
+/// `EVT_RADIO_INFO` payload size: the bytes after the opcode.
+pub const RADIO_INFO_SIZE: usize = 26;
+/// Bytes of an image hash the answer carries.
+pub const RADIO_HASH_PREFIX: usize = 8;
+
+// `EVT_RADIO_INFO` flags.
+pub const RADIO_LEFT_VALID: u8 = 0x01;
+pub const RADIO_LEFT_CONFIRMED: u8 = 0x02;
+pub const RADIO_RIGHT_VALID: u8 = 0x04;
+pub const RADIO_RIGHT_CONFIRMED: u8 = 0x08;
+
+/// Byte offsets inside the `EVT_RADIO_INFO` payload.
+mod radio_info_offset {
+    pub const FORMAT: usize = 0;
+    pub const FLAGS: usize = 1;
+    pub const MAJOR: usize = 2;
+    pub const MINOR: usize = 3;
+    pub const REVISION: usize = 4;
+    pub const BUILD: usize = 6;
+    pub const LEFT_HASH: usize = 10;
+    pub const RIGHT_TAG: usize = 18;
+}
+
+/// Whether a board at Oryx protocol `version` answers `CMD_GET_RADIO_INFO`.
+pub fn has_radio_info(version: u8) -> bool {
+    version >= RADIO_INFO_PROTOCOL
+}
+
+/// An MCUboot image version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RadioVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub revision: u16,
+    pub build: u32,
+}
+
+impl std::fmt::Display for RadioVersion {
+    /// `major.minor.revision`; the build number is left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.revision)
+    }
+}
+
+/// The running left image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeftRadio {
+    pub version: RadioVersion,
+    /// First bytes of the image hash.
+    pub hash: [u8; RADIO_HASH_PREFIX],
+    pub confirmed: bool,
+}
+
+/// The running right image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RightRadio {
+    /// First bytes of the image hash.
+    pub tag: [u8; RADIO_HASH_PREFIX],
+    pub confirmed: bool,
+}
+
+/// What `EVT_RADIO_INFO` says about each half. `None` for a half the board
+/// could not tell about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RadioInfo {
+    pub left: Option<LeftRadio>,
+    pub right: Option<RightRadio>,
+}
+
+impl RadioInfo {
+    /// Whether the board told anything at all.
+    pub fn is_known(&self) -> bool {
+        self.left.is_some() || self.right.is_some()
+    }
+}
+
+/// Decode an `EVT_RADIO_INFO` payload, the bytes after the opcode. `None` when
+/// short; an unknown format reads as nothing known.
+pub fn parse_radio_info(params: &[u8]) -> Option<RadioInfo> {
+    use radio_info_offset as at;
+
+    let params = params.get(..RADIO_INFO_SIZE)?;
+    if params[at::FORMAT] != RADIO_INFO_FORMAT {
+        return Some(RadioInfo::default());
+    }
+    let flags = params[at::FLAGS];
+    let prefix = |at: usize| {
+        let mut hash = [0u8; RADIO_HASH_PREFIX];
+        hash.copy_from_slice(&params[at..at + RADIO_HASH_PREFIX]);
+        hash
+    };
+    let left = (flags & RADIO_LEFT_VALID != 0).then(|| LeftRadio {
+        version: RadioVersion {
+            major: params[at::MAJOR],
+            minor: params[at::MINOR],
+            revision: le16(params, at::REVISION),
+            build: le32(params, at::BUILD),
+        },
+        hash: prefix(at::LEFT_HASH),
+        confirmed: flags & RADIO_LEFT_CONFIRMED != 0,
+    });
+    let right = (flags & RADIO_RIGHT_VALID != 0).then(|| RightRadio {
+        tag: prefix(at::RIGHT_TAG),
+        confirmed: flags & RADIO_RIGHT_CONFIRMED != 0,
+    });
+    Some(RadioInfo { left, right })
+}
+
 /// Events from a connected keyboard's raw HID interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidEvent {
@@ -1160,7 +1289,8 @@ pub enum HidEvent {
         layout_id: String,
         revision_id: String,
     },
-    /// Feature-gating protocol version (0x03 = smart layer, 0x04 = RGB).
+    /// Feature-gating protocol version (0x03 = smart layer, 0x04 = RGB,
+    /// 0x06 = radio info).
     ProtocolVersion(u8),
     /// The active layer changed.
     LayerChanged(u8),
@@ -1188,6 +1318,8 @@ pub enum HidEvent {
     PmicRails(PmicRailsReport),
     /// The board answered `CMD_GET_DIAG` with one page of a record.
     Diag(DiagPage),
+    /// The board answered `CMD_GET_RADIO_INFO`.
+    RadioInfo(RadioInfo),
     /// The read loop ended (device unplugged or errored).
     Disconnected,
 }
@@ -1214,7 +1346,7 @@ pub fn parse_packet(data: &[u8]) -> Option<(u8, &[u8])> {
     }
     if matches!(
         cmd,
-        EVT_TELEMETRY | EVT_CHARGE_TELEMETRY | EVT_PMIC_RAILS | EVT_DIAG
+        EVT_TELEMETRY | EVT_CHARGE_TELEMETRY | EVT_PMIC_RAILS | EVT_DIAG | EVT_RADIO_INFO
     ) {
         // Binary payload carrying its own length: 0xFE in it is a value, not
         // a terminator, and truncating there would eat a 254% battery or a
@@ -1487,6 +1619,10 @@ pub fn process_packet(data: &[u8]) -> (Option<HidEvent>, Vec<Packet>) {
         },
         EVT_DIAG => match parse_diag_page(params) {
             Some(page) => HidEvent::Diag(page),
+            None => return (None, Vec::new()),
+        },
+        EVT_RADIO_INFO => match parse_radio_info(params) {
+            Some(info) => HidEvent::RadioInfo(info),
             None => return (None, Vec::new()),
         },
         EVT_GET_PROTOCOL_VERSION => match params.first() {
@@ -2687,6 +2823,92 @@ mod tests {
         assert!(DiagRecord::Left.is_left() && !DiagRecord::Stm32Previous.is_left());
     }
 
+    /// An `EVT_RADIO_INFO` report: left 0.2.3 build 7, both halves known.
+    fn radio_report(format: u8, flags: u8) -> Vec<u8> {
+        let mut r = vec![EVT_RADIO_INFO, format, flags, 0, 2];
+        r.extend_from_slice(&3u16.to_le_bytes());
+        r.extend_from_slice(&7u32.to_le_bytes());
+        r.extend_from_slice(&[0xFE, 1, 2, 3, 4, 5, 6, 7]);
+        r.extend_from_slice(&[0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xFE]);
+        assert_eq!(r.len(), 1 + RADIO_INFO_SIZE);
+        r.resize(REPORT_SIZE, 0);
+        r
+    }
+
+    #[test]
+    fn radio_info_decodes_both_halves() {
+        let flags = RADIO_LEFT_VALID | RADIO_LEFT_CONFIRMED | RADIO_RIGHT_VALID;
+        let (event, replies) = process_packet(&radio_report(RADIO_INFO_FORMAT, flags));
+        assert!(replies.is_empty());
+        let Some(HidEvent::RadioInfo(info)) = event else {
+            panic!("not radio info: {event:?}");
+        };
+        let left = info.left.unwrap();
+        assert_eq!(
+            left.version,
+            RadioVersion {
+                major: 0,
+                minor: 2,
+                revision: 3,
+                build: 7
+            }
+        );
+        assert_eq!(left.version.to_string(), "0.2.3");
+        // A 0xFE in a hash is data, not a terminator.
+        assert_eq!(left.hash, [0xFE, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(left.confirmed);
+        let right = info.right.unwrap();
+        assert_eq!(right.tag, [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xFE]);
+        assert!(!right.confirmed);
+        assert!(info.is_known());
+    }
+
+    #[test]
+    fn radio_info_reads_each_half_by_its_flag() {
+        let report = radio_report(RADIO_INFO_FORMAT, RADIO_LEFT_VALID | RADIO_RIGHT_CONFIRMED);
+        let info = parse_radio_info(&report[1..]).unwrap();
+        assert!(info.left.is_some());
+        assert_eq!(info.right, None);
+
+        let report = radio_report(RADIO_INFO_FORMAT, RADIO_RIGHT_VALID | RADIO_RIGHT_CONFIRMED);
+        let info = parse_radio_info(&report[1..]).unwrap();
+        assert_eq!(info.left, None);
+        assert!(info.right.unwrap().confirmed);
+    }
+
+    #[test]
+    fn radio_info_flags_zero_is_unknown() {
+        let info = parse_radio_info(&radio_report(RADIO_INFO_FORMAT, 0)[1..]).unwrap();
+        assert_eq!(info, RadioInfo::default());
+        assert!(!info.is_known());
+    }
+
+    #[test]
+    fn radio_info_in_another_format_is_unknown() {
+        let all =
+            RADIO_LEFT_VALID | RADIO_LEFT_CONFIRMED | RADIO_RIGHT_VALID | RADIO_RIGHT_CONFIRMED;
+        for format in [0, 2, 0xFF] {
+            let (event, _) = process_packet(&radio_report(format, all));
+            assert_eq!(event, Some(HidEvent::RadioInfo(RadioInfo::default())));
+        }
+    }
+
+    #[test]
+    fn short_radio_info_is_dropped() {
+        let report = radio_report(RADIO_INFO_FORMAT, RADIO_LEFT_VALID);
+        assert_eq!(parse_radio_info(&report[1..RADIO_INFO_SIZE]), None);
+        assert_eq!(parse_radio_info(&[]), None);
+        assert_eq!(process_packet(&report[..RADIO_INFO_SIZE]).0, None);
+    }
+
+    #[test]
+    fn radio_info_needs_protocol_6() {
+        assert!(!has_radio_info(0x05));
+        assert!(has_radio_info(0x06));
+        assert!(has_radio_info(0x07));
+        assert_eq!(&encode_packet(CMD_GET_RADIO_INFO, &[])[..2], &[0x12, 0]);
+    }
+
     #[test]
     fn page_count_rounds_up() {
         assert_eq!(diag_page_count(0), 0);
@@ -2743,8 +2965,33 @@ mod tests {
                 frames_tx: 23_456,
                 rx_age_ms: 12,
                 max_rx_gap_ms: 0x0001_FEFE,
+                left_probes: None,
+                left_resets: None,
             }
         );
+    }
+
+    #[test]
+    fn the_stm32_rescue_counters_decode_only_from_the_longer_record() {
+        // Older firmware: 48 bytes, len 46.
+        let short = parse_stm32_diag(&stm32_record()).unwrap();
+        assert_eq!((short.left_probes, short.left_resets), (None, None));
+
+        // Newer firmware: 50 bytes, len 48.
+        let mut long = stm32_record();
+        long[1] = (STM32_DIAG_SIZE_RESCUE - 2) as u8;
+        long.extend_from_slice(&[3, 1]);
+        let diag = parse_stm32_diag(&long).unwrap();
+        assert_eq!((diag.left_probes, diag.left_resets), (Some(3), Some(1)));
+        assert_eq!(diag.max_rx_gap_ms, short.max_rx_gap_ms);
+
+        // A len that claims them without the bytes, or bytes without the len.
+        let mut cut = long.clone();
+        cut.truncate(STM32_DIAG_SIZE_RESCUE - 1);
+        assert_eq!(parse_stm32_diag(&cut).unwrap().left_probes, None);
+        let mut unclaimed = long;
+        unclaimed[1] = (STM32_DIAG_SIZE - 2) as u8;
+        assert_eq!(parse_stm32_diag(&unclaimed).unwrap().left_probes, None);
     }
 
     #[test]

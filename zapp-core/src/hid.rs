@@ -40,6 +40,10 @@ pub use zapp_hid_proto::{
     Stm32Diag, ThreadStall, assemble_diag_record, diag_page_count, diag_request, nrf_reset_causes,
     parse_left_diag, parse_stm32_diag, stm32_reset_causes,
 };
+pub use zapp_hid_proto::{
+    CMD_GET_RADIO_INFO, LeftRadio, RADIO_INFO_PROTOCOL, RadioInfo, RadioVersion, RightRadio,
+    has_radio_info,
+};
 
 /// Write packet size: report ID byte + 32-byte report.
 const PACKET_SIZE: usize = REPORT_SIZE + 1;

@@ -4,9 +4,11 @@ use std::time::{Duration, Instant};
 
 use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::hid::{
-    ChargeTelemetry, HidConnection, HidEvent, PmicRailsReport, Telemetry,
-    CMD_GET_CHARGE_TELEMETRY, CMD_GET_PMIC_RAILS, CMD_GET_TELEMETRY,
+    ChargeTelemetry, HidConnection, HidEvent, PmicRailsReport, RadioInfo, Telemetry,
+    CMD_GET_CHARGE_TELEMETRY, CMD_GET_PMIC_RAILS, CMD_GET_RADIO_INFO, CMD_GET_TELEMETRY,
+    has_radio_info,
 };
+
 use zapp_wired::ignition::usb::UsbLink;
 use zapp_wired::WiredError;
 
@@ -103,6 +105,13 @@ pub(crate) fn voyager2_among(attached: &[UsbDevice]) -> Option<&UsbDevice> {
 /// ordinary case and must stay short enough not to be felt.
 const TELEMETRY_WAIT: Duration = Duration::from_millis(500);
 
+/// How long a board gets to answer `CMD_GET_RADIO_INFO`, which it passes on to
+/// the left radio first. The wait `zapp diag` gives a diagnostic page.
+pub const RADIO_INFO_WAIT: Duration = Duration::from_millis(1500);
+/// How long a Bluetooth board gets to finish the handshake that says its
+/// protocol version.
+const BLE_HANDSHAKE_WAIT: Duration = Duration::from_secs(3);
+
 /// What the board answers, on one connection: the summary always, and the
 /// detail behind it only when it was asked for. A board whose firmware predates
 /// any of these commands never answers it, which is why each wait can elapse.
@@ -111,51 +120,121 @@ pub type UsbTelemetry = (Telemetry, Option<ChargeTelemetry>, Option<PmicRailsRep
 /// Asks a wired board about itself: the telemetry summary, the charge detail,
 /// and the PMIC rails when `rails` is set.
 pub fn usb_telemetry(device: &UsbDevice, rails: bool) -> Option<UsbTelemetry> {
+    usb_report(device, rails, false).map(|(telemetry, _)| telemetry)
+}
+
+/// [`usb_telemetry`], plus the radio firmware each half runs when `radio` is
+/// set. The radio answer is `None` for firmware before
+/// [`zapp_core::hid::RADIO_INFO_PROTOCOL`], and nothing known when the board
+/// did not answer.
+pub fn usb_report(
+    device: &UsbDevice,
+    rails: bool,
+    radio: bool,
+) -> Option<(UsbTelemetry, Option<RadioInfo>)> {
     if device.bootloader.is_some() {
         return None; // a board in its bootloader runs no keyboard firmware
     }
 
-    let conn = HidConnection::open(device.vid, device.pid).ok()?;
-    let telemetry = ask(&conn, CMD_GET_TELEMETRY, |event| match event {
+    let mut probe = Probe::new(HidConnection::open(device.vid, device.pid).ok()?);
+    let telemetry = probe.ask(CMD_GET_TELEMETRY, |event| match event {
         HidEvent::Telemetry(telemetry) => Some(telemetry),
         _ => None,
     })?;
     // Asked for every listing, verbose or not: the charger phase words the
     // board's own line, and the two wordings must not differ.
-    let charge = ask(&conn, CMD_GET_CHARGE_TELEMETRY, |event| match event {
+    let charge = probe.ask(CMD_GET_CHARGE_TELEMETRY, |event| match event {
         HidEvent::ChargeTelemetry(telemetry) => Some(telemetry),
         _ => None,
     });
     let rails = rails
         .then(|| {
-            ask(&conn, CMD_GET_PMIC_RAILS, |event| match event {
+            probe.ask(CMD_GET_PMIC_RAILS, |event| match event {
                 HidEvent::PmicRails(report) => Some(report),
                 _ => None,
             })
         })
         .flatten();
+    let radio = radio.then(|| probe.radio_info(TELEMETRY_WAIT)).flatten();
 
-    Some((telemetry, charge, rails))
+    Some(((telemetry, charge, rails), radio))
 }
 
-/// Send one query and wait out the answer `take` is looking for.
-///
-/// Everything else on the way past is the connection's own handshake, which
-/// runs whether anything wants it or not.
-fn ask<T>(conn: &HidConnection, cmd: u8, take: impl Fn(HidEvent) -> Option<T>) -> Option<T> {
-    conn.send(cmd, &[]);
+/// Asks a bonded Bluetooth board which radio firmware each half runs, over
+/// its Oryx service. `key` is the platform handle. Same answers as
+/// [`usb_report`]'s radio part; `None` also when the service cannot be opened.
+pub fn ble_radio_info(key: &str) -> Option<RadioInfo> {
+    let connection = zapp_ble::oryx::open(Some(key))
+        .inspect_err(|err| log::debug!("could not open the Oryx service on {key}: {err}"))
+        .ok()?;
+    let mut probe = Probe::new(connection);
+    let radio = probe.radio_info(BLE_HANDSHAKE_WAIT);
+    probe.conn.close();
+    radio
+}
 
-    let deadline = Instant::now() + TELEMETRY_WAIT;
-    loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        match conn.recv_timeout(left)? {
-            HidEvent::Disconnected => return None,
-            event => {
-                if let Some(answer) = take(event) {
-                    return Some(answer);
+/// One connection, and the protocol version its handshake reported.
+struct Probe {
+    conn: HidConnection,
+    protocol: Option<u8>,
+}
+
+impl Probe {
+    fn new(conn: HidConnection) -> Self {
+        Self {
+            conn,
+            protocol: None,
+        }
+    }
+
+    /// Send one query and wait out the answer `take` is looking for.
+    fn ask<T>(&mut self, cmd: u8, take: impl Fn(HidEvent) -> Option<T>) -> Option<T> {
+        self.conn.send(cmd, &[]);
+        self.wait(TELEMETRY_WAIT, take)
+    }
+
+    /// Wait up to `wait` for the event `take` is looking for. Handshake events
+    /// on the way past are recorded.
+    fn wait<T>(&mut self, wait: Duration, take: impl Fn(HidEvent) -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match self.conn.recv_timeout(left)? {
+                HidEvent::Disconnected => return None,
+                HidEvent::ProtocolVersion(version) => self.protocol = Some(version),
+                event => {
+                    if let Some(answer) = take(event) {
+                        return Some(answer);
+                    }
                 }
             }
         }
+    }
+
+    /// The protocol version, waiting up to `wait` for it if it has not come.
+    fn protocol(&mut self, wait: Duration) -> Option<u8> {
+        if self.protocol.is_none() {
+            self.wait(wait, |_| None::<()>);
+        }
+        self.protocol
+    }
+
+    /// Asks for the radio firmware when the protocol has the command.
+    fn radio_info(&mut self, protocol_wait: Duration) -> Option<RadioInfo> {
+        let protocol = self.protocol(protocol_wait);
+        if !protocol.is_some_and(has_radio_info) {
+            log::debug!("no radio info at protocol {protocol:?}");
+            return None;
+        }
+        self.conn.send(CMD_GET_RADIO_INFO, &[]);
+        let answer = self.wait(RADIO_INFO_WAIT, |event| match event {
+            HidEvent::RadioInfo(info) => Some(info),
+            _ => None,
+        });
+        if answer.is_none() {
+            log::debug!("the board did not answer the radio info request");
+        }
+        Some(answer.unwrap_or_default())
     }
 }
 

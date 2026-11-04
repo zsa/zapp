@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use zapp_ble::{Battery, BleMonitor, ChargeDetail, Level, Presence};
@@ -24,12 +24,13 @@ use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
     BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-    HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, Telemetry,
+    HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
 use zapp_wired::Ignition;
-use zapp_update::probe::usb_telemetry;
+use zapp_update::cloud::{radio_offered, Release, RunningRadio};
+use zapp_update::probe::{ble_radio_info, usb_report};
 use zapp_update::{route, Transport};
 
 use crate::screen::Screen;
@@ -41,15 +42,21 @@ struct Cli {
     command: Commands,
 }
 
+/// What `zapp update` updates besides the Oryx layout.
+#[derive(Clone, Copy, ValueEnum)]
+enum UpdateTarget {
+    /// The latest Voyager 2 radio firmware.
+    Radio,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash firmware from a local file, an Oryx URL, or the latest radio firmware
+    /// Flash firmware from a local file or an Oryx URL
     #[command(
-        long_about = "Flash firmware from a local file, an Oryx URL, or the latest radio firmware.\n\n\
+        long_about = "Flash firmware from a local file or an Oryx URL.\n\n\
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
-            bundles carrying both wireless halves, and Oryx layout URLs. `radio` \
-            downloads the latest Voyager 2 radio firmware bundle from the ZSA \
-            update server and flashes it like a .zsab file. A \
+            bundles carrying both wireless halves, and Oryx layout URLs. For the \
+            latest Voyager 2 radio firmware, run `zapp update radio`. A \
             Voyager 2 keyboard image goes over the cable when the keyboard is \
             on USB and over Bluetooth otherwise. A .zsab bundle goes over the \
             cable only. Any other keyboard's firmware goes over the cable. A \
@@ -60,13 +67,11 @@ enum Commands {
             zapp flash .build/zsa_voyager_tng_default.bin --device \"Voyager\"\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash voyager2_0.1.9.zsab --force\n  \
-            zapp flash radio\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
     Flash {
-        /// Path to a firmware file (.bin, .hex or .zsab), an Oryx URL, or
-        /// `radio` for the latest radio firmware (`./radio` for a file of that name).
+        /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
         firmware: String,
         /// Write a half even if it already carries the image, or the bundle is
         /// older than what is installed. Applies to .zsab bundles only.
@@ -77,13 +82,28 @@ enum Commands {
         #[arg(long, short = 'd')]
         device: Option<String>,
     },
-    /// Check Oryx for updates on your layout and flash if available
+    /// Check Oryx for updates on your layout and flash if available, or update the radio firmware
     #[command(
         long_about = "Check Oryx for updates on your layout and flash if available.\n\n\
             Reads a connected ZSA keyboard's layout and revision from its USB serial \
-            number, and downloads and flashes the newest revision Oryx has for it."
+            number, and downloads and flashes the newest revision Oryx has for it.\n\n\
+            `zapp update radio` downloads the latest Voyager 2 radio firmware bundle \
+            from the ZSA update server and flashes it like a .zsab file, with the \
+            keyboard fully wired.",
+        after_long_help = "Examples:\n  \
+            zapp update\n  \
+            zapp update radio\n  \
+            zapp update radio --force"
     )]
-    Update,
+    Update {
+        /// What to update instead of the Oryx layout.
+        #[arg(value_enum)]
+        target: Option<UpdateTarget>,
+        /// Write a half even if it already carries the radio firmware, or the
+        /// download is older than what is installed. Radio only.
+        #[arg(long, requires = "target")]
+        force: bool,
+    },
     /// List the ZSA keyboards this machine can see, wired and wireless
     #[command(long_about = "List the ZSA keyboards this machine can see.\n\n\
             Wired boards are read straight from USB. Bluetooth boards are listed \
@@ -174,7 +194,7 @@ enum Commands {
 /// Runs the command the arguments name, and says one line about a failure.
 fn main() {
     let cli = Cli::parse();
-    flash_log::init(matches!(cli.command, Commands::Flash { .. } | Commands::Update));
+    flash_log::init(matches!(cli.command, Commands::Flash { .. } | Commands::Update { .. }));
 
     let result = dispatch(cli.command);
     flash_log::finish(&result);
@@ -194,13 +214,15 @@ fn dispatch(command: Commands) -> Result<()> {
         } => {
             if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
-            } else if firmware == RADIO {
-                cmd_flash_radio(force, device.as_deref())
             } else {
                 cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
             }
         }
-        Commands::Update => cmd_update(),
+        Commands::Update { target: None, .. } => cmd_update(),
+        Commands::Update {
+            target: Some(UpdateTarget::Radio),
+            force,
+        } => cmd_update_radio(force),
         Commands::Devices {
             scan,
             skip_bluetooth,
@@ -282,6 +304,7 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
     // The Bluetooth identities the boards on the cable named, which the roster
     // below matches its bonded entries against.
     let mut on_usb: Vec<String> = Vec::new();
+    let mut feed = RadioFeed::default();
 
     println!("USB");
     match &wired {
@@ -297,6 +320,11 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
                 );
                 for line in &report.lines {
                     println!("    {line}");
+                }
+                if let Some(radio) = &report.radio {
+                    for line in radio_lines(radio, verbose, &mut feed, Transport::Usb) {
+                        println!("    {line}");
+                    }
                 }
                 on_usb.extend(report.ble_address);
             }
@@ -342,9 +370,145 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
         for line in ble_report(detail.as_ref()) {
             println!("    {line}");
         }
+        if let Some(radio) = ble_radio(&board, &on_usb) {
+            for line in radio_lines(&radio, verbose, &mut feed, Transport::Bluetooth) {
+                println!("    {line}");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// How long `zapp devices` waits on the update server.
+const FEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The latest radio firmware release, asked for at most once per run.
+#[derive(Default)]
+struct RadioFeed(Option<Option<Release>>);
+
+impl RadioFeed {
+    /// The latest release, or `None` when the server could not be asked.
+    fn latest(&mut self) -> Option<&Release> {
+        self.0.get_or_insert_with(latest_radio).as_ref()
+    }
+}
+
+fn latest_radio() -> Option<Release> {
+    let spinner = new_spinner("Checking for radio firmware...");
+    let latest = zapp_update::cloud::quick_client(
+        concat!("zapp/", env!("CARGO_PKG_VERSION")),
+        FEED_TIMEOUT,
+    )
+    .and_then(|client| zapp_update::cloud::check_radio(&client, None));
+    spinner.finish_and_clear();
+    latest
+        .inspect_err(|err| log::debug!("could not check for radio firmware: {err:#}"))
+        .ok()
+        .flatten()
+}
+
+/// What a Bluetooth Voyager 2 runs, asked over its Oryx service. Only for a
+/// board connected to this machine and not already read over the cable.
+fn ble_radio(board: &zapp_ble::BleBoard, on_usb: &[String]) -> Option<RadioInfo> {
+    let on_cable = board
+        .address
+        .as_deref()
+        .is_some_and(|address| on_usb.iter().any(|wired| wired == address));
+    if board.keyboard != Some(ids::Keyboard::Voyager2)
+        || board.presence != Presence::Connected
+        || on_cable
+    {
+        return None;
+    }
+    let spinner = new_spinner("Asking for radio firmware...");
+    let radio = ble_radio_info(&board.key);
+    spinner.finish_and_clear();
+    radio
+}
+
+/// The lines about a board's radio firmware: what each half runs, then a
+/// newer release when the feed has one.
+fn radio_lines(
+    radio: &RadioInfo,
+    verbose: bool,
+    feed: &mut RadioFeed,
+    over: Transport,
+) -> Vec<String> {
+    let mut lines = vec![radio_line(radio, verbose)];
+    if radio.left.is_some()
+        && let Some(latest) = feed.latest()
+        && let Some(offer) = radio_offer(radio, latest, over)
+    {
+        lines.push(offer);
+    }
+    lines
+}
+
+/// "radio    · left 0.1.20 · 0a1b2c3d · right 4e5f6a7b", with full hashes,
+/// build number and confirm state under `--verbose`.
+fn radio_line(radio: &RadioInfo, verbose: bool) -> String {
+    if !radio.is_known() {
+        return format!("{:<8} · unknown", "radio");
+    }
+    let short = if verbose { 8 } else { 4 };
+    let confirmed = |confirmed: bool| match (verbose, confirmed) {
+        (true, true) => " · confirmed",
+        (_, false) => " · not confirmed",
+        (false, true) => "",
+    };
+    let left = match &radio.left {
+        Some(left) => {
+            let build = match left.version.build {
+                build if verbose && build != 0 => format!("+{build}"),
+                _ => String::new(),
+            };
+            format!(
+                "left {}{build} · {}{}",
+                left.version,
+                hex(&left.hash[..short]),
+                confirmed(left.confirmed)
+            )
+        }
+        None => "left unknown".to_string(),
+    };
+    let right = match &radio.right {
+        Some(right) => format!(
+            "right {}{}",
+            hex(&right.tag[..short]),
+            confirmed(right.confirmed)
+        ),
+        None => "right unknown".to_string(),
+    };
+    format!("{:<8} · {left} · {right}", "radio")
+}
+
+/// The line saying `latest` is newer than what the board runs, if it is.
+fn radio_offer(radio: &RadioInfo, latest: &Release, over: Transport) -> Option<String> {
+    let left = radio.left.as_ref()?;
+    let version = left.version.to_string();
+    let running = RunningRadio {
+        left_version: &version,
+        left_hash: &left.hash,
+        right_tag: radio.right.as_ref().map(|right| right.tag.as_slice()),
+    };
+    if !radio_offered(&running, &latest.version, None) {
+        return None;
+    }
+    Some(match over {
+        Transport::Usb => format!(
+            "Radio firmware {} available. Run `zapp update radio`.",
+            latest.version
+        ),
+        Transport::Bluetooth => format!(
+            "Radio firmware {} available. Connect the USB cable and run `zapp update radio`.",
+            latest.version
+        ),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Ask a wired board about itself, and say what it answered.
@@ -359,7 +523,7 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
     if device.keyboard != Some(ids::Keyboard::Voyager2) {
         return WiredReport::default();
     }
-    let Some((telemetry, detail, rails)) = usb_telemetry(device, verbose) else {
+    let Some(((telemetry, detail, rails), radio)) = usb_report(device, verbose, true) else {
         return WiredReport::default();
     };
 
@@ -374,18 +538,21 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
         charge: wired_charge(&telemetry, detail.as_ref()),
         lines,
         ble_address: telemetry.ble.map(|ble| ble.address),
+        radio,
     }
 }
 
 /// What a wired board answered: what its halves have left, which goes on the
 /// board's own line; the lines to print under it, which only `--verbose` asks
 /// for; and the Bluetooth address it is using, which the roster matches its
-/// bonded entries against.
+/// bonded entries against; and the radio firmware it runs, for firmware that
+/// can say.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WiredReport {
     charge: String,
     lines: Vec<String>,
     ble_address: Option<String>,
+    radio: Option<RadioInfo>,
 }
 
 /// What each half of a wired board has left, in the shape and the wording the
@@ -1020,7 +1187,7 @@ fn bundle_route() -> Result<Transport> {
     let over = route();
     if over == Transport::Bluetooth && !BLUETOOTH_BUNDLES {
         bail!(
-            "A .zsab bundle needs the keyboard fully wired: plugged into your \
+            "A radio firmware update needs the keyboard fully wired: plugged into your \
              computer with the USB cable, and both halves connected with their cable."
         );
     }
@@ -1028,10 +1195,8 @@ fn bundle_route() -> Result<Transport> {
 }
 
 /// The `flash` argument that names the latest radio firmware.
-const RADIO: &str = "radio";
-
 /// Downloads the latest radio firmware and flashes it as a bundle.
-fn cmd_flash_radio(force: bool, device: Option<&str>) -> Result<()> {
+fn cmd_update_radio(force: bool) -> Result<()> {
     let over = bundle_route()?;
     let client = zapp_update::cloud::client(concat!("zapp/", env!("CARGO_PKG_VERSION")))?;
     let spinner = new_spinner("Checking for radio firmware...");
@@ -1050,7 +1215,7 @@ fn cmd_flash_radio(force: bool, device: Option<&str>) -> Result<()> {
     let radio = zapp_update::cloud::download_radio(&client, release);
     spinner.finish_and_clear();
     let radio = radio?;
-    flash_bundle(&radio.bundle, over, force, device)
+    flash_bundle(&radio.bundle, over, force, None)
 }
 
 /// Whether the file leads with the .zsab magic.
@@ -2175,6 +2340,84 @@ mod tests {
             }),
             "0x80"
         );
+    }
+
+    fn radio(left_confirmed: bool, right: bool) -> RadioInfo {
+        use zapp_core::hid::{LeftRadio, RadioVersion, RightRadio};
+        RadioInfo {
+            left: Some(LeftRadio {
+                version: RadioVersion {
+                    major: 0,
+                    minor: 1,
+                    revision: 20,
+                    build: 7,
+                },
+                hash: [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71],
+                confirmed: left_confirmed,
+            }),
+            right: right.then_some(RightRadio {
+                tag: [0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0x0e, 0x1f],
+                confirmed: true,
+            }),
+        }
+    }
+
+    fn radio_release(version: &str) -> Release {
+        Release {
+            version: version.into(),
+            notes: None,
+            url: "u".into(),
+            signature: "s".into(),
+        }
+    }
+
+    #[test]
+    fn each_half_s_radio_firmware_is_named() {
+        assert_eq!(
+            radio_line(&radio(true, true), false),
+            "radio    · left 0.1.20 · 0a1b2c3d · right 4e5f6a7b"
+        );
+        assert_eq!(
+            radio_line(&radio(true, true), true),
+            "radio    · left 0.1.20+7 · 0a1b2c3d4e5f6071 · confirmed · right 4e5f6a7b8c9d0e1f · confirmed"
+        );
+        assert_eq!(
+            radio_line(&radio(false, false), false),
+            "radio    · left 0.1.20 · 0a1b2c3d · not confirmed · right unknown"
+        );
+        assert_eq!(radio_line(&RadioInfo::default(), true), "radio    · unknown");
+    }
+
+    #[test]
+    fn a_newer_radio_release_is_offered() {
+        let board = radio(true, true);
+        assert_eq!(
+            radio_offer(&board, &radio_release("0.2.0"), Transport::Usb).as_deref(),
+            Some("Radio firmware 0.2.0 available. Run `zapp update radio`.")
+        );
+        assert_eq!(
+            radio_offer(&board, &radio_release("0.2.0"), Transport::Bluetooth).as_deref(),
+            Some("Radio firmware 0.2.0 available. Connect the USB cable and run `zapp update radio`.")
+        );
+        assert_eq!(radio_offer(&board, &radio_release("0.1.20"), Transport::Usb), None);
+        assert_eq!(radio_offer(&board, &radio_release("0.1.19"), Transport::Usb), None);
+        assert_eq!(
+            radio_offer(&RadioInfo::default(), &radio_release("0.2.0"), Transport::Usb),
+            None
+        );
+    }
+
+    #[test]
+    fn a_board_that_cannot_tell_never_asks_the_feed() {
+        // The feed holds a release; an unknown board must not reach it.
+        let mut feed = RadioFeed(Some(Some(radio_release("9.9.9"))));
+        assert_eq!(
+            radio_lines(&RadioInfo::default(), false, &mut feed, Transport::Usb),
+            vec!["radio    · unknown".to_string()]
+        );
+        let mut offline = RadioFeed(Some(None));
+        assert_eq!(radio_lines(&radio(true, true), false, &mut offline, Transport::Usb).len(), 1);
+        assert_eq!(radio_lines(&radio(true, true), false, &mut feed, Transport::Usb).len(), 2);
     }
 
     #[test]

@@ -150,12 +150,12 @@ zapp flash firmware.bin
 zapp flash firmware.hex
 ```
 
-### Flash the latest radio firmware (Voyager 2)
+### Update to the latest radio firmware (Voyager 2)
 
 Downloads the newest radio firmware bundle from ZSA's update server, checks its signature, and flashes it like a `.zsab` file (keyboard fully wired):
 
 ```sh
-zapp flash radio
+zapp update radio
 ```
 
 ### Flash from an Oryx URL
