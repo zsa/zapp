@@ -2,7 +2,6 @@
 //! ignition. The orchestration is `zapp_update::wired`; this is what the
 //! terminal shows of it.
 
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -41,9 +40,8 @@ fn reply_timeout() -> Duration {
 }
 
 /// Writes both halves from one bundle.
-pub fn flash(path: &Path, force: bool) -> Result<()> {
-    let bundle = zapp_update::load_bundle(path)?;
-    announce(&bundle);
+pub fn flash(bundle: &Bundle, force: bool) -> Result<()> {
+    announce(bundle);
 
     let options = Options {
         force,
@@ -53,7 +51,7 @@ pub fn flash(path: &Path, force: bool) -> Result<()> {
         ..Options::default()
     };
     let mut screen = Screen::default();
-    match wired::update_bundle(&bundle, &options, &mut |event| screen.show(event))? {
+    match wired::update_bundle(bundle, &options, &mut |event| screen.show(event))? {
         // Nothing was written and nothing was checked, so this one line is the
         // whole of the output.
         Outcome::UpToDate => println!("{UP_TO_DATE}"),

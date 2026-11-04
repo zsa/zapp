@@ -43,11 +43,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash firmware from a local file or Oryx URL
+    /// Flash firmware from a local file, an Oryx URL, or the latest radio firmware
     #[command(
-        long_about = "Flash firmware from a local file or Oryx URL.\n\n\
+        long_about = "Flash firmware from a local file, an Oryx URL, or the latest radio firmware.\n\n\
             Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
-            bundles carrying both wireless halves, and Oryx layout URLs. A \
+            bundles carrying both wireless halves, and Oryx layout URLs. `radio` \
+            downloads the latest Voyager 2 radio firmware bundle from the ZSA \
+            update server and flashes it like a .zsab file. A \
             Voyager 2 keyboard image goes over the cable when the keyboard is \
             on USB and over Bluetooth otherwise. A .zsab bundle goes over the \
             cable only. Any other keyboard's firmware goes over the cable. A \
@@ -58,11 +60,13 @@ enum Commands {
             zapp flash .build/zsa_voyager_tng_default.bin --device \"Voyager\"\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash voyager2_0.1.9.zsab --force\n  \
+            zapp flash radio\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
     Flash {
-        /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
+        /// Path to a firmware file (.bin, .hex or .zsab), an Oryx URL, or
+        /// `radio` for the latest radio firmware (`./radio` for a file of that name).
         firmware: String,
         /// Write a half even if it already carries the image, or the bundle is
         /// older than what is installed. Applies to .zsab bundles only.
@@ -190,6 +194,8 @@ fn dispatch(command: Commands) -> Result<()> {
         } => {
             if zapp_oryx::is_oryx_url(&firmware) {
                 cmd_flash_url(&firmware)
+            } else if firmware == RADIO {
+                cmd_flash_radio(force, device.as_deref())
             } else {
                 cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
             }
@@ -915,7 +921,11 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
     // so a renamed bundle still does the right thing instead of failing deep
     // inside the DFU loader.
     if is_bundle(path) {
-        return flash_bundle(path, force, device);
+        let over = bundle_route()?;
+        let bundle = zapp_update::load_bundle(path)?;
+        let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or_default();
+        log::debug!("{} · {len} bytes", path.display());
+        return flash_bundle(&bundle, over, force, device);
     }
 
     if force {
@@ -974,7 +984,8 @@ fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Resu
 /// the keyboard on the cable. The Bluetooth path stays in place behind this.
 const BLUETOOTH_BUNDLES: bool = false;
 
-/// A bundle, over the cable, or over Bluetooth when `BLUETOOTH_BUNDLES` is on.
+/// A bundle, over the way `bundle_route` picked: the cable, or Bluetooth when
+/// `BLUETOOTH_BUNDLES` is on.
 ///
 /// The cable wins whenever the Voyager 2 is on it, whether it is already in its
 /// bootloader or still running its own firmware — the wired path waits for the
@@ -992,18 +1003,54 @@ const BLUETOOTH_BUNDLES: bool = false;
 ///
 /// `named` picks between bonded boards over Bluetooth. The cable ignores it:
 /// there is only ever one keyboard plugged in.
-fn flash_bundle(path: &Path, force: bool, named: Option<&str>) -> Result<()> {
-    if route() == Transport::Usb {
-        return nrf_wired::flash(path, force);
+fn flash_bundle(
+    bundle: &zapp_update::Bundle,
+    over: Transport,
+    force: bool,
+    named: Option<&str>,
+) -> Result<()> {
+    match over {
+        Transport::Usb => nrf_wired::flash(bundle, force),
+        Transport::Bluetooth => zsab::update(bundle, force, named),
     }
-    if !BLUETOOTH_BUNDLES {
+}
+
+/// The way a bundle goes (see `flash_bundle`), or an error when it has none.
+fn bundle_route() -> Result<Transport> {
+    let over = route();
+    if over == Transport::Bluetooth && !BLUETOOTH_BUNDLES {
         bail!(
             "A .zsab bundle needs the keyboard fully wired: plugged into your \
              computer with the USB cable, and both halves connected with their cable."
         );
     }
+    Ok(over)
+}
 
-    zsab::update(path, force, named)
+/// The `flash` argument that names the latest radio firmware.
+const RADIO: &str = "radio";
+
+/// Downloads the latest radio firmware and flashes it as a bundle.
+fn cmd_flash_radio(force: bool, device: Option<&str>) -> Result<()> {
+    let over = bundle_route()?;
+    let client = zapp_update::cloud::client(concat!("zapp/", env!("CARGO_PKG_VERSION")))?;
+    let spinner = new_spinner("Checking for radio firmware...");
+    let release = zapp_update::cloud::check_radio(&client, None);
+    spinner.finish_and_clear();
+    let release = release?.context("The update server has no radio firmware release.")?;
+
+    println!("Radio firmware {}", release.version);
+    if let Some(notes) = release.notes() {
+        println!();
+        println!("{notes}");
+        println!();
+    }
+
+    let spinner = new_spinner(&format!("Downloading radio firmware {}...", release.version));
+    let radio = zapp_update::cloud::download_radio(&client, release);
+    spinner.finish_and_clear();
+    let radio = radio?;
+    flash_bundle(&radio.bundle, over, force, device)
 }
 
 /// Whether the file leads with the .zsab magic.

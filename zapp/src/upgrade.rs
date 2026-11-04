@@ -2,36 +2,21 @@
 
 use std::io::{self, BufRead, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
-use serde::Deserialize;
+use zapp_update::cloud;
 
-/// Update endpoint; `/<platform>/<current version>` is appended.
-const ENDPOINT: &str = "https://cdn.crabnebula.app/update/zsa-technology-labs-inc/io-zsa-zapp";
+/// zapp's app on CrabNebula Cloud.
+const APP: &str = "io-zsa-zapp";
 /// Minisign public key (Tauri format: base64 of the key file) the archives are signed with.
 const PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5QkQ1OUJGNzc1MEQzMApSV1F3RFhYM205V2JEdW5RU3pyZWptK3VwbXVpc2Y1TVJHMFZsb0N4enl2RlNQUGR6ajVYSGJRbgo=";
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const USER_AGENT: &str = concat!("zapp/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(windows)]
 const EXE_NAME: &str = "zapp.exe";
 #[cfg(not(windows))]
 const EXE_NAME: &str = "zapp";
-
-/// What the update server offers.
-#[derive(Debug, Deserialize, PartialEq)]
-struct Release {
-    version: String,
-    #[serde(default)]
-    notes: Option<String>,
-    url: String,
-    signature: String,
-}
 
 /// Checks for a newer release and, unless `check` is set, installs it.
 pub fn run(yes: bool, check: bool) -> Result<()> {
@@ -42,19 +27,9 @@ pub fn run(yes: bool, check: bool) -> Result<()> {
             std::env::consts::ARCH
         )
     })?;
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("zapp/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .context("could not set up the HTTP client")?;
-
-    let url = format!("{ENDPOINT}/{platform}/{CURRENT}");
-    let response = client.get(&url).send().map_err(network_error)?;
-    let status = response.status().as_u16();
-    let body = response.bytes().map_err(network_error)?;
-    let release = match parse_response(status, &body, platform)? {
-        Some(release) if is_newer(&release.version, CURRENT)? => release,
+    let client = cloud::client(USER_AGENT)?;
+    let release = match cloud::check(&client, APP, platform, CURRENT, "zapp release")? {
+        Some(release) if cloud::is_newer(&release.version, CURRENT)? => release,
         _ => {
             println!("zapp {CURRENT} is up to date.");
             return Ok(());
@@ -65,12 +40,7 @@ pub fn run(yes: bool, check: bool) -> Result<()> {
         "zapp {} is available (you have {CURRENT}).",
         release.version
     );
-    if let Some(notes) = release
-        .notes
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-    {
+    if let Some(notes) = release.notes() {
         println!();
         println!("{notes}");
         println!();
@@ -93,15 +63,7 @@ pub fn run(yes: bool, check: bool) -> Result<()> {
     }
 
     println!("Downloading zapp {}...", release.version);
-    let response = client.get(&release.url).send().map_err(network_error)?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("The download failed (HTTP {}).", status.as_u16());
-    }
-    let archive = response.bytes().map_err(network_error)?;
-
-    verify(&archive, &release.signature, PUBLIC_KEY)
-        .map_err(|_| anyhow!("The download's signature does not match. Nothing was changed."))?;
+    let archive = cloud::download(&client, &release, PUBLIC_KEY)?;
     let binary = extract(&archive, EXE_NAME)?;
 
     let mut staging = staging;
@@ -134,36 +96,6 @@ fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
         ("windows", "aarch64") => "windows-aarch64",
         _ => return None,
     })
-}
-
-/// The release in a reply, or `None` for 204 (nothing newer).
-fn parse_response(status: u16, body: &[u8], platform: &str) -> Result<Option<Release>> {
-    match status {
-        200 => serde_json::from_slice(body)
-            .map(Some)
-            .map_err(|_| anyhow!("The update server sent a reply zapp cannot read.")),
-        204 => Ok(None),
-        400 | 404 => bail!("The update server has no zapp release for {platform}."),
-        other => bail!("The update server answered with HTTP {other}."),
-    }
-}
-
-/// Whether `offered` is a later version than `current`.
-fn is_newer(offered: &str, current: &str) -> Result<bool> {
-    let parse = |v: &str| {
-        semver::Version::parse(v.trim().trim_start_matches('v'))
-            .map_err(|_| anyhow!("The update server sent an unreadable version: {v}."))
-    };
-    Ok(parse(offered)? > parse(current)?)
-}
-
-/// Checks `data` against a Tauri-format minisign signature and public key.
-fn verify(data: &[u8], signature_b64: &str, public_key_b64: &str) -> Result<()> {
-    let decode = |b64: &str| -> Result<String> { Ok(String::from_utf8(B64.decode(b64.trim())?)?) };
-    let key = minisign_verify::PublicKey::decode(&decode(public_key_b64)?)?;
-    let signature = minisign_verify::Signature::decode(&decode(signature_b64)?)?;
-    key.verify(data, &signature, false)?;
-    Ok(())
 }
 
 /// The file named `name` from a .tar.gz or .zip archive.
@@ -278,17 +210,6 @@ fn confirm(prompt: &str) -> Result<bool> {
     ))
 }
 
-fn network_error(err: reqwest::Error) -> anyhow::Error {
-    log::debug!("update request failed: {err:?}");
-    if err.is_timeout() {
-        anyhow!("The update server did not answer in time.")
-    } else if err.is_connect() {
-        anyhow!("Cannot reach the update server. Check the internet connection.")
-    } else {
-        anyhow!("The update request failed: {err}.")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,84 +235,14 @@ mod tests {
     }
 
     #[test]
-    fn newer_versions() {
-        assert!(is_newer("1.1.11", "1.1.10").unwrap());
-        assert!(is_newer("1.2.0", "1.1.10").unwrap());
-        assert!(is_newer("v1.1.11", "1.1.10").unwrap());
-        assert!(!is_newer("1.1.10", "1.1.10").unwrap());
-        assert!(!is_newer("1.1.9", "1.1.10").unwrap());
-        assert!(!is_newer("1.1.11-beta.1", "1.1.11").unwrap());
-        assert!(is_newer("nonsense", "1.1.10").is_err());
-    }
-
-    #[test]
-    fn no_content_means_up_to_date() {
-        assert_eq!(parse_response(204, b"", "linux-x86_64").unwrap(), None);
-    }
-
-    #[test]
-    fn release_reply() {
-        let body = br#"{"version":"1.1.11","notes":"- Fixes","pub_date":"2026-10-28T00:00:00Z",
-            "url":"https://cdn.example/zapp.tar.gz","signature":"c2ln","format":"tar.gz"}"#;
-        let release = parse_response(200, body, "linux-x86_64").unwrap().unwrap();
-        assert_eq!(
-            release,
-            Release {
-                version: "1.1.11".into(),
-                notes: Some("- Fixes".into()),
-                url: "https://cdn.example/zapp.tar.gz".into(),
-                signature: "c2ln".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn release_reply_without_notes() {
-        let body = br#"{"version":"1.1.11","url":"u","signature":"s"}"#;
-        let release = parse_response(200, body, "linux-x86_64").unwrap().unwrap();
-        assert_eq!(release.notes, None);
-    }
-
-    #[test]
-    fn bad_replies() {
-        assert!(parse_response(200, b"<html>", "linux-x86_64").is_err());
-        let err = parse_response(400, b"", "linux-x86_64").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "The update server has no zapp release for linux-x86_64."
-        );
-        let err = parse_response(500, b"", "linux-x86_64").unwrap_err();
-        assert_eq!(err.to_string(), "The update server answered with HTTP 500.");
-    }
-
-    #[test]
-    fn signature_accepts_signed_archive() {
-        verify(TAR_GZ, TAR_GZ_SIG, TEST_PUBLIC_KEY).unwrap();
-    }
-
-    #[test]
-    fn signature_rejects_tampered_archive() {
-        let mut tampered = TAR_GZ.to_vec();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 1;
-        assert!(verify(&tampered, TAR_GZ_SIG, TEST_PUBLIC_KEY).is_err());
-    }
-
-    #[test]
     fn signature_rejects_other_key() {
-        assert!(verify(TAR_GZ, TAR_GZ_SIG, PUBLIC_KEY).is_err());
-    }
-
-    #[test]
-    fn signature_rejects_garbage() {
-        assert!(verify(TAR_GZ, "not base64!", TEST_PUBLIC_KEY).is_err());
-        assert!(verify(TAR_GZ, TAR_GZ_SIG, "").is_err());
+        cloud::verify(TAR_GZ, TAR_GZ_SIG, TEST_PUBLIC_KEY).unwrap();
+        assert!(cloud::verify(TAR_GZ, TAR_GZ_SIG, PUBLIC_KEY).is_err());
     }
 
     #[test]
     fn release_key_decodes() {
-        let text = String::from_utf8(B64.decode(PUBLIC_KEY).unwrap()).unwrap();
-        minisign_verify::PublicKey::decode(&text).unwrap();
+        cloud::public_key(PUBLIC_KEY).unwrap();
     }
 
     #[test]

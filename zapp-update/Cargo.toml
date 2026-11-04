@@ -9,6 +9,13 @@ description = "Updating a Voyager 2's firmware, over Bluetooth or the cable, wit
 # chains, and the public error is rendered from them.
 anyhow = "1"
 log = "0.4"
+# Releases on CrabNebula Cloud (`cloud`).
+base64 = "0.22"
+minisign-verify = "0.3"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 zapp-ble = { path = "../zapp-ble" }
 zapp-core = { path = "../zapp-core" }
 zapp-smp = { path = "../zapp-smp" }

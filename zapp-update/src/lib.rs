@@ -36,6 +36,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 pub mod ble;
+pub mod cloud;
 mod confirm;
 mod error;
 pub mod event;
@@ -152,11 +153,27 @@ impl Default for Timings {
 
 /// Reads and parses a `.zsab` bundle.
 pub fn load_bundle(path: &Path) -> Result<Bundle, UpdateError> {
-    let parsed = std::fs::read(path)
+    let blob = std::fs::read(path)
         .with_context(|| format!("Failed to read {}", path.display()))
-        .and_then(|blob| {
-            zapp_smp::bundle::parse(&blob)
-                .with_context(|| format!("{} is not a bundle this build can read", path.display()))
-        });
-    parsed.map_err(|err| error::classify(error::kind_of(ErrorKind::Bundle, None, err)))
+        .map_err(|err| error::classify(error::kind_of(ErrorKind::Bundle, None, err)))?;
+    parse_bundle(&blob, &path.display().to_string())
+}
+
+/// Parses a `.zsab` bundle already in memory. `name` is what messages call it.
+pub fn parse_bundle(blob: &[u8], name: &str) -> Result<Bundle, UpdateError> {
+    zapp_smp::bundle::parse(blob)
+        .with_context(|| format!("{name} is not a bundle this build can read"))
+        .map_err(|err| error::classify(error::kind_of(ErrorKind::Bundle, None, err)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_from_bytes_names_its_source() {
+        let err = parse_bundle(b"not a bundle", "Radio firmware 0.1.20").unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::Bundle);
+        assert!(err.message().contains("Radio firmware 0.1.20"), "{}", err.message());
+    }
 }
