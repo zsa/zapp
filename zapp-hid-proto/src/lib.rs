@@ -116,6 +116,7 @@ mod telemetry_offset {
     pub const BLE_SLOT_COUNT: usize = 26;
     pub const NAV_BUS: usize = 27;
     pub const TRRS: usize = 28;
+    pub const ESB_LINK: usize = 29;
 }
 
 /// Bytes in the address the identity block carries.
@@ -148,6 +149,12 @@ const TELEMETRY_TRRS_UNPLUGGED: u8 = 0;
 const TELEMETRY_TRRS_PLUGGED: u8 = 1;
 #[cfg(test)]
 const TELEMETRY_TRRS_UNKNOWN: u8 = 0xFF;
+/// The left half's radio link to the right half.
+const TELEMETRY_ESB_ABSENT: u8 = 0;
+const TELEMETRY_ESB_LINKED: u8 = 1;
+const TELEMETRY_ESB_MISMATCH: u8 = 2;
+#[cfg(test)]
+const TELEMETRY_ESB_UNKNOWN: u8 = 0xFF;
 
 /// Charge-telemetry format this host understands, and refused whole when it is
 /// anything else — same rule, and for the same reason, as [`TELEMETRY_VERSION`].
@@ -405,6 +412,28 @@ impl NavReport {
     }
 }
 
+/// The left half's radio (ESB) link to the right half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EsbLink {
+    /// Both halves hear each other and agree on the protocol.
+    Linked,
+    /// No right half heard.
+    Absent,
+    /// Both halves alive, running different protocol versions.
+    Mismatch,
+}
+
+impl EsbLink {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            TELEMETRY_ESB_LINKED => Some(Self::Linked),
+            TELEMETRY_ESB_ABSENT => Some(Self::Absent),
+            TELEMETRY_ESB_MISMATCH => Some(Self::Mismatch),
+            _ => None,
+        }
+    }
+}
+
 /// What a board says about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Telemetry {
@@ -424,6 +453,9 @@ pub struct Telemetry {
     /// Whether the TRRS cable between the halves is plugged. `None` when the
     /// board cannot tell, or from a firmware that predates the field.
     pub trrs: Option<bool>,
+    /// The radio link between the halves. `None` when the board cannot tell,
+    /// or from a firmware that predates the field.
+    pub esb_link: Option<EsbLink>,
     /// `None` from a firmware that predates the field, and from a board that
     /// has no identity in its active slot yet.
     pub ble: Option<BleIdentity>,
@@ -1485,6 +1517,7 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
             TELEMETRY_TRRS_PLUGGED => Some(true),
             _ => None,
         }),
+        esb_link: telemetry_field(params, at::ESB_LINK).and_then(EsbLink::from_raw),
         ble: telemetry_ble(params),
     })
 }
@@ -2231,6 +2264,49 @@ mod tests {
         payload[28] = TELEMETRY_TRRS_UNKNOWN;
         let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
         assert_eq!(telemetry.trrs, None);
+    }
+
+    /// A len 27 payload: everything up to and including the cable field.
+    fn telemetry_payload_with_trrs() -> Vec<u8> {
+        let mut payload = telemetry_payload_with_bus();
+        payload[1] = 27;
+        payload.push(TELEMETRY_TRRS_UNPLUGGED);
+        payload
+    }
+
+    #[test]
+    fn a_board_from_before_the_radio_field_says_nothing_about_the_radio() {
+        // len 27 ends at the cable field. The byte after it is not the radio
+        // field, whatever it holds.
+        let payload = telemetry_payload_with_trrs();
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, TELEMETRY_ESB_LINKED));
+
+        assert_eq!(telemetry.esb_link, None);
+        assert_eq!(telemetry.trrs, Some(false));
+    }
+
+    #[test]
+    fn the_radio_field_follows_the_cable_field() {
+        let mut payload = telemetry_payload_with_trrs();
+        payload[1] = 28;
+        payload.push(TELEMETRY_ESB_LINKED);
+        assert_eq!(payload.len(), 30);
+        let data = telemetry_report(&payload, 0);
+        assert_eq!(data[30], TELEMETRY_ESB_LINKED, "report byte 30");
+        let telemetry = telemetry_from_report(&data);
+        assert_eq!(telemetry.esb_link, Some(EsbLink::Linked));
+        assert_eq!(telemetry.trrs, Some(false));
+
+        for (raw, expected) in [
+            (TELEMETRY_ESB_ABSENT, Some(EsbLink::Absent)),
+            (TELEMETRY_ESB_MISMATCH, Some(EsbLink::Mismatch)),
+            (TELEMETRY_ESB_UNKNOWN, None),
+            (3, None),
+        ] {
+            payload[29] = raw;
+            let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
+            assert_eq!(telemetry.esb_link, expected, "raw {raw:#04x}");
+        }
     }
 
     #[test]

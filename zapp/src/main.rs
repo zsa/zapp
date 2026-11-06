@@ -24,13 +24,13 @@ use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
     BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-    HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
+    EsbLink, HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
 use zapp_wired::Ignition;
 use zapp_update::cloud::{radio_offered, Release, RunningRadio};
-use zapp_update::probe::{ble_radio_info, usb_report};
+use zapp_update::probe::{ble_report as ble_oryx_report, usb_report};
 use zapp_update::{route, Transport};
 
 use crate::screen::Screen;
@@ -370,7 +370,11 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
         for line in ble_report(detail.as_ref()) {
             println!("    {line}");
         }
-        if let Some(radio) = ble_radio(&board, &on_usb) {
+        let (radio, telemetry) = ble_radio(&board, &on_usb, verbose);
+        if let Some(line) = telemetry.as_ref().and_then(halves_line) {
+            println!("    {line}");
+        }
+        if let Some(radio) = radio {
             for line in radio_lines(&radio, verbose, &mut feed, Transport::Bluetooth) {
                 println!("    {line}");
             }
@@ -408,9 +412,14 @@ fn latest_radio() -> Option<Release> {
         .flatten()
 }
 
-/// What a Bluetooth Wireless Voyager runs, asked over its Oryx service. Only for a
-/// board connected to this machine and not already read over the cable.
-fn ble_radio(board: &zapp_ble::BleBoard, on_usb: &[String]) -> Option<RadioInfo> {
+/// What a Bluetooth Wireless Voyager runs, and its telemetry under `verbose`,
+/// asked over its Oryx service. Only for a board connected to this machine and
+/// not already read over the cable.
+fn ble_radio(
+    board: &zapp_ble::BleBoard,
+    on_usb: &[String],
+    verbose: bool,
+) -> (Option<RadioInfo>, Option<Telemetry>) {
     let on_cable = board
         .address
         .as_deref()
@@ -419,12 +428,12 @@ fn ble_radio(board: &zapp_ble::BleBoard, on_usb: &[String]) -> Option<RadioInfo>
         || board.presence != Presence::Connected
         || on_cable
     {
-        return None;
+        return (None, None);
     }
     let spinner = new_spinner("Asking for radio firmware...");
-    let radio = ble_radio_info(&board.key);
+    let report = ble_oryx_report(&board.key, verbose);
     spinner.finish_and_clear();
-    radio
+    report
 }
 
 /// The lines about a board's radio firmware: what each half runs, then a
@@ -589,20 +598,34 @@ fn wired_charge(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> Stri
 }
 
 /// The lines under a wired board that stand on their own: the Bluetooth
-/// identity it is using, whether the cable between the halves is plugged, and
-/// which pointing devices the build carries and which of them answer. Only
-/// `--verbose` asks for these.
+/// identity it is using, how the halves are linked, and which pointing devices
+/// the build carries and which of them answer. Only `--verbose` asks for these.
 fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(ble) = &telemetry.ble {
         lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
     }
-    if let Some(plugged) = telemetry.trrs {
-        let cable = if plugged { "plugged" } else { "unplugged" };
-        lines.push(format!("{:<8} · cable {cable}", "halves"));
-    }
+    lines.extend(halves_line(telemetry));
     lines.push(features_line(&telemetry.nav()));
     lines
+}
+
+/// How the halves are linked: the cable, or the radio between them. The radio
+/// is left out with the cable plugged, where the right half stops it.
+fn halves_line(telemetry: &Telemetry) -> Option<String> {
+    let radio = telemetry.esb_link.map(|link| match link {
+        EsbLink::Linked => "radio linked",
+        EsbLink::Absent => "radio not linked",
+        EsbLink::Mismatch => "radio key mismatch",
+    });
+    let link = match (telemetry.trrs, radio) {
+        (Some(true), _) => "cable plugged".to_string(),
+        (Some(false), Some(radio)) => format!("cable unplugged, {radio}"),
+        (Some(false), None) => "cable unplugged".to_string(),
+        (None, Some(radio)) => radio.to_string(),
+        (None, None) => return None,
+    };
+    Some(format!("{:<8} · {link}", "halves"))
 }
 
 /// The address the board is using. The slot fields come off the wire with it
@@ -1492,6 +1515,7 @@ mod tests {
             }),
             nav_bus: Some(Nav::default()),
             trrs: None,
+            esb_link: None,
             charging: Charging {
                 budget_ma: Some(1500),
                 ..Charging::default()
@@ -1552,6 +1576,87 @@ mod tests {
         // Unknown, or a firmware from before the field: no line.
         telemetry.trrs = None;
         assert_eq!(describe_telemetry(&telemetry).len(), 1);
+    }
+
+    #[test]
+    fn the_cable_hides_the_radio() {
+        // The right half stops the radio with the cable plugged.
+        for link in [
+            None,
+            Some(EsbLink::Linked),
+            Some(EsbLink::Absent),
+            Some(EsbLink::Mismatch),
+        ] {
+            let telemetry = Telemetry {
+                trrs: Some(true),
+                esb_link: link,
+                ..Telemetry::default()
+            };
+            assert_eq!(
+                halves_line(&telemetry).as_deref(),
+                Some("halves   · cable plugged")
+            );
+        }
+    }
+
+    #[test]
+    fn halves_off_the_cable_say_how_the_radio_is() {
+        let line = |trrs, esb_link| {
+            halves_line(&Telemetry {
+                trrs,
+                esb_link,
+                ..Telemetry::default()
+            })
+        };
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Linked)).as_deref(),
+            Some("halves   · cable unplugged, radio linked")
+        );
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Absent)).as_deref(),
+            Some("halves   · cable unplugged, radio not linked")
+        );
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Mismatch)).as_deref(),
+            Some("halves   · cable unplugged, radio key mismatch")
+        );
+        assert_eq!(
+            line(Some(false), None).as_deref(),
+            Some("halves   · cable unplugged")
+        );
+        // Cable state unknown: the radio alone.
+        assert_eq!(
+            line(None, Some(EsbLink::Linked)).as_deref(),
+            Some("halves   · radio linked")
+        );
+        assert_eq!(
+            line(None, Some(EsbLink::Absent)).as_deref(),
+            Some("halves   · radio not linked")
+        );
+        assert_eq!(
+            line(None, Some(EsbLink::Mismatch)).as_deref(),
+            Some("halves   · radio key mismatch")
+        );
+        // Neither known, or a firmware from before both fields: no line.
+        assert_eq!(line(None, None), None);
+    }
+
+    #[test]
+    fn a_wired_board_puts_the_halves_line_after_the_identity() {
+        let telemetry = Telemetry {
+            ble: Some(BleIdentity {
+                address: "FE:DB:E9:A8:B1:36".into(),
+                random: true,
+                slot: 0,
+                slot_count: 6,
+            }),
+            trrs: Some(false),
+            esb_link: Some(EsbLink::Linked),
+            ..Telemetry::default()
+        };
+        let lines = describe_telemetry(&telemetry);
+        assert_eq!(lines[1], "halves   · cable unplugged, radio linked");
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]

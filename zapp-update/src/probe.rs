@@ -160,17 +160,30 @@ pub fn usb_report(
     Some(((telemetry, charge, rails), radio))
 }
 
-/// Asks a bonded Bluetooth board which radio firmware each half runs, over
-/// its Oryx service. `key` is the platform handle. Same answers as
-/// [`usb_report`]'s radio part; `None` also when the service cannot be opened.
-pub fn ble_radio_info(key: &str) -> Option<RadioInfo> {
-    let connection = zapp_ble::oryx::open(Some(key))
-        .inspect_err(|err| log::debug!("could not open the Oryx service on {key}: {err}"))
-        .ok()?;
+/// Asks a bonded Bluetooth board which radio firmware each half runs, and its
+/// telemetry summary when `telemetry` is set, on one connection to its Oryx
+/// service. `key` is the platform handle. Same answers as [`usb_report`]; both
+/// `None` when the service cannot be opened.
+pub fn ble_report(key: &str, telemetry: bool) -> (Option<RadioInfo>, Option<Telemetry>) {
+    let connection = match zapp_ble::oryx::open(Some(key)) {
+        Ok(connection) => connection,
+        Err(err) => {
+            log::debug!("could not open the Oryx service on {key}: {err}");
+            return (None, None);
+        }
+    };
     let mut probe = Probe::new(connection);
     let radio = probe.radio_info(BLE_HANDSHAKE_WAIT);
+    let telemetry = telemetry
+        .then(|| {
+            probe.ask(CMD_GET_TELEMETRY, |event| match event {
+                HidEvent::Telemetry(telemetry) => Some(telemetry),
+                _ => None,
+            })
+        })
+        .flatten();
     probe.conn.close();
-    radio
+    (radio, telemetry)
 }
 
 /// One connection, and the protocol version its handshake reported.
