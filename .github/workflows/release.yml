@@ -301,22 +301,36 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Draft Cloud release
-        id: cn_draft
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release draft ${{ env.CN_APPLICATION }} ${{ steps.version.outputs.version }}
-            --notes-file release-notes/${{ github.ref_name }}.md
-          api-key: ${{ secrets.CN_API_KEY }}
+      # One cn for every Cloud step. The CDN has answered with a 17-byte body
+      # instead of the binary, so retry until it is an ELF executable.
+      - name: Install cn
+        run: |
+          url=https://cdn.crabnebula.app/download/crabnebula/cn-cli/latest/platform/linux-binary-x86_64
+          bin="$RUNNER_TEMP/cn-bin"
+          mkdir -p "$bin"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL "$url" --output "$bin/cn" \
+              && [ "$(head -c 4 "$bin/cn" | od -An -tx1 | tr -d ' ')" = "7f454c46" ]; then
+              chmod +x "$bin/cn"
+              echo "$bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            echo "cn download attempt $attempt failed ($(wc -c < "$bin/cn" 2>/dev/null || echo 0) bytes)"
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not download cn"
+          exit 1
 
       # The command prints a version line before its JSON.
-      - name: Read Cloud release id
+      - name: Draft Cloud release
         id: cn_release
         env:
-          CN_STDOUT: ${{ steps.cn_draft.outputs.stdout }}
+          CN_API_KEY: ${{ secrets.CN_API_KEY }}
         run: |
-          json=$(printf '%s\n' "$CN_STDOUT" | sed -n '/^{/,$p')
+          out=$(cn release draft "$CN_APPLICATION" "${{ steps.version.outputs.version }}" \
+            --notes-file "release-notes/$GITHUB_REF_NAME.md")
+          printf '%s\n' "$out"
+          json=$(printf '%s\n' "$out" | sed -n '/^{/,$p')
           id=$(printf '%s\n' "$json" | jq -r '.id // empty')
           if [ -z "$id" ]; then
             echo "::error::could not read the release id from the draft output"
@@ -329,72 +343,27 @@ jobs:
           echo "id=$id" >> "$GITHUB_OUTPUT"
           echo "release $id"
 
-      - name: Upload linux-x86_64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform linux-x86_64
-            --public-platform cli-linux-x86_64
-            --file artifacts/zapp-linux-x86_64.tar.gz
-            --signature artifacts/zapp-linux-x86_64.tar.gz.sig
-          api-key: ${{ secrets.CN_API_KEY }}
-
-      - name: Upload linux-aarch64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform linux-aarch64
-            --public-platform cli-linux-aarch64
-            --file artifacts/zapp-linux-aarch64.tar.gz
-            --signature artifacts/zapp-linux-aarch64.tar.gz.sig
-          api-key: ${{ secrets.CN_API_KEY }}
-
-      - name: Upload windows-x86_64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform windows-x86_64
-            --public-platform cli-windows-x86_64
-            --file artifacts/zapp-windows-x86_64.zip
-            --signature artifacts/zapp-windows-x86_64.zip.sig
-          api-key: ${{ secrets.CN_API_KEY }}
-
-      - name: Upload windows-aarch64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform windows-aarch64
-            --public-platform cli-windows-aarch64
-            --file artifacts/zapp-windows-aarch64.zip
-            --signature artifacts/zapp-windows-aarch64.zip.sig
-          api-key: ${{ secrets.CN_API_KEY }}
-
-      # Cloud has no universal platform: the universal archive answers both arches.
-      - name: Upload darwin-x86_64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform darwin-x86_64
-            --public-platform cli-darwin-x86_64
-            --file artifacts/zapp-macos-universal.tar.gz
-            --signature artifacts/zapp-macos-universal.tar.gz.sig
-          api-key: ${{ secrets.CN_API_KEY }}
-
-      - name: Upload darwin-aarch64
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: >-
-            release upload ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-            --update-platform darwin-aarch64
-            --public-platform cli-darwin-aarch64
-            --file artifacts/zapp-macos-universal.tar.gz
-            --signature artifacts/zapp-macos-universal.tar.gz.sig
-          api-key: ${{ secrets.CN_API_KEY }}
+      # Cloud has no universal platform: the universal archive answers both
+      # macOS arches.
+      - name: Upload to Cloud
+        env:
+          CN_API_KEY: ${{ secrets.CN_API_KEY }}
+          RELEASE_ID: ${{ steps.cn_release.outputs.id }}
+        run: |
+          while read -r platform file; do
+            cn release upload "$CN_APPLICATION" "$RELEASE_ID" \
+              --update-platform "$platform" \
+              --public-platform "cli-$platform" \
+              --file "artifacts/$file" \
+              --signature "artifacts/$file.sig" < /dev/null
+          done <<'LIST'
+          linux-x86_64 zapp-linux-x86_64.tar.gz
+          linux-aarch64 zapp-linux-aarch64.tar.gz
+          windows-x86_64 zapp-windows-x86_64.zip
+          windows-aarch64 zapp-windows-aarch64.zip
+          darwin-x86_64 zapp-macos-universal.tar.gz
+          darwin-aarch64 zapp-macos-universal.tar.gz
+          LIST
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -403,10 +372,9 @@ jobs:
           files: artifacts/*
 
       - name: Publish Cloud release
-        uses: crabnebula-dev/cloud-release@v0
-        with:
-          command: release publish ${{ env.CN_APPLICATION }} ${{ steps.cn_release.outputs.id }}
-          api-key: ${{ secrets.CN_API_KEY }}
+        env:
+          CN_API_KEY: ${{ secrets.CN_API_KEY }}
+        run: cn release publish "$CN_APPLICATION" "${{ steps.cn_release.outputs.id }}"
 
   # Mirrors the public archives to downloads.zsa.io. Runs after the Cloud
   # release is live, so a failure here leaves it untouched and this job can be
