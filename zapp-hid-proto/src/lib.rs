@@ -115,6 +115,7 @@ mod telemetry_offset {
     pub const BLE_SLOT: usize = 25;
     pub const BLE_SLOT_COUNT: usize = 26;
     pub const NAV_BUS: usize = 27;
+    pub const TRRS: usize = 28;
 }
 
 /// Bytes in the address the identity block carries.
@@ -142,6 +143,11 @@ const TELEMETRY_BAT_KNOWN: u8 = 0x80;
 const TELEMETRY_CURRENT_UNKNOWN: u16 = 0;
 /// The board has nothing to say about what its charging policy is doing.
 const TELEMETRY_CHG_UNKNOWN: u8 = 0xFF;
+/// TRRS cable between the halves.
+const TELEMETRY_TRRS_UNPLUGGED: u8 = 0;
+const TELEMETRY_TRRS_PLUGGED: u8 = 1;
+#[cfg(test)]
+const TELEMETRY_TRRS_UNKNOWN: u8 = 0xFF;
 
 /// Charge-telemetry format this host understands, and refused whole when it is
 /// anything else — same rule, and for the same reason, as [`TELEMETRY_VERSION`].
@@ -415,6 +421,9 @@ pub struct Telemetry {
     /// plugged, side unknown. Empty with the cable unplugged; `None` from a
     /// firmware that predates the field.
     pub nav_bus: Option<Nav>,
+    /// Whether the TRRS cable between the halves is plugged. `None` when the
+    /// board cannot tell, or from a firmware that predates the field.
+    pub trrs: Option<bool>,
     /// `None` from a firmware that predates the field, and from a board that
     /// has no identity in its active slot yet.
     pub ble: Option<BleIdentity>,
@@ -1471,6 +1480,11 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
         nav_left: telemetry_field(params, at::NAV_LEFT).and_then(Nav::from_mask),
         nav_right: telemetry_field(params, at::NAV_RIGHT).and_then(Nav::from_mask),
         nav_bus: telemetry_field(params, at::NAV_BUS).and_then(Nav::from_mask),
+        trrs: telemetry_field(params, at::TRRS).and_then(|raw| match raw {
+            TELEMETRY_TRRS_UNPLUGGED => Some(false),
+            TELEMETRY_TRRS_PLUGGED => Some(true),
+            _ => None,
+        }),
         ble: telemetry_ble(params),
     })
 }
@@ -2177,6 +2191,46 @@ mod tests {
         payload[27] = TELEMETRY_NAV_UNKNOWN;
         let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
         assert_eq!(telemetry.nav_bus, None);
+    }
+
+    /// A len 26 payload: everything up to and including the bus field.
+    fn telemetry_payload_with_bus() -> Vec<u8> {
+        let mut payload = telemetry_payload_with_ble(1);
+        payload[1] = 26;
+        payload.push(0);
+        payload
+    }
+
+    #[test]
+    fn a_board_from_before_the_cable_field_says_nothing_about_the_cable() {
+        // len 26 ends at the bus field. The byte after it is not the cable
+        // field, whatever it holds.
+        let payload = telemetry_payload_with_bus();
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, TELEMETRY_TRRS_PLUGGED));
+
+        assert_eq!(telemetry.trrs, None);
+        assert_eq!(telemetry.nav_bus, Some(Nav::default()));
+    }
+
+    #[test]
+    fn the_cable_field_follows_the_bus_field() {
+        let mut payload = telemetry_payload_with_bus();
+        payload[1] = 27;
+        payload.push(TELEMETRY_TRRS_PLUGGED);
+        assert_eq!(payload.len(), 29);
+        let data = telemetry_report(&payload, 0);
+        assert_eq!(data[29], TELEMETRY_TRRS_PLUGGED, "report byte 29");
+        let telemetry = telemetry_from_report(&data);
+        assert_eq!(telemetry.trrs, Some(true));
+        assert_eq!(telemetry.nav_bus, Some(Nav::default()));
+
+        payload[28] = TELEMETRY_TRRS_UNPLUGGED;
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, 0xFE));
+        assert_eq!(telemetry.trrs, Some(false));
+
+        payload[28] = TELEMETRY_TRRS_UNKNOWN;
+        let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
+        assert_eq!(telemetry.trrs, None);
     }
 
     #[test]

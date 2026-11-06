@@ -589,12 +589,17 @@ fn wired_charge(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> Stri
 }
 
 /// The lines under a wired board that stand on their own: the Bluetooth
-/// identity it is using, and which pointing devices the build carries and
-/// which of them answer. Only `--verbose` asks for these.
+/// identity it is using, whether the cable between the halves is plugged, and
+/// which pointing devices the build carries and which of them answer. Only
+/// `--verbose` asks for these.
 fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(ble) = &telemetry.ble {
         lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
+    }
+    if let Some(plugged) = telemetry.trrs {
+        let cable = if plugged { "plugged" } else { "unplugged" };
+        lines.push(format!("{:<8} · cable {cable}", "halves"));
     }
     lines.push(features_line(&telemetry.nav()));
     lines
@@ -1486,6 +1491,7 @@ mod tests {
                 trackpad: false,
             }),
             nav_bus: Some(Nav::default()),
+            trrs: None,
             charging: Charging {
                 budget_ma: Some(1500),
                 ..Charging::default()
@@ -1523,6 +1529,29 @@ mod tests {
             describe_telemetry(&telemetry)[0],
             "bluetooth · FE:DB:E9:A8:B1:36"
         );
+    }
+
+    #[test]
+    fn a_wired_board_says_whether_the_halves_are_cabled() {
+        let mut telemetry = Telemetry {
+            version: 1,
+            trrs: Some(true),
+            ..Telemetry::default()
+        };
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "halves   · cable plugged"
+        );
+
+        telemetry.trrs = Some(false);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "halves   · cable unplugged"
+        );
+
+        // Unknown, or a firmware from before the field: no line.
+        telemetry.trrs = None;
+        assert_eq!(describe_telemetry(&telemetry).len(), 1);
     }
 
     #[test]
