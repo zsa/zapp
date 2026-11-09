@@ -44,6 +44,7 @@ pub use zapp_hid_proto::{
     CMD_GET_RADIO_INFO, LeftRadio, RADIO_INFO_PROTOCOL, RadioInfo, RadioVersion, RightRadio,
     has_radio_info,
 };
+pub use zapp_hid_proto::{CMD_GET_HOST_SLOTS, HOST_SLOTS_MAX, HostSlot, parse_host_slot};
 
 /// Write packet size: report ID byte + 32-byte report.
 const PACKET_SIZE: usize = REPORT_SIZE + 1;

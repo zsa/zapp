@@ -24,7 +24,7 @@ use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
 use zapp_core::hid::{
     BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-    EsbLink, HidEvent, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
+    EsbLink, HidEvent, HostSlot, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
 };
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
@@ -370,8 +370,11 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
         for line in ble_report(detail.as_ref()) {
             println!("    {line}");
         }
-        let (radio, telemetry) = ble_radio(&board, &on_usb, verbose);
+        let (radio, telemetry, slots) = ble_radio(&board, &on_usb, verbose);
         if let Some(line) = telemetry.as_ref().and_then(halves_line) {
+            println!("    {line}");
+        }
+        for line in host_slot_lines(&slots) {
             println!("    {line}");
         }
         if let Some(radio) = radio {
@@ -419,7 +422,7 @@ fn ble_radio(
     board: &zapp_ble::BleBoard,
     on_usb: &[String],
     verbose: bool,
-) -> (Option<RadioInfo>, Option<Telemetry>) {
+) -> (Option<RadioInfo>, Option<Telemetry>, Vec<HostSlot>) {
     let on_cable = board
         .address
         .as_deref()
@@ -428,7 +431,7 @@ fn ble_radio(
         || board.presence != Presence::Connected
         || on_cable
     {
-        return (None, None);
+        return (None, None, Vec::new());
     }
     let spinner = new_spinner("Asking for radio firmware...");
     let report = ble_oryx_report(&board.key, verbose);
@@ -532,13 +535,16 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
     if device.keyboard != Some(ids::Keyboard::Voyager2) {
         return WiredReport::default();
     }
-    let Some(((telemetry, detail, rails), radio)) = usb_report(device, verbose, true) else {
+    let Some(((telemetry, detail, rails), radio, slots)) =
+        usb_report(device, verbose, true, verbose)
+    else {
         return WiredReport::default();
     };
 
     let mut lines = Vec::new();
     if verbose {
         lines.extend(describe_telemetry(&telemetry));
+        lines.extend(host_slot_lines(&slots));
         if let Some(detail) = &detail {
             lines.extend(describe_charge(&telemetry, detail, rails));
         }
@@ -626,6 +632,27 @@ fn halves_line(telemetry: &Telemetry) -> Option<String> {
         (None, None) => return None,
     };
     Some(format!("{:<8} · {link}", "halves"))
+}
+
+/// One line per Bluetooth host slot, counted from one:
+/// "slot 1: C4:12:9A:33:0E:7B  paired, connected".
+fn host_slot_lines(slots: &[HostSlot]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|slot| {
+            let number = u16::from(slot.slot) + 1;
+            let Some(address) = &slot.address else {
+                return format!("slot {number}: unknown");
+            };
+            let state = match (slot.paired, slot.connected) {
+                (true, true) => "paired, connected",
+                (true, false) => "paired",
+                (false, true) => "connected",
+                (false, false) => "free",
+            };
+            format!("slot {number}: {address}  {state}")
+        })
+        .collect()
 }
 
 /// The address the board is using. The slot fields come off the wire with it
@@ -1441,6 +1468,34 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 mod tests {
     use super::*;
     use zapp_core::hid::{Charging, HalfDetail, Source, VbusInStatus};
+
+    #[test]
+    fn host_slots_are_counted_from_one() {
+        let slot = |slot: u8, paired: bool, connected: bool, address: Option<&str>| HostSlot {
+            slot,
+            slot_count: 5,
+            paired,
+            connected,
+            address: address.map(str::to_string),
+            random: true,
+        };
+        let slots = [
+            slot(0, true, true, Some("C4:12:9A:33:0E:7B")),
+            slot(1, true, false, Some("E8:51:06:BF:22:91")),
+            slot(2, false, false, Some("F0:7D:4C:18:A6:05")),
+            slot(3, true, false, None),
+        ];
+        assert_eq!(
+            host_slot_lines(&slots),
+            [
+                "slot 1: C4:12:9A:33:0E:7B  paired, connected",
+                "slot 2: E8:51:06:BF:22:91  paired",
+                "slot 3: F0:7D:4C:18:A6:05  free",
+                "slot 4: unknown",
+            ]
+        );
+        assert!(host_slot_lines(&[]).is_empty());
+    }
 
     #[test]
     fn both_halves_of_a_split_board_are_named() {

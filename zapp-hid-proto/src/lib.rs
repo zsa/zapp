@@ -48,6 +48,10 @@ pub const CMD_GET_DIAG: u8 = 0x11;
 /// Ask the board which radio firmware each half runs. Only for boards at
 /// `RADIO_INFO_PROTOCOL` or later. Answered with `EVT_RADIO_INFO`.
 pub const CMD_GET_RADIO_INFO: u8 = 0x12;
+/// Ask the board for one of its Bluetooth host slots: the param is the slot,
+/// counted from zero. Answered with `EVT_HOST_SLOTS`; firmware before it does
+/// not answer.
+pub const CMD_GET_HOST_SLOTS: u8 = 0x13;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -78,6 +82,9 @@ pub const EVT_DIAG: u8 = 0x11;
 /// Answer to `CMD_GET_RADIO_INFO`. Binary and STOP_BIT-free: a 0xFE in a hash
 /// is data.
 pub const EVT_RADIO_INFO: u8 = 0x12;
+/// Answer to `CMD_GET_HOST_SLOTS`. Binary and STOP_BIT-free: a 0xFE in an
+/// address is data.
+pub const EVT_HOST_SLOTS: u8 = 0x13;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
@@ -1322,6 +1329,60 @@ pub fn parse_radio_info(params: &[u8]) -> Option<RadioInfo> {
     Some(RadioInfo { left, right })
 }
 
+/// Host slots a board keeps; `CMD_GET_HOST_SLOTS` is asked at most this often.
+pub const HOST_SLOTS_MAX: u8 = 5;
+/// `EVT_HOST_SLOTS` payload size: the bytes after the opcode.
+pub const HOST_SLOT_SIZE: usize = 10;
+
+// `EVT_HOST_SLOTS` flags.
+pub const HOST_SLOT_PAIRED: u8 = 0x01;
+pub const HOST_SLOT_CONNECTED: u8 = 0x02;
+
+/// Byte offsets inside the `EVT_HOST_SLOTS` payload.
+mod host_slot_offset {
+    pub const SLOT: usize = 0;
+    pub const SLOT_COUNT: usize = 1;
+    pub const FLAGS: usize = 2;
+    pub const ADDR_TYPE: usize = 3;
+    pub const ADDR: usize = 4;
+}
+
+/// One Bluetooth host slot: the board's own address on it, and whether a host
+/// is paired and connected there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSlot {
+    /// The slot, counted from zero.
+    pub slot: u8,
+    /// How many slots the board keeps. Zero when the board knows nothing.
+    pub slot_count: u8,
+    pub paired: bool,
+    pub connected: bool,
+    /// Most significant byte first, as `BleIdentity::address`. `None` when
+    /// the board does not know it.
+    pub address: Option<String>,
+    pub random: bool,
+}
+
+/// Decode an `EVT_HOST_SLOTS` payload, the bytes after the opcode. `None` when
+/// short.
+pub fn parse_host_slot(params: &[u8]) -> Option<HostSlot> {
+    use host_slot_offset as at;
+
+    let params = params.get(..HOST_SLOT_SIZE)?;
+    let flags = params[at::FLAGS];
+    let addr_type = params[at::ADDR_TYPE];
+    let mut addr = [0u8; BLE_ADDR_LEN];
+    addr.copy_from_slice(&params[at::ADDR..at::ADDR + BLE_ADDR_LEN]);
+    Some(HostSlot {
+        slot: params[at::SLOT],
+        slot_count: params[at::SLOT_COUNT],
+        paired: flags & HOST_SLOT_PAIRED != 0,
+        connected: flags & HOST_SLOT_CONNECTED != 0,
+        address: (addr_type != TELEMETRY_BLE_ADDR_UNKNOWN).then(|| ble_address(&addr)),
+        random: addr_type == TELEMETRY_BLE_ADDR_RANDOM,
+    })
+}
+
 /// Events from a connected keyboard's raw HID interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidEvent {
@@ -1361,6 +1422,8 @@ pub enum HidEvent {
     Diag(DiagPage),
     /// The board answered `CMD_GET_RADIO_INFO`.
     RadioInfo(RadioInfo),
+    /// The board answered `CMD_GET_HOST_SLOTS` for one slot.
+    HostSlot(HostSlot),
     /// The read loop ended (device unplugged or errored).
     Disconnected,
 }
@@ -1387,7 +1450,12 @@ pub fn parse_packet(data: &[u8]) -> Option<(u8, &[u8])> {
     }
     if matches!(
         cmd,
-        EVT_TELEMETRY | EVT_CHARGE_TELEMETRY | EVT_PMIC_RAILS | EVT_DIAG | EVT_RADIO_INFO
+        EVT_TELEMETRY
+            | EVT_CHARGE_TELEMETRY
+            | EVT_PMIC_RAILS
+            | EVT_DIAG
+            | EVT_RADIO_INFO
+            | EVT_HOST_SLOTS
     ) {
         // Binary payload carrying its own length: 0xFE in it is a value, not
         // a terminator, and truncating there would eat a 254% battery or a
@@ -1454,16 +1522,21 @@ fn telemetry_ble(params: &[u8]) -> Option<BleIdentity> {
     }
 
     Some(BleIdentity {
-        address: addr
-            .iter()
-            .rev()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(":"),
+        address: ble_address(&addr),
         random: addr_type == TELEMETRY_BLE_ADDR_RANDOM,
         slot,
         slot_count,
     })
+}
+
+/// `FE:DB:E9:A8:B1:36` from an address as it travels, least significant byte
+/// first.
+fn ble_address(addr: &[u8; BLE_ADDR_LEN]) -> String {
+    addr.iter()
+        .rev()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn telemetry_battery(params: &[u8], level: usize, flags: usize, source: usize) -> BatteryReading {
@@ -1670,6 +1743,10 @@ pub fn process_packet(data: &[u8]) -> (Option<HidEvent>, Vec<Packet>) {
         },
         EVT_RADIO_INFO => match parse_radio_info(params) {
             Some(info) => HidEvent::RadioInfo(info),
+            None => return (None, Vec::new()),
+        },
+        EVT_HOST_SLOTS => match parse_host_slot(params) {
+            Some(slot) => HidEvent::HostSlot(slot),
             None => return (None, Vec::new()),
         },
         EVT_GET_PROTOCOL_VERSION => match params.first() {
@@ -3029,6 +3106,49 @@ mod tests {
         assert_eq!(parse_radio_info(&report[1..RADIO_INFO_SIZE]), None);
         assert_eq!(parse_radio_info(&[]), None);
         assert_eq!(process_packet(&report[..RADIO_INFO_SIZE]).0, None);
+    }
+
+    /// An `EVT_HOST_SLOTS` report for slot 1 of 5, address C4:12:9A:33:0E:FE.
+    fn host_slot_report(flags: u8, addr_type: u8) -> Vec<u8> {
+        let mut r = vec![EVT_HOST_SLOTS, 1, 5, flags, addr_type];
+        r.extend_from_slice(&[0xFE, 0x0E, 0x33, 0x9A, 0x12, 0xC4]);
+        assert_eq!(r.len(), 1 + HOST_SLOT_SIZE);
+        r.resize(REPORT_SIZE, 0);
+        r
+    }
+
+    #[test]
+    fn host_slot_decodes_address_and_state() {
+        let report = host_slot_report(HOST_SLOT_PAIRED | HOST_SLOT_CONNECTED, 0x01);
+        let (event, replies) = process_packet(&report);
+        assert!(replies.is_empty());
+        let Some(HidEvent::HostSlot(slot)) = event else {
+            panic!("not a host slot: {event:?}");
+        };
+        assert_eq!(slot.slot, 1);
+        assert_eq!(slot.slot_count, 5);
+        assert!(slot.paired && slot.connected && slot.random);
+        // Most significant byte first; the 0xFE is data, not a terminator.
+        assert_eq!(slot.address.as_deref(), Some("C4:12:9A:33:0E:FE"));
+
+        let free = parse_host_slot(&host_slot_report(0, 0x00)[1..]).unwrap();
+        assert!(!free.paired && !free.connected && !free.random);
+        assert_eq!(free.address.as_deref(), Some("C4:12:9A:33:0E:FE"));
+    }
+
+    #[test]
+    fn host_slot_unknown_address_is_none() {
+        let slot = parse_host_slot(&host_slot_report(HOST_SLOT_PAIRED, 0xFF)[1..]).unwrap();
+        assert_eq!(slot.address, None);
+        assert!(slot.paired);
+    }
+
+    #[test]
+    fn short_host_slot_is_dropped() {
+        let report = host_slot_report(HOST_SLOT_PAIRED, 0x00);
+        assert_eq!(parse_host_slot(&report[1..HOST_SLOT_SIZE]), None);
+        assert_eq!(process_packet(&report[..HOST_SLOT_SIZE]).0, None);
+        assert_eq!(&encode_packet(CMD_GET_HOST_SLOTS, &[3])[..3], &[0x13, 3, 0]);
     }
 
     #[test]

@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use zapp_core::device::{self, Keyboard, UsbDevice};
 use zapp_core::hid::{
-    ChargeTelemetry, HidConnection, HidEvent, PmicRailsReport, RadioInfo, Telemetry,
-    CMD_GET_CHARGE_TELEMETRY, CMD_GET_PMIC_RAILS, CMD_GET_RADIO_INFO, CMD_GET_TELEMETRY,
-    has_radio_info,
+    ChargeTelemetry, HidConnection, HidEvent, HostSlot, PmicRailsReport, RadioInfo, Telemetry,
+    CMD_GET_CHARGE_TELEMETRY, CMD_GET_HOST_SLOTS, CMD_GET_PMIC_RAILS, CMD_GET_RADIO_INFO,
+    CMD_GET_TELEMETRY, HOST_SLOTS_MAX, has_radio_info,
 };
 
 use zapp_wired::ignition::usb::UsbLink;
@@ -120,18 +120,20 @@ pub type UsbTelemetry = (Telemetry, Option<ChargeTelemetry>, Option<PmicRailsRep
 /// Asks a wired board about itself: the telemetry summary, the charge detail,
 /// and the PMIC rails when `rails` is set.
 pub fn usb_telemetry(device: &UsbDevice, rails: bool) -> Option<UsbTelemetry> {
-    usb_report(device, rails, false).map(|(telemetry, _)| telemetry)
+    usb_report(device, rails, false, false).map(|(telemetry, _, _)| telemetry)
 }
 
 /// [`usb_telemetry`], plus the radio firmware each half runs when `radio` is
-/// set. The radio answer is `None` for firmware before
-/// [`zapp_core::hid::RADIO_INFO_PROTOCOL`], and nothing known when the board
-/// did not answer.
+/// set, and the Bluetooth host slots when `slots` is set. The radio answer is
+/// `None` for firmware before [`zapp_core::hid::RADIO_INFO_PROTOCOL`], and
+/// nothing known when the board did not answer. The slots are empty when the
+/// board did not answer.
 pub fn usb_report(
     device: &UsbDevice,
     rails: bool,
     radio: bool,
-) -> Option<(UsbTelemetry, Option<RadioInfo>)> {
+    slots: bool,
+) -> Option<(UsbTelemetry, Option<RadioInfo>, Vec<HostSlot>)> {
     if device.bootloader.is_some() {
         return None; // a board in its bootloader runs no keyboard firmware
     }
@@ -156,20 +158,28 @@ pub fn usb_report(
         })
         .flatten();
     let radio = radio.then(|| probe.radio_info(TELEMETRY_WAIT)).flatten();
+    let slots = if slots {
+        probe.host_slots(TELEMETRY_WAIT)
+    } else {
+        Vec::new()
+    };
 
-    Some(((telemetry, charge, rails), radio))
+    Some(((telemetry, charge, rails), radio, slots))
 }
 
 /// Asks a bonded Bluetooth board which radio firmware each half runs, and its
-/// telemetry summary when `telemetry` is set, on one connection to its Oryx
-/// service. `key` is the platform handle. Same answers as [`usb_report`]; both
-/// `None` when the service cannot be opened.
-pub fn ble_report(key: &str, telemetry: bool) -> (Option<RadioInfo>, Option<Telemetry>) {
+/// telemetry summary and Bluetooth host slots when `telemetry` is set, on one
+/// connection to its Oryx service. `key` is the platform handle. Same answers
+/// as [`usb_report`]; nothing when the service cannot be opened.
+pub fn ble_report(
+    key: &str,
+    telemetry: bool,
+) -> (Option<RadioInfo>, Option<Telemetry>, Vec<HostSlot>) {
     let connection = match zapp_ble::oryx::open(Some(key)) {
         Ok(connection) => connection,
         Err(err) => {
             log::debug!("could not open the Oryx service on {key}: {err}");
-            return (None, None);
+            return (None, None, Vec::new());
         }
     };
     let mut probe = Probe::new(connection);
@@ -182,8 +192,13 @@ pub fn ble_report(key: &str, telemetry: bool) -> (Option<RadioInfo>, Option<Tele
             })
         })
         .flatten();
+    let slots = if telemetry.is_some() {
+        probe.host_slots(BLE_HANDSHAKE_WAIT)
+    } else {
+        Vec::new()
+    };
     probe.conn.close();
-    (radio, telemetry)
+    (radio, telemetry, slots)
 }
 
 /// One connection, and the protocol version its handshake reported.
@@ -248,6 +263,36 @@ impl Probe {
             log::debug!("the board did not answer the radio info request");
         }
         Some(answer.unwrap_or_default())
+    }
+
+    /// Asks for each Bluetooth host slot in turn, when the protocol has radio
+    /// info. Empty when the board does not answer the first, which is what
+    /// firmware before the command does, or knows no slots.
+    fn host_slots(&mut self, protocol_wait: Duration) -> Vec<HostSlot> {
+        let protocol = self.protocol(protocol_wait);
+        if !protocol.is_some_and(has_radio_info) {
+            return Vec::new();
+        }
+        let mut slots = Vec::new();
+        let mut count = HOST_SLOTS_MAX;
+        let mut slot = 0;
+        while slot < count {
+            self.conn.send(CMD_GET_HOST_SLOTS, &[slot]);
+            let answer = self.wait(TELEMETRY_WAIT, |event| match event {
+                HidEvent::HostSlot(answer) if answer.slot == slot => Some(answer),
+                _ => None,
+            });
+            let Some(answer) = answer else {
+                log::debug!("the board did not answer host slot {slot}");
+                break;
+            };
+            count = count.min(answer.slot_count);
+            if slot < count {
+                slots.push(answer);
+            }
+            slot += 1;
+        }
+        slots
     }
 }
 
