@@ -1541,7 +1541,6 @@ pub const FREEZE_STALL_MAIN: u8 = 0x08;
 
 // `FreezeHeader::flags` bits.
 pub const FREEZE_UNREAD: u8 = 0x01;
-pub const FREEZE_LOOP_GUARD: u8 = 0x02;
 pub const FREEZE_RESTORED: u8 = 0x04;
 
 /// What the freeze record caught.
@@ -1564,8 +1563,8 @@ pub struct FreezeHeader {
     pub stalled: u8,
     /// `FREEZE_*` flag bits.
     pub flags: u8,
-    /// Consecutive automatic restarts.
-    pub in_a_row: u8,
+    /// Freezes since this record was taken, this one included.
+    pub freezes: u8,
     pub uptime_ms: u32,
     /// Zephyr fatal reason; 0 for a freeze.
     pub fatal_reason: u32,
@@ -1598,7 +1597,6 @@ impl FreezeHeader {
             self.flags,
             &[
                 (FREEZE_UNREAD, "unread"),
-                (FREEZE_LOOP_GUARD, "restart loop guard tripped"),
                 (FREEZE_RESTORED, "restored from flash"),
             ],
         )
@@ -1632,7 +1630,7 @@ pub fn parse_freeze_header(bytes: &[u8]) -> Option<FreezeHeader> {
         },
         stalled: bytes[9],
         flags: bytes[10],
-        in_a_row: bytes[11],
+        freezes: bytes[11],
         uptime_ms: le32(bytes, 12),
         fatal_reason: le32(bytes, 16),
         version: [bytes[20], bytes[21], bytes[22]],
@@ -3798,7 +3796,10 @@ mod tests {
         assert_eq!(h.stalled_names(), ["hid_wq", "slow_wq"]);
         assert!(h.unread());
         assert_eq!(h.flag_names(), ["unread", "restored from flash"]);
-        assert_eq!(h.in_a_row, 2);
+        assert_eq!(h.freezes, 2);
+        // Bit 1 is unused.
+        let unused = FreezeHeader { flags: 0x07, ..h.clone() };
+        assert_eq!(unused.flag_names(), ["unread", "restored from flash"]);
         assert_eq!(h.uptime_ms, 1_213_000);
         assert_eq!(h.fatal_reason, 0);
         assert_eq!(h.version, [0, 2, 3]);
