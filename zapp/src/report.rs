@@ -1,15 +1,13 @@
 //! `zapp report`: one plain-text file with the board's versions, its
 //! diagnostic records, and the left half's freeze record and event log.
 
-use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 
 use zapp_core::device;
 use zapp_core::hid::{BLOB_EVENTS, BLOB_FREEZE, BLOB_OK, BlobRead, parse_freeze_header};
+use zapp_update::report::{Parts, file_name, render};
 
 use crate::{describe_usb, diag, freeze, radio_line, wired_report};
 
@@ -36,6 +34,7 @@ pub fn run(output: Option<PathBuf>) -> Result<()> {
     };
 
     let parts = Parts {
+        tool: diag::tool(),
         written: now.strftime("%Y-%m-%d %H:%M:%S %:z").to_string(),
         devices: devices_lines,
         diag,
@@ -44,9 +43,9 @@ pub fn run(output: Option<PathBuf>) -> Result<()> {
         events: events_read,
     };
     let path = output.unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "zapp-report-{}.txt",
-            now.strftime("%Y-%m-%d-%H%M%S")
+        PathBuf::from(file_name(
+            "zapp",
+            &now.strftime("%Y-%m-%d-%H%M%S").to_string(),
         ))
     });
     let written = std::fs::write(&path, render(&parts))
@@ -74,49 +73,6 @@ pub fn run(output: Option<PathBuf>) -> Result<()> {
     }
     conn.close();
     Ok(())
-}
-
-/// What goes into the file.
-struct Parts {
-    written: String,
-    devices: Vec<String>,
-    /// The `zapp diag` text, or why it could not be read.
-    diag: Result<String, String>,
-    freeze_summary: Option<String>,
-    freeze: BlobRead,
-    events: BlobRead,
-}
-
-/// The file's text. Blob lines are `freeze: <base64>` and `events: <base64>`,
-/// present only when read.
-fn render(parts: &Parts) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "zapp {} report", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(out, "written: {}", parts.written);
-
-    let _ = writeln!(out, "\n== devices");
-    for line in &parts.devices {
-        let _ = writeln!(out, "{line}");
-    }
-
-    let _ = writeln!(out, "\n== diag");
-    match &parts.diag {
-        Ok(text) => out.push_str(text),
-        Err(err) => {
-            let _ = writeln!(out, "not read: {err}");
-        }
-    }
-
-    let _ = writeln!(out, "\n== left half blobs");
-    if let Some(summary) = &parts.freeze_summary {
-        let _ = writeln!(out, "freeze summary: {summary}");
-    }
-    for (name, read) in [("freeze", &parts.freeze), ("events", &parts.events)] {
-        if let BlobRead::Data(bytes) = read {
-            let _ = writeln!(out, "{name}: {}", BASE64.encode(bytes));
-        }
-    }
-    out
 }
 
 /// The lines printed besides the file's path: the freeze record, and what was
@@ -154,6 +110,7 @@ mod tests {
 
     fn parts(freeze: BlobRead, events: BlobRead) -> Parts {
         Parts {
+            tool: format!("zapp {}", env!("CARGO_PKG_VERSION")),
             written: "2026-11-10 14:03:22 +07:00".into(),
             devices: vec![
                 "Wireless Voyager · ABC".into(),

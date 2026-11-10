@@ -1,6 +1,5 @@
 mod diag;
 mod flash_log;
-mod freeze;
 mod nrf_wired;
 mod report;
 mod screen;
@@ -24,15 +23,14 @@ use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pi
 use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
-use zapp_core::hid::{
-    BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-    EsbLink, HidEvent, HostSlot, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
-};
+use zapp_core::hid::{HidEvent, HostSlot, RadioInfo, Telemetry};
 use zapp_oryx::FirmwareVariant;
 use zapp_wired::ignition::{bcd_version, usb::UsbLink};
 use zapp_wired::Ignition;
 use zapp_update::cloud::{radio_offered, Release, RunningRadio};
 use zapp_update::probe::{ble_report as ble_oryx_report, usb_report};
+use zapp_update::report::devices::*;
+use zapp_update::report::freeze;
 use zapp_update::{route, Transport};
 
 use crate::screen::Screen;
@@ -480,44 +478,6 @@ fn radio_lines(
     lines
 }
 
-/// "radio    · left 0.1.20 · 0a1b2c3d · right 4e5f6a7b", with full hashes,
-/// build number and confirm state under `--verbose`.
-fn radio_line(radio: &RadioInfo, verbose: bool) -> String {
-    if !radio.is_known() {
-        return format!("{:<8} · unknown", "radio");
-    }
-    let short = if verbose { 8 } else { 4 };
-    let confirmed = |confirmed: bool| match (verbose, confirmed) {
-        (true, true) => " · confirmed",
-        (_, false) => " · not confirmed",
-        (false, true) => "",
-    };
-    let left = match &radio.left {
-        Some(left) => {
-            let build = match left.version.build {
-                build if verbose && build != 0 => format!("+{build}"),
-                _ => String::new(),
-            };
-            format!(
-                "left {}{build} · {}{}",
-                left.version,
-                hex(&left.hash[..short]),
-                confirmed(left.confirmed)
-            )
-        }
-        None => "left unknown".to_string(),
-    };
-    let right = match &radio.right {
-        Some(right) => format!(
-            "right {}{}",
-            hex(&right.tag[..short]),
-            confirmed(right.confirmed)
-        ),
-        None => "right unknown".to_string(),
-    };
-    format!("{:<8} · {left} · {right}", "radio")
-}
-
 /// The line saying `latest` is newer than what the board runs, if it is.
 fn radio_offer(radio: &RadioInfo, latest: &Release, over: Transport) -> Option<String> {
     let left = radio.left.as_ref()?;
@@ -542,10 +502,6 @@ fn radio_offer(radio: &RadioInfo, latest: &Release, over: Transport) -> Option<S
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Ask a wired board about itself, and say what it answered.
 ///
 /// A board is preferred over the radio for its own state: plugged in, it can
@@ -558,26 +514,7 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
     if device.keyboard != Some(ids::Keyboard::Voyager2) {
         return WiredReport::default();
     }
-    let Some(((telemetry, detail, rails), radio, slots)) =
-        usb_report(device, verbose, true, verbose)
-    else {
-        return WiredReport::default();
-    };
-
-    let mut lines = Vec::new();
-    if verbose {
-        lines.extend(describe_telemetry(&telemetry));
-        lines.extend(host_slot_lines(&slots));
-        if let Some(detail) = &detail {
-            lines.extend(describe_charge(&telemetry, detail, rails));
-        }
-    }
-    WiredReport {
-        charge: wired_charge(&telemetry, detail.as_ref()),
-        lines,
-        ble_address: telemetry.ble.map(|ble| ble.address),
-        radio,
-    }
+    wired_report_from(usb_report(device, verbose, true, verbose), verbose)
 }
 
 /// The left half's unread freeze record notice, for a wired Wireless Voyager
@@ -590,110 +527,6 @@ fn wired_freeze_notice(device: &UsbDevice) -> Option<String> {
     let notice = freeze::notice(&conn);
     conn.close();
     notice
-}
-
-/// What a wired board answered: what its halves have left, which goes on the
-/// board's own line; the lines to print under it, which only `--verbose` asks
-/// for; and the Bluetooth address it is using, which the roster matches its
-/// bonded entries against; and the radio firmware it runs, for firmware that
-/// can say.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct WiredReport {
-    charge: String,
-    lines: Vec<String>,
-    ble_address: Option<String>,
-    radio: Option<RadioInfo>,
-}
-
-/// What each half of a wired board has left, in the shape and the wording the
-/// Bluetooth roster line uses, ready to append to the board's own line.
-///
-/// The charger phase from the detail read words each half when it arrived, so
-/// this and the table under it say the same thing; the summary's charging flag
-/// words it only for firmware that answers no detail at all.
-fn wired_charge(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> String {
-    let speed = charge_speed(telemetry.charging.budget_ma);
-    let halves: Vec<String> = [
-        (
-            "left",
-            telemetry.left,
-            detail.and_then(|detail| detail.left.detail.charger),
-        ),
-        (
-            "right",
-            telemetry.right,
-            detail.and_then(|detail| detail.right.detail.charger),
-        ),
-    ]
-    .into_iter()
-    .map(|(half, reading, charger)| {
-        let said = match charger {
-            Some(status) => read_in_phase(reading, status, speed),
-            None => read_as(reading, speed),
-        };
-        format!("{half} {said}")
-    })
-    .collect();
-
-    format!(" · {}", halves.join(" · "))
-}
-
-/// The lines under a wired board that stand on their own: the Bluetooth
-/// identity it is using, how the halves are linked, and which pointing devices
-/// the build carries and which of them answer. Only `--verbose` asks for these.
-fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(ble) = &telemetry.ble {
-        lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
-    }
-    lines.extend(halves_line(telemetry));
-    lines.push(features_line(&telemetry.nav()));
-    lines
-}
-
-/// How the halves are linked: the cable, or the radio between them. The radio
-/// is left out with the cable plugged, where the right half stops it.
-fn halves_line(telemetry: &Telemetry) -> Option<String> {
-    let radio = telemetry.esb_link.map(|link| match link {
-        EsbLink::Linked => "radio linked",
-        EsbLink::Absent => "radio not linked",
-        EsbLink::Mismatch => "radio key mismatch",
-    });
-    let link = match (telemetry.trrs, radio) {
-        (Some(true), _) => "cable plugged".to_string(),
-        (Some(false), Some(radio)) => format!("cable unplugged, {radio}"),
-        (Some(false), None) => "cable unplugged".to_string(),
-        (None, Some(radio)) => radio.to_string(),
-        (None, None) => return None,
-    };
-    Some(format!("{:<8} · {link}", "halves"))
-}
-
-/// One line per Bluetooth host slot, counted from one:
-/// "slot 1: C4:12:9A:33:0E:7B  paired, connected".
-fn host_slot_lines(slots: &[HostSlot]) -> Vec<String> {
-    slots
-        .iter()
-        .map(|slot| {
-            let number = u16::from(slot.slot) + 1;
-            let Some(address) = &slot.address else {
-                return format!("slot {number}: unknown");
-            };
-            let state = match (slot.paired, slot.connected) {
-                (true, true) => "paired, connected",
-                (true, false) => "paired",
-                (false, true) => "connected",
-                (false, false) => "free",
-            };
-            format!("slot {number}: {address}  {state}")
-        })
-        .collect()
-}
-
-/// The address the board is using. The slot fields come off the wire with it
-/// and are not printed.
-fn ble_identity(ble: &BleIdentity) -> String {
-    ble.address.clone()
 }
 
 /// What a Bluetooth board's charge-detail characteristic says, when the detail
@@ -730,353 +563,6 @@ fn ble_report(detail: Option<&ChargeDetail>) -> Vec<String> {
         detail_row("right", &detail.right, going, None, detail.right_rails),
     ]));
     lines
-}
-
-/// The lines under a wired board once its charge telemetry has been read: what
-/// each half's cell and charger are doing.
-///
-/// The summary read comes along for each half's VBUS flag, which the detail
-/// block does not carry and the charger phase needs.
-fn describe_charge(
-    summary: &Telemetry,
-    telemetry: &ChargeTelemetry,
-    rails: Option<PmicRailsReport>,
-) -> Vec<String> {
-    let left_rails = rails.and_then(|rails| rails.left);
-    let right_rails = rails.and_then(|rails| rails.right);
-    let going = heading_for([
-        (&telemetry.left.detail, left_rails),
-        (&telemetry.right.detail, right_rails),
-    ]);
-    table(&[
-        detail_header(going),
-        detail_row(
-            "left",
-            &telemetry.left.detail,
-            going,
-            summary.left.usb,
-            left_rails,
-        ),
-        detail_row(
-            "right",
-            &telemetry.right.detail,
-            going,
-            summary.right.usb,
-            right_rails,
-        ),
-    ])
-}
-
-/// Which way the board is going, and so what its time column counts down to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Estimate {
-    Full,
-    Empty,
-}
-
-impl Estimate {
-    fn heading(self) -> &'static str {
-        match self {
-            Self::Full => "full in",
-            Self::Empty => "empty in",
-        }
-    }
-
-    /// What one half has left the way the board is going, or nothing when the
-    /// gauge did not say or the half is not going that way. A charge that has
-    /// terminated is not filling, whatever estimate the gauge still carries.
-    fn minutes(self, detail: &BatteryDetail) -> Option<u16> {
-        match self {
-            Self::Full => detail
-                .ttf_min
-                .filter(|_| !detail.charger.is_some_and(|status| status.complete)),
-            Self::Empty => detail.tte_min,
-        }
-    }
-}
-
-/// Which way a board is going: filling while anything says it is on a source,
-/// running down otherwise. Read off both halves together, so the time column is
-/// headed once for the board rather than once per half.
-fn heading_for(halves: [(&BatteryDetail, Option<PmicRails>); 2]) -> Estimate {
-    let on_source = halves.iter().any(|(detail, rails)| {
-        rails.is_some_and(|rails| rails.vbusin.present)
-            || detail.charger.is_some_and(charging_phase)
-    });
-    match on_source {
-        true => Estimate::Full,
-        false => Estimate::Empty,
-    }
-}
-
-/// Whether the charger names a phase at all, which it only does on a source.
-fn charging_phase(status: ChargerStatus) -> bool {
-    status.complete
-        || status.trickle
-        || status.constant_current
-        || status.constant_voltage
-        || status.recharge
-        || status.paused_die_temp
-}
-
-/// The headings the halves' rows sit under. The half's own name has none.
-fn detail_header(going: Estimate) -> Vec<String> {
-    [
-        "",
-        "cell",
-        "current",
-        "temp",
-        "VBUS",
-        "VSYS",
-        going.heading(),
-        "charger",
-        "fault",
-    ]
-    .iter()
-    .map(|heading| (*heading).to_string())
-    .collect()
-}
-
-/// One half's row: its cell, its rails, how long it has, what the charger is
-/// doing and whether anything latched.
-///
-/// A column the board would not fill in says "n/a" rather than dropping out, so
-/// the rows stay under their headings. The input rail is "n/a" for a half with
-/// nothing attached, since what it reads then is not an input.
-fn detail_row(
-    half: &str,
-    detail: &BatteryDetail,
-    going: Estimate,
-    usb: Option<bool>,
-    rails: Option<PmicRails>,
-) -> Vec<String> {
-    let vbus = rails
-        .filter(|rails| rails.vbusin.present)
-        .map(|rails| volts(rails.vbus_mv));
-
-    vec![
-        half.to_string(),
-        detail.voltage_mv.map_or_else(not_available, volts),
-        detail.current_ma.map_or_else(not_available, milliamps),
-        detail.temp_cdeg.map_or_else(not_available, degrees),
-        vbus.unwrap_or_else(not_available),
-        rails.map_or_else(not_available, |rails| volts(rails.vsys_mv)),
-        going.minutes(detail).map_or_else(not_available, duration),
-        detail
-            .charger
-            .map_or_else(not_available, |status| phase(status, usb)),
-        detail.fault.map_or_else(not_available, fault),
-    ]
-}
-
-/// Rows laid out in columns: each as wide as the widest thing in it, two spaces
-/// between, left-aligned, and nothing trailing the last one.
-fn table(rows: &[Vec<String>]) -> Vec<String> {
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .filter_map(|row| row.get(column))
-                .map(|cell| cell.chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-
-    rows.iter()
-        .map(|row| {
-            let mut line = String::new();
-            for (column, cell) in row.iter().enumerate() {
-                line.push_str(cell);
-                if column + 1 < row.len() {
-                    let pad = widths[column] - cell.chars().count();
-                    line.push_str(&" ".repeat(pad + 2));
-                }
-            }
-            line
-        })
-        .collect()
-}
-
-fn not_available() -> String {
-    "n/a".to_string()
-}
-
-fn volts(millivolts: u16) -> String {
-    format!("{:.2} V", f64::from(millivolts) / 1000.0)
-}
-
-/// Signed, because the sign is the whole of what it says: into the cell or out
-/// of it.
-fn milliamps(current: i16) -> String {
-    format!("{current:+} mA")
-}
-
-fn degrees(centidegrees: i16) -> String {
-    format!("{:.1} °C", f64::from(centidegrees) / 100.0)
-}
-
-/// Hours and minutes, or minutes on their own under an hour. An estimate that
-/// has run down to nothing is under a minute rather than none.
-fn duration(minutes: u16) -> String {
-    match (minutes / 60, minutes % 60) {
-        (0, 0) => "under a minute".to_string(),
-        (0, minutes) => format!("{minutes} min"),
-        (hours, minutes) => format!("{hours} h {minutes:02} min"),
-    }
-}
-
-/// What the charger is doing, in one phrase. More than one phase bit at a time
-/// is the register's business; the first of them is what the charge is at.
-///
-/// The no-cell bit only means anything while the half has USB: on battery the
-/// firmware reads it clear with a healthy cell in place. So it is said only
-/// when the caller knows a source is attached, and otherwise the phase bits
-/// are read as they stand.
-fn phase(status: ChargerStatus, usb: Option<bool>) -> String {
-    match status {
-        _ if usb == Some(true) && !status.battery_detected => "no battery detected",
-        _ if status.complete => "charge complete",
-        _ if status.trickle => "trickle charging",
-        _ if status.constant_current => "constant current",
-        _ if status.constant_voltage => "constant voltage",
-        _ if status.recharge => "recharging",
-        _ if status.paused_die_temp => "paused (die temperature)",
-        _ => "charger idle",
-    }
-    .to_string()
-}
-
-/// Whether anything latched, and what the sensors read when it did.
-///
-/// The firmware clears these when a source is attached, so a fault named here
-/// is one that happened since.
-fn fault(fault: ChargerFault) -> String {
-    if fault.is_clear() {
-        return "none".to_string();
-    }
-
-    let reasons = fault.reasons();
-    let named = match reasons.is_empty() {
-        // A bit this host has no name for: firmware, or hardware, newer than it.
-        true => format!("0x{:02x}", fault.reason),
-        false => reasons.join(", "),
-    };
-    let sensors = fault.sensors();
-    match sensors.is_empty() {
-        true => named,
-        false => format!("{named} ({})", sensors.join(", ")),
-    }
-}
-
-/// The port's declared capacity, not what is presently drawn — a source that
-/// only offered the default 500 mA can never charge fast no matter what
-/// gets negotiated after. Mirrors ZSA_PWR_BUDGET_HIGH_MA in the firmware's
-/// zsa_uart_proto.h.
-const FAST_CHARGE_BUDGET_MA: u16 = 1500;
-
-fn charge_speed(budget_ma: Option<u16>) -> Option<&'static str> {
-    match budget_ma {
-        Some(0) | None => None, // no source identified, or firmware predates the field
-        Some(ma) if ma >= FAST_CHARGE_BUDGET_MA => Some("fast"),
-        Some(_) => Some("slow"),
-    }
-}
-
-/// One half's level and, if it is charging, how fast.
-///
-/// The fallback wording, for a board that gave no charge detail: its charging
-/// flag is true for a trickle and for a topped-up cell alike.
-fn read_as(reading: BatteryReading, speed: Option<&str>) -> String {
-    let level = level_as(reading.level);
-    match reading.charging {
-        Some(true) => format!("{level} {}", charging_as(speed)),
-        _ => level,
-    }
-}
-
-/// One half's level and what its charger is doing, out of the same phase the
-/// detail line names.
-fn read_in_phase(reading: BatteryReading, status: ChargerStatus, speed: Option<&str>) -> String {
-    let level = level_as(reading.level);
-    match phase_as(status, reading.usb, speed) {
-        Some(said) => format!("{level} {said}"),
-        None => level,
-    }
-}
-
-/// A summary line's word for one charger phase, or `None` when there is nothing
-/// to say: no phase at all, off a source.
-///
-/// The bits are read in the order `phase` reads them, so the summary and the
-/// detail line never disagree. Only constant current is a speed: constant
-/// voltage is the tail of the charge, whatever the source offered.
-fn phase_as(status: ChargerStatus, usb: Option<bool>, speed: Option<&str>) -> Option<String> {
-    let said = match status {
-        _ if usb == Some(true) && !status.battery_detected => "no battery detected".to_string(),
-        _ if status.complete => "full".to_string(),
-        _ if status.trickle => "trickle charging".to_string(),
-        _ if status.constant_current => charging_as(speed),
-        _ if status.constant_voltage => "topping up".to_string(),
-        _ if status.recharge => "charging".to_string(),
-        _ if status.paused_die_temp => "charging paused (hot)".to_string(),
-        // No phase at all: idle on a source, and nothing to say off one.
-        _ if usb == Some(true) => "not charging".to_string(),
-        _ => return None,
-    };
-    Some(said)
-}
-
-fn level_as(level: Option<u8>) -> String {
-    match level {
-        Some(level) => format!("{level}%"),
-        None => "unknown".to_string(),
-    }
-}
-
-fn charging_as(speed: Option<&str>) -> String {
-    match speed {
-        Some(speed) => format!("{speed} charging"),
-        None => "charging".to_string(),
-    }
-}
-
-/// One entry per pointing device: unknown when the build is not known, not
-/// supported when the build cannot drive it, connected with the side it is on
-/// (or with no side when only the shared bus found it), disconnected when both
-/// halves answered without it, and unknown otherwise.
-fn features(nav: &NavReport) -> String {
-    let devices: [(&str, fn(Nav) -> bool); 2] = [
-        ("Trackball", |nav| nav.trackball),
-        ("Trackpad", |nav| nav.trackpad),
-    ];
-    devices
-        .into_iter()
-        .map(|(name, has)| {
-            let found = |side: Option<Nav>| side.is_some_and(has);
-            let state = match nav.build {
-                None => "unknown",
-                Some(build) if !has(build) => "not supported",
-                Some(_) => match (found(nav.left), found(nav.right)) {
-                    (true, true) => "connected, left and right",
-                    (true, false) => "connected, left",
-                    (false, true) => "connected, right",
-                    (false, false) if found(nav.bus) => "connected",
-                    _ if nav.left.is_some() && nav.right.is_some() => "disconnected",
-                    // A non-zero bus mask comes from a bus that reaches both halves.
-                    _ if nav.bus.is_some_and(|bus| bus != Nav::default()) => "disconnected",
-                    _ => "unknown",
-                },
-            };
-            format!("{name} ({state})")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The features line, as wired and Bluetooth boards print it.
-fn features_line(nav: &NavReport) -> String {
-    format!("{:<8} · {}", "features", features(nav))
 }
 
 /// What the halves have left, and what each half's charger is doing when the
@@ -1158,17 +644,6 @@ fn bootloader_version(device: &UsbDevice) -> String {
         }
     };
     format!(" · ignition {version}")
-}
-
-fn describe_usb(device: &UsbDevice) -> String {
-    let name = match device.bootloader {
-        Some(_) => ids::friendly_name(device.vid, device.pid).to_string(),
-        None => target_name_for_pid(device.pid).to_string(),
-    };
-    match &device.serial {
-        Some(serial) if !serial.is_empty() => format!("{name} · {serial}"),
-        _ => name,
-    }
 }
 
 fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<()> {
@@ -1502,7 +977,11 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zapp_core::hid::{Charging, HalfDetail, Source, VbusInStatus};
+    use zapp_core::hid::{
+        BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
+        Charging, EsbLink, HalfDetail, Nav, NavReport, PmicRails, PmicRailsReport, Source,
+        VbusInStatus,
+    };
 
     #[test]
     fn host_slots_are_counted_from_one() {

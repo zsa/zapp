@@ -47,6 +47,7 @@ mod error;
 pub mod event;
 pub mod guard;
 pub mod probe;
+pub mod report;
 pub mod text;
 pub mod wired;
 

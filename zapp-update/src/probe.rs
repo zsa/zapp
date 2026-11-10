@@ -138,7 +138,20 @@ pub fn usb_report(
         return None; // a board in its bootloader runs no keyboard firmware
     }
 
-    let mut probe = Probe::new(HidConnection::open(device.vid, device.pid).ok()?);
+    let conn = HidConnection::open(device.vid, device.pid).ok()?;
+    report_on(&conn, None, rails, radio, slots)
+}
+
+/// [`usb_report`] over a connection already open, on either transport.
+/// `protocol` is the version its handshake already reported, if any.
+pub fn report_on(
+    conn: &HidConnection,
+    protocol: Option<u8>,
+    rails: bool,
+    radio: bool,
+    slots: bool,
+) -> Option<(UsbTelemetry, Option<RadioInfo>, Vec<HostSlot>)> {
+    let mut probe = Probe { conn, protocol };
     let telemetry = probe.ask(CMD_GET_TELEMETRY, |event| match event {
         HidEvent::Telemetry(telemetry) => Some(telemetry),
         _ => None,
@@ -182,7 +195,7 @@ pub fn ble_report(
             return (None, None, Vec::new());
         }
     };
-    let mut probe = Probe::new(connection);
+    let mut probe = Probe::new(&connection);
     let radio = probe.radio_info(BLE_HANDSHAKE_WAIT);
     let telemetry = telemetry
         .then(|| {
@@ -197,18 +210,18 @@ pub fn ble_report(
     } else {
         Vec::new()
     };
-    probe.conn.close();
+    connection.close();
     (radio, telemetry, slots)
 }
 
 /// One connection, and the protocol version its handshake reported.
-struct Probe {
-    conn: HidConnection,
+struct Probe<'a> {
+    conn: &'a HidConnection,
     protocol: Option<u8>,
 }
 
-impl Probe {
-    fn new(conn: HidConnection) -> Self {
+impl<'a> Probe<'a> {
+    fn new(conn: &'a HidConnection) -> Self {
         Self {
             conn,
             protocol: None,
