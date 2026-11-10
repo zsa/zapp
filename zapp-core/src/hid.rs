@@ -141,6 +141,11 @@ impl HidConnection {
         self.rx.recv_timeout(timeout).ok()
     }
 
+    /// Whether the read loop has ended, its `Disconnected` sent.
+    pub fn is_closed(&self) -> bool {
+        self.reader.as_ref().is_none_or(|reader| reader.is_finished())
+    }
+
     /// Stops the reader thread and waits for it, so the link is dropped
     /// before this returns.
     pub fn close(mut self) {
@@ -339,5 +344,11 @@ mod tests {
             connection.recv_timeout(Duration::from_secs(2)),
             Some(HidEvent::Disconnected)
         );
+        // The reader returns right after sending it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !connection.is_closed() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(connection.is_closed());
     }
 }
