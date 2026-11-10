@@ -52,6 +52,13 @@ pub const CMD_GET_RADIO_INFO: u8 = 0x12;
 /// counted from zero. Answered with `EVT_HOST_SLOTS`; firmware before it does
 /// not answer.
 pub const CMD_GET_HOST_SLOTS: u8 = 0x13;
+/// Ask the board for one chunk of a left nRF blob: params are the blob
+/// (`BLOB_FREEZE`, `BLOB_EVENTS`) and the offset, little-endian. Answered with
+/// `EVT_BLOB`; firmware before it answers `EVT_ERROR`.
+pub const CMD_GET_BLOB: u8 = 0x14;
+/// Clear the left nRF freeze record's unread flag. Answered with
+/// `EVT_FREEZE_SEEN`.
+pub const CMD_FREEZE_SEEN: u8 = 0x15;
 pub const CMD_GET_PROTOCOL_VERSION: u8 = 0xFE;
 
 // Device → host events
@@ -85,6 +92,15 @@ pub const EVT_RADIO_INFO: u8 = 0x12;
 /// Answer to `CMD_GET_HOST_SLOTS`. Binary and STOP_BIT-free: a 0xFE in an
 /// address is data.
 pub const EVT_HOST_SLOTS: u8 = 0x13;
+/// Answer to `CMD_GET_BLOB`. Binary and STOP_BIT-free.
+pub const EVT_BLOB: u8 = 0x14;
+/// Answer to `CMD_FREEZE_SEEN`: one status byte, `BLOB_OK` or
+/// `BLOB_NO_LINK`.
+pub const EVT_FREEZE_SEEN: u8 = 0x15;
+/// The board refused a command; the param is the error code.
+pub const EVT_ERROR: u8 = 0xFF;
+/// `EVT_ERROR` code for a command the firmware does not know.
+pub const ERR_UNKNOWN_COMMAND: u8 = 0xFF;
 pub const EVT_GET_PROTOCOL_VERSION: u8 = 0xFD;
 
 /// Telemetry format this host understands. Only bumped by firmware when a
@@ -1383,6 +1399,248 @@ pub fn parse_host_slot(params: &[u8]) -> Option<HostSlot> {
     })
 }
 
+// `CMD_GET_BLOB` blobs.
+pub const BLOB_FREEZE: u8 = 0;
+pub const BLOB_EVENTS: u8 = 1;
+/// Data bytes per `EVT_BLOB`.
+pub const BLOB_CHUNK: usize = 24;
+/// `EVT_BLOB` payload size: the bytes after the opcode.
+pub const BLOB_SIZE: usize = 7 + BLOB_CHUNK;
+
+// `EVT_BLOB` and `EVT_FREEZE_SEEN` status.
+pub const BLOB_OK: u8 = 0;
+pub const BLOB_NONE: u8 = 1;
+pub const BLOB_BAD_OFFSET: u8 = 2;
+pub const BLOB_TIMEOUT: u8 = 0x80;
+pub const BLOB_NO_LINK: u8 = 0x81;
+pub const BLOB_BUSY: u8 = 0x82;
+
+/// Byte offsets inside the `EVT_BLOB` payload.
+mod blob_offset {
+    pub const WHICH: usize = 0;
+    pub const STATUS: usize = 1;
+    pub const TOTAL_LEN: usize = 2;
+    pub const OFFSET: usize = 4;
+    pub const LEN: usize = 6;
+    pub const DATA: usize = 7;
+}
+
+/// One `EVT_BLOB` answer: `data` is the chunk at `offset`, `total_len` the
+/// whole blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobChunk {
+    pub which: u8,
+    pub status: u8,
+    pub total_len: u16,
+    pub offset: u16,
+    pub data: Vec<u8>,
+}
+
+/// Params of `CMD_GET_BLOB`.
+pub fn blob_request(which: u8, offset: u16) -> [u8; 3] {
+    let [lo, hi] = offset.to_le_bytes();
+    [which, lo, hi]
+}
+
+/// Decode an `EVT_BLOB` payload, the bytes after the opcode. `None` when
+/// short or when `len` is past a chunk.
+pub fn parse_blob_chunk(params: &[u8]) -> Option<BlobChunk> {
+    use blob_offset as at;
+
+    let params = params.get(..BLOB_SIZE)?;
+    let len = usize::from(params[at::LEN]);
+    if len > BLOB_CHUNK {
+        return None;
+    }
+    Some(BlobChunk {
+        which: params[at::WHICH],
+        status: params[at::STATUS],
+        total_len: le16(params, at::TOTAL_LEN),
+        offset: le16(params, at::OFFSET),
+        data: params[at::DATA..at::DATA + len].to_vec(),
+    })
+}
+
+/// How a blob read ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobRead {
+    Data(Vec<u8>),
+    /// The left nRF has no such blob.
+    None,
+    /// The firmware does not know `CMD_GET_BLOB`, or never answered it.
+    Unsupported,
+    /// A chunk came back with this status (`BLOB_*`).
+    Failed(u8),
+    /// The chunks did not join up.
+    Inconsistent,
+}
+
+/// Whole-blob restarts when `total_len` changes during a read.
+const BLOB_RESTARTS: usize = 2;
+
+/// Reads a blob chunk by chunk from offset 0, at most `limit` bytes of it.
+/// `ask` returns the answer for one offset: `None` for no answer,
+/// `Some(Err(()))` for an unknown-command error.
+pub fn read_blob(
+    which: u8,
+    limit: usize,
+    mut ask: impl FnMut(u16) -> Option<Result<BlobChunk, ()>>,
+) -> BlobRead {
+    'restart: for _ in 0..=BLOB_RESTARTS {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut total: Option<u16> = None;
+        loop {
+            let offset = bytes.len();
+            if let Some(total) = total
+                && offset >= usize::from(total).min(limit)
+            {
+                bytes.truncate(limit);
+                return BlobRead::Data(bytes);
+            }
+            let Ok(at) = u16::try_from(offset) else {
+                return BlobRead::Inconsistent;
+            };
+            let chunk = match ask(at) {
+                None if offset == 0 => return BlobRead::Unsupported,
+                None => return BlobRead::Failed(BLOB_TIMEOUT),
+                Some(Err(())) => return BlobRead::Unsupported,
+                Some(Ok(chunk)) => chunk,
+            };
+            if chunk.which != which || chunk.offset != at {
+                return BlobRead::Inconsistent;
+            }
+            match chunk.status {
+                BLOB_OK => {}
+                BLOB_NONE if offset == 0 => return BlobRead::None,
+                status => return BlobRead::Failed(status),
+            }
+            match total {
+                None => total = Some(chunk.total_len),
+                Some(total) if total != chunk.total_len => continue 'restart,
+                Some(_) => {}
+            }
+            if chunk.data.is_empty() && offset < usize::from(chunk.total_len) {
+                return BlobRead::Inconsistent;
+            }
+            bytes.extend_from_slice(&chunk.data);
+        }
+    }
+    BlobRead::Inconsistent
+}
+
+/// "ZFRZ", little-endian: the freeze record's first four bytes.
+pub const FREEZE_MAGIC: u32 = 0x5A52_465A;
+/// Bytes in the freeze record's fixed header.
+pub const FREEZE_HEADER_SIZE: usize = 36;
+
+// `FreezeHeader::stalled` bits.
+pub const FREEZE_STALL_SYSTEM_WQ: u8 = 0x01;
+pub const FREEZE_STALL_HID_WQ: u8 = 0x02;
+pub const FREEZE_STALL_SLOW_WQ: u8 = 0x04;
+pub const FREEZE_STALL_MAIN: u8 = 0x08;
+
+// `FreezeHeader::flags` bits.
+pub const FREEZE_UNREAD: u8 = 0x01;
+pub const FREEZE_LOOP_GUARD: u8 = 0x02;
+pub const FREEZE_RESTORED: u8 = 0x04;
+
+/// What the freeze record caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeKind {
+    /// A task queue stopped making progress.
+    Freeze,
+    /// A fatal error.
+    Fatal,
+    Other(u8),
+}
+
+/// The freeze record's fixed header; the body after it is not decoded here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreezeHeader {
+    pub layout: u16,
+    pub total_len: u16,
+    pub kind: FreezeKind,
+    /// `FREEZE_STALL_*` bits.
+    pub stalled: u8,
+    /// `FREEZE_*` flag bits.
+    pub flags: u8,
+    /// Consecutive automatic restarts.
+    pub in_a_row: u8,
+    pub uptime_ms: u32,
+    /// Zephyr fatal reason; 0 for a freeze.
+    pub fatal_reason: u32,
+    pub version: [u8; 3],
+    pub build: u32,
+    pub hash: [u8; 8],
+}
+
+impl FreezeHeader {
+    pub fn unread(&self) -> bool {
+        self.flags & FREEZE_UNREAD != 0
+    }
+
+    /// Names of the stalled queues, in bit order.
+    pub fn stalled_names(&self) -> Vec<&'static str> {
+        freeze_bit_names(
+            self.stalled,
+            &[
+                (FREEZE_STALL_SYSTEM_WQ, "system workqueue"),
+                (FREEZE_STALL_HID_WQ, "hid_wq"),
+                (FREEZE_STALL_SLOW_WQ, "slow_wq"),
+                (FREEZE_STALL_MAIN, "main loop"),
+            ],
+        )
+    }
+
+    /// Names of the set flags, in bit order.
+    pub fn flag_names(&self) -> Vec<&'static str> {
+        freeze_bit_names(
+            self.flags,
+            &[
+                (FREEZE_UNREAD, "unread"),
+                (FREEZE_LOOP_GUARD, "restart loop guard tripped"),
+                (FREEZE_RESTORED, "restored from flash"),
+            ],
+        )
+    }
+}
+
+fn freeze_bit_names(bits: u8, names: &[(u8, &'static str)]) -> Vec<&'static str> {
+    names
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|&(_, name)| name)
+        .collect()
+}
+
+/// Decode the freeze record's fixed header from its first bytes. `None` when
+/// short or without the magic.
+pub fn parse_freeze_header(bytes: &[u8]) -> Option<FreezeHeader> {
+    let bytes = bytes.get(..FREEZE_HEADER_SIZE)?;
+    if le32(bytes, 0) != FREEZE_MAGIC {
+        return None;
+    }
+    let mut hash = [0u8; 8];
+    hash.copy_from_slice(&bytes[28..36]);
+    Some(FreezeHeader {
+        layout: le16(bytes, 4),
+        total_len: le16(bytes, 6),
+        kind: match bytes[8] {
+            1 => FreezeKind::Freeze,
+            2 => FreezeKind::Fatal,
+            other => FreezeKind::Other(other),
+        },
+        stalled: bytes[9],
+        flags: bytes[10],
+        in_a_row: bytes[11],
+        uptime_ms: le32(bytes, 12),
+        fatal_reason: le32(bytes, 16),
+        version: [bytes[20], bytes[21], bytes[22]],
+        build: le32(bytes, 24),
+        hash,
+    })
+}
+
 /// Events from a connected keyboard's raw HID interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HidEvent {
@@ -1424,6 +1682,12 @@ pub enum HidEvent {
     RadioInfo(RadioInfo),
     /// The board answered `CMD_GET_HOST_SLOTS` for one slot.
     HostSlot(HostSlot),
+    /// The board answered `CMD_GET_BLOB` with one chunk.
+    Blob(BlobChunk),
+    /// The board answered `CMD_FREEZE_SEEN` with this status.
+    FreezeSeen(u8),
+    /// The board answered `EVT_ERROR` with this code.
+    Error(u8),
     /// The read loop ended (device unplugged or errored).
     Disconnected,
 }
@@ -1456,6 +1720,9 @@ pub fn parse_packet(data: &[u8]) -> Option<(u8, &[u8])> {
             | EVT_DIAG
             | EVT_RADIO_INFO
             | EVT_HOST_SLOTS
+            | EVT_BLOB
+            | EVT_FREEZE_SEEN
+            | EVT_ERROR
     ) {
         // Binary payload carrying its own length: 0xFE in it is a value, not
         // a terminator, and truncating there would eat a 254% battery or a
@@ -1747,6 +2014,18 @@ pub fn process_packet(data: &[u8]) -> (Option<HidEvent>, Vec<Packet>) {
         },
         EVT_HOST_SLOTS => match parse_host_slot(params) {
             Some(slot) => HidEvent::HostSlot(slot),
+            None => return (None, Vec::new()),
+        },
+        EVT_BLOB => match parse_blob_chunk(params) {
+            Some(chunk) => HidEvent::Blob(chunk),
+            None => return (None, Vec::new()),
+        },
+        EVT_FREEZE_SEEN => match params.first() {
+            Some(&status) => HidEvent::FreezeSeen(status),
+            None => return (None, Vec::new()),
+        },
+        EVT_ERROR => match params.first() {
+            Some(&code) => HidEvent::Error(code),
             None => return (None, Vec::new()),
         },
         EVT_GET_PROTOCOL_VERSION => match params.first() {
@@ -3323,5 +3602,224 @@ mod tests {
             ["reset pin", "watchdog"]
         );
         assert!(stm32_reset_causes(0x01).is_empty());
+    }
+
+    /// An `EVT_BLOB` report.
+    fn blob_report(which: u8, status: u8, total: u16, offset: u16, data: &[u8]) -> Vec<u8> {
+        let mut r = vec![EVT_BLOB, which, status];
+        r.extend_from_slice(&total.to_le_bytes());
+        r.extend_from_slice(&offset.to_le_bytes());
+        r.push(data.len() as u8);
+        r.extend_from_slice(data);
+        r.resize(REPORT_SIZE, 0);
+        r
+    }
+
+    #[test]
+    fn blob_chunk_decodes() {
+        let data: Vec<u8> = (0xE8..=0xFF).collect();
+        let (event, replies) = process_packet(&blob_report(BLOB_EVENTS, BLOB_OK, 300, 48, &data));
+        assert!(replies.is_empty());
+        assert_eq!(
+            event,
+            Some(HidEvent::Blob(BlobChunk {
+                which: BLOB_EVENTS,
+                status: BLOB_OK,
+                total_len: 300,
+                offset: 48,
+                // 0xFE in it is data.
+                data,
+            }))
+        );
+        assert_eq!(
+            &encode_packet(CMD_GET_BLOB, &blob_request(1, 0x0130))[..4],
+            &[0x14, 1, 0x30, 0x01]
+        );
+    }
+
+    #[test]
+    fn blob_chunk_rejects_short_and_overlong() {
+        let report = blob_report(BLOB_FREEZE, BLOB_OK, 10, 0, &[1, 2]);
+        assert_eq!(parse_blob_chunk(&report[1..BLOB_SIZE]), None);
+        let mut bad = blob_report(BLOB_FREEZE, BLOB_OK, 10, 0, &[]);
+        bad[7] = 25;
+        assert_eq!(parse_blob_chunk(&bad[1..]), None);
+    }
+
+    #[test]
+    fn freeze_seen_and_error_events() {
+        let mut r = vec![EVT_FREEZE_SEEN, BLOB_NO_LINK];
+        r.resize(REPORT_SIZE, 0);
+        assert_eq!(
+            process_packet(&r).0,
+            Some(HidEvent::FreezeSeen(BLOB_NO_LINK))
+        );
+        let mut r = vec![EVT_ERROR, ERR_UNKNOWN_COMMAND];
+        r.resize(REPORT_SIZE, 0);
+        assert_eq!(
+            process_packet(&r).0,
+            Some(HidEvent::Error(ERR_UNKNOWN_COMMAND))
+        );
+    }
+
+    /// Answers `read_blob` from `blob`, `BLOB_CHUNK` bytes at a time.
+    fn serve(which: u8, blob: &[u8]) -> impl FnMut(u16) -> Option<Result<BlobChunk, ()>> + '_ {
+        move |offset| {
+            let at = usize::from(offset).min(blob.len());
+            let end = (at + BLOB_CHUNK).min(blob.len());
+            Some(Ok(BlobChunk {
+                which,
+                status: BLOB_OK,
+                total_len: blob.len() as u16,
+                offset,
+                data: blob[at..end].to_vec(),
+            }))
+        }
+    }
+
+    #[test]
+    fn read_blob_joins_chunks() {
+        let blob: Vec<u8> = (0..100u8).collect();
+        let mut asked = Vec::new();
+        let mut inner = serve(BLOB_EVENTS, &blob);
+        let read = read_blob(BLOB_EVENTS, usize::MAX, |offset| {
+            asked.push(offset);
+            inner(offset)
+        });
+        assert_eq!(read, BlobRead::Data(blob.clone()));
+        assert_eq!(asked, [0, 24, 48, 72, 96]);
+
+        // A limit stops early: the 36-byte header is two chunks.
+        let mut count = 0;
+        let mut inner = serve(BLOB_EVENTS, &blob);
+        let read = read_blob(BLOB_EVENTS, FREEZE_HEADER_SIZE, |offset| {
+            count += 1;
+            inner(offset)
+        });
+        assert_eq!(read, BlobRead::Data(blob[..FREEZE_HEADER_SIZE].to_vec()));
+        assert_eq!(count, 2);
+
+        // An empty blob is one chunk.
+        assert_eq!(
+            read_blob(BLOB_FREEZE, usize::MAX, serve(BLOB_FREEZE, &[])),
+            BlobRead::Data(Vec::new())
+        );
+    }
+
+    #[test]
+    fn read_blob_outcomes() {
+        let none = |offset| {
+            Some(Ok(BlobChunk {
+                which: 0,
+                status: BLOB_NONE,
+                total_len: 0,
+                offset,
+                data: Vec::new(),
+            }))
+        };
+        assert_eq!(read_blob(BLOB_FREEZE, usize::MAX, none), BlobRead::None);
+        assert_eq!(
+            read_blob(BLOB_FREEZE, usize::MAX, |_| None),
+            BlobRead::Unsupported
+        );
+        assert_eq!(
+            read_blob(BLOB_FREEZE, usize::MAX, |_| Some(Err(()))),
+            BlobRead::Unsupported
+        );
+        let no_link = |offset| {
+            Some(Ok(BlobChunk {
+                which: 0,
+                status: BLOB_NO_LINK,
+                total_len: 0,
+                offset,
+                data: Vec::new(),
+            }))
+        };
+        assert_eq!(
+            read_blob(BLOB_FREEZE, usize::MAX, no_link),
+            BlobRead::Failed(BLOB_NO_LINK)
+        );
+
+        // Silence after the first chunk is a timeout.
+        let blob = [7u8; 40];
+        let mut inner = serve(BLOB_FREEZE, &blob);
+        let read = read_blob(BLOB_FREEZE, usize::MAX, |offset| {
+            (offset == 0).then(|| inner(offset)).flatten()
+        });
+        assert_eq!(read, BlobRead::Failed(BLOB_TIMEOUT));
+
+        // The wrong blob back.
+        assert_eq!(
+            read_blob(BLOB_FREEZE, usize::MAX, serve(BLOB_EVENTS, &blob)),
+            BlobRead::Inconsistent
+        );
+    }
+
+    #[test]
+    fn read_blob_restarts_when_the_size_changes() {
+        let short: Vec<u8> = vec![1; 30];
+        let long: Vec<u8> = vec![2; 50];
+        let mut calls = 0;
+        let read = read_blob(BLOB_EVENTS, usize::MAX, |offset| {
+            calls += 1;
+            // The first read sees 30 bytes, then the log grows to 50.
+            if calls == 1 {
+                serve(BLOB_EVENTS, &short)(offset)
+            } else {
+                serve(BLOB_EVENTS, &long)(offset)
+            }
+        });
+        assert_eq!(read, BlobRead::Data(long));
+    }
+
+    /// A freeze header: hid_wq and slow_wq stalled, unread and restored.
+    fn freeze_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&FREEZE_MAGIC.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&200u16.to_le_bytes());
+        h.extend_from_slice(&[1, 0x06, 0x05, 2]);
+        h.extend_from_slice(&1_213_000u32.to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(&[0, 2, 3, 0]);
+        h.extend_from_slice(&41u32.to_le_bytes());
+        h.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(h.len(), FREEZE_HEADER_SIZE);
+        h.extend_from_slice(&[0xAA; 8]);
+        h
+    }
+
+    #[test]
+    fn freeze_header_decodes() {
+        let h = parse_freeze_header(&freeze_header()).unwrap();
+        assert_eq!(h.layout, 1);
+        assert_eq!(h.total_len, 200);
+        assert_eq!(h.kind, FreezeKind::Freeze);
+        assert_eq!(h.stalled_names(), ["hid_wq", "slow_wq"]);
+        assert!(h.unread());
+        assert_eq!(h.flag_names(), ["unread", "restored from flash"]);
+        assert_eq!(h.in_a_row, 2);
+        assert_eq!(h.uptime_ms, 1_213_000);
+        assert_eq!(h.fatal_reason, 0);
+        assert_eq!(h.version, [0, 2, 3]);
+        assert_eq!(h.build, 41);
+        assert_eq!(h.hash, [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn freeze_header_rejects_short_and_bad_magic() {
+        let h = freeze_header();
+        assert_eq!(parse_freeze_header(&h[..FREEZE_HEADER_SIZE - 1]), None);
+        let mut bad = h.clone();
+        bad[0] ^= 1;
+        assert_eq!(parse_freeze_header(&bad), None);
+        let mut fatal = h;
+        fatal[8] = 2;
+        fatal[9] = 0;
+        fatal[16] = 4;
+        let fatal = parse_freeze_header(&fatal).unwrap();
+        assert_eq!(fatal.kind, FreezeKind::Fatal);
+        assert!(fatal.stalled_names().is_empty());
+        assert_eq!(fatal.fatal_reason, 4);
     }
 }

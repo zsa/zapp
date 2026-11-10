@@ -1115,6 +1115,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2778,11 +2779,13 @@ name = "zapp"
 version = "1.1.14"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ctrlc",
  "env_logger",
  "flate2",
  "indicatif",
+ "jiff",
  "log",
  "self-replace",
  "tar",

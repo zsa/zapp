@@ -1,6 +1,8 @@
 mod diag;
 mod flash_log;
+mod freeze;
 mod nrf_wired;
+mod report;
 mod screen;
 mod upgrade;
 mod zsab;
@@ -170,6 +172,23 @@ enum Commands {
             zapp diag > voyager2-diag.txt"
     )]
     Diag,
+    /// Write a Wireless Voyager report file for ZSA support
+    #[command(
+        long_about = "Write a Wireless Voyager report file for ZSA support.\n\n\
+            Collects into one plain-text file the zapp version, the keyboard's \
+            firmware and radio versions, the `zapp diag` records, and the left \
+            half's freeze record and event log. Then marks the freeze record \
+            as reported. The keyboard must be on USB and running its own \
+            firmware.",
+        after_long_help = "Examples:\n  \
+            zapp report\n  \
+            zapp report -o voyager-report.txt"
+    )]
+    Report {
+        /// File to write; defaults to zapp-report-<date>-<time>.txt here
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
     /// Update zapp itself to the newest release
     #[command(
         long_about = "Update zapp itself to the newest release.\n\n\
@@ -230,6 +249,7 @@ fn dispatch(command: Commands) -> Result<()> {
         } => cmd_devices(scan, skip_bluetooth, verbose),
         Commands::Live { device } => cmd_live(device.as_deref()),
         Commands::Diag => diag::run(),
+        Commands::Report { output } => report::run(output),
         Commands::Upgrade { yes, check } => upgrade::run(yes, check),
         Commands::Bond { key, show } => {
             if show {
@@ -325,6 +345,9 @@ fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
                     for line in radio_lines(radio, verbose, &mut feed, Transport::Usb) {
                         println!("    {line}");
                     }
+                }
+                if let Some(line) = wired_freeze_notice(device) {
+                    println!("    {line}");
                 }
                 on_usb.extend(report.ble_address);
             }
@@ -555,6 +578,18 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
         ble_address: telemetry.ble.map(|ble| ble.address),
         radio,
     }
+}
+
+/// The left half's unread freeze record notice, for a wired Wireless Voyager
+/// running its keyboard firmware. Silent for firmware without the command.
+fn wired_freeze_notice(device: &UsbDevice) -> Option<String> {
+    if device.keyboard != Some(ids::Keyboard::Voyager2) || device.bootloader.is_some() {
+        return None;
+    }
+    let conn = zapp_core::hid::HidConnection::open(device.vid, device.pid).ok()?;
+    let notice = freeze::notice(&conn);
+    conn.close();
+    notice
 }
 
 /// What a wired board answered: what its halves have left, which goes on the

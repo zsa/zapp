@@ -45,6 +45,11 @@ pub use zapp_hid_proto::{
     has_radio_info,
 };
 pub use zapp_hid_proto::{CMD_GET_HOST_SLOTS, HOST_SLOTS_MAX, HostSlot, parse_host_slot};
+pub use zapp_hid_proto::{
+    BLOB_BUSY, BLOB_EVENTS, BLOB_FREEZE, BLOB_NO_LINK, BLOB_OK, BLOB_TIMEOUT, BlobChunk, BlobRead,
+    CMD_FREEZE_SEEN, CMD_GET_BLOB, ERR_UNKNOWN_COMMAND, FREEZE_HEADER_SIZE, FreezeHeader,
+    FreezeKind, blob_request, parse_freeze_header, read_blob,
+};
 
 /// Write packet size: report ID byte + 32-byte report.
 const PACKET_SIZE: usize = REPORT_SIZE + 1;

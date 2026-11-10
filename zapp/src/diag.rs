@@ -35,6 +35,32 @@ const NO_ANSWER: &str = "The keyboard firmware did not answer the diagnostic req
 pub fn run() -> Result<()> {
     let devices = device::list_devices().context("could not list USB devices")?;
     let (device, count) = pick(&devices)?;
+    let (conn, read) = read(device, count)?;
+    let notice = match &read {
+        Ok(_) => crate::freeze::notice(&conn),
+        Err(_) => None,
+    };
+    conn.close();
+
+    let read = read?;
+    print!("{}", read.text);
+    if let Some(notice) = notice {
+        println!("{notice}");
+    }
+    match read.stm32_problem {
+        None => Ok(()),
+        Some(problem) => bail!(problem),
+    }
+}
+
+/// The rendered records, and what is wrong with the STM32 one.
+pub(crate) struct Read {
+    pub text: String,
+    pub stm32_problem: Option<String>,
+}
+
+/// Reads every record over a new connection, which is handed back open.
+pub(crate) fn read(device: &UsbDevice, count: usize) -> Result<(HidConnection, Result<Read>)> {
     let conn = HidConnection::open(device.vid, device.pid)
         .context("could not open the keyboard's raw HID interface")?;
     let mut session = Session::new(conn);
@@ -46,21 +72,21 @@ pub fn run() -> Result<()> {
         firmware: session.firmware.take(),
         protocol: session.protocol,
     };
-    session.conn.close();
-
-    let report = report?;
-    print!("{}", render(&header, &report));
-    match &report.stm32 {
-        Found::Record { .. } => Ok(()),
-        Found::NoRecord => bail!("The keyboard MCU (STM32) has no record for this boot."),
-        Found::Problem(problem) => {
-            bail!("Could not read the keyboard MCU (STM32) record: {problem}.")
-        }
-    }
+    let read = report.map(|report| Read {
+        text: render(&header, &report),
+        stm32_problem: match &report.stm32 {
+            Found::Record { .. } => None,
+            Found::NoRecord => Some("The keyboard MCU (STM32) has no record for this boot.".into()),
+            Found::Problem(problem) => Some(format!(
+                "Could not read the keyboard MCU (STM32) record: {problem}."
+            )),
+        },
+    });
+    Ok((session.conn, read))
 }
 
 /// The first Wireless Voyager running its keyboard firmware, and how many there are.
-fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
+pub(crate) fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
     let voyagers: Vec<&UsbDevice> = devices
         .iter()
         .filter(|device| device.keyboard == Some(Keyboard::Voyager2))

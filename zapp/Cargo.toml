@@ -11,10 +11,12 @@ zapp-smp = { path = "../zapp-smp" }
 zapp-update = { path = "../zapp-update" }
 zapp-wired = { path = "../zapp-wired" }
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 env_logger = "0.11"
 indicatif = "0.17"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 log = "0.4"
 flate2 = "1"
 self-replace = "1"
