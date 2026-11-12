@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn the_voyager_2_has_its_own_product_id() {
-        // qmk voyager/keyboard.json is 0x1977, voyager_tng/keyboard.json 0x1978.
+        // qmk voyager/keyboard.json is 0x1977, wireless_voyager/keyboard.json 0x1978.
         assert_eq!(identify_keyboard(ZSA_VID, 0x1977), Some(Keyboard::Voyager));
         assert_eq!(identify_keyboard(ZSA_VID, 0x1978), Some(Keyboard::Voyager2));
         assert_eq!(target_name_for_pid(0x1977), "Voyager");

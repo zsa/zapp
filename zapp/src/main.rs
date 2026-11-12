@@ -63,8 +63,8 @@ enum Commands {
             bundle's two halves are written together, the right one first.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
-            zapp flash .build/zsa_voyager_tng_default.bin\n  \
-            zapp flash .build/zsa_voyager_tng_default.bin --device \"Voyager\"\n  \
+            zapp flash .build/zsa_wireless_voyager_default.bin\n  \
+            zapp flash .build/zsa_wireless_voyager_default.bin --device \"Voyager\"\n  \
             zapp flash voyager2_0.1.9.zsab\n  \
             zapp flash voyager2_0.1.9.zsab --force\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
