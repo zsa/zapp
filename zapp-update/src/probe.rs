@@ -38,7 +38,7 @@ impl Transport {
 /// is on USB": a user with an original Voyager on the cable and a Wireless Voyager on
 /// Bluetooth has to get the radio.
 pub fn route() -> Transport {
-    if bootloader_present() || voyager2_present() {
+    if bootloader_present() || wireless_voyager_present() {
         Transport::Usb
     } else {
         Transport::Bluetooth
@@ -74,8 +74,8 @@ pub fn bootloader_present() -> bool {
 ///
 /// For deciding which way to send a bundle, alongside [`bootloader_present`]:
 /// between them they are every USB state a bundle can be written from.
-pub fn voyager2_present() -> bool {
-    attached().is_some_and(|attached| voyager2_among(&attached).is_some())
+pub fn wireless_voyager_present() -> bool {
+    attached().is_some_and(|attached| wireless_voyager_among(&attached).is_some())
 }
 
 /// What is plugged in, or nothing when the bus cannot be read.
@@ -94,10 +94,10 @@ pub(crate) fn attached() -> Option<Vec<UsbDevice>> {
 /// A board still in a bootloader is not it either. For the restart wait that is
 /// the whole point — the STM32 has to have left one — and for routing it is
 /// [`bootloader_present`]'s to find.
-pub(crate) fn voyager2_among(attached: &[UsbDevice]) -> Option<&UsbDevice> {
-    attached
-        .iter()
-        .find(|device| device.bootloader.is_none() && device.keyboard == Some(Keyboard::Voyager2))
+pub(crate) fn wireless_voyager_among(attached: &[UsbDevice]) -> Option<&UsbDevice> {
+    attached.iter().find(|device| {
+        device.bootloader.is_none() && device.keyboard == Some(Keyboard::WirelessVoyager)
+    })
 }
 
 /// How long to wait for a wired board to answer the telemetry query. Firmware
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn another_zsa_keyboard_on_the_cable_is_not_a_voyager_2() {
+    fn another_zsa_keyboard_on_the_cable_is_not_a_wireless_voyager() {
         // The bug this guards: a wired Voyager plugged in while the Wireless Voyager
         // is on Bluetooth used to count as "a keyboard on USB", so the bundle
         // went down the cable and sat waiting for a reset button on a board it
@@ -344,36 +344,42 @@ mod tests {
         for other in the_other_models() {
             let pid = other.pid;
             assert!(
-                voyager2_among(&[other]).is_none(),
+                wireless_voyager_among(&[other]).is_none(),
                 "{pid:#06x} was taken for a Wireless Voyager"
             );
         }
-        assert!(voyager2_among(&the_other_models()).is_none());
+        assert!(wireless_voyager_among(&the_other_models()).is_none());
     }
 
     #[test]
-    fn a_voyager_2_among_other_boards_is_still_found() {
+    fn a_wireless_voyager_among_other_boards_is_still_found() {
         // Whichever order the bus happens to report them in: a user with two
         // ZSA keyboards plugged in must still get the cable.
         let mut mixed = the_other_models();
-        mixed.push(plugged_in(Some(Keyboard::Voyager2), 0x1978));
-        assert_eq!(voyager2_among(&mixed).map(|found| found.pid), Some(0x1978));
+        mixed.push(plugged_in(Some(Keyboard::WirelessVoyager), 0x1978));
+        assert_eq!(
+            wireless_voyager_among(&mixed).map(|found| found.pid),
+            Some(0x1978)
+        );
         mixed.reverse();
-        assert_eq!(voyager2_among(&mixed).map(|found| found.pid), Some(0x1978));
+        assert_eq!(
+            wireless_voyager_among(&mixed).map(|found| found.pid),
+            Some(0x1978)
+        );
     }
 
     #[test]
-    fn a_voyager_2_in_a_bootloader_is_not_one_running_its_firmware() {
+    fn a_wireless_voyager_in_a_bootloader_is_not_one_running_its_firmware() {
         // `bootloader_present` finds that one. Counting it here would report a
         // board as back from its restart while it is still sitting in MCUboot.
-        let mut booting = plugged_in(Some(Keyboard::Voyager2), 0x0792);
+        let mut booting = plugged_in(Some(Keyboard::WirelessVoyager), 0x0792);
         booting.bootloader = Some(BootloaderKind::IgnitionV2);
-        assert!(voyager2_among(&[booting]).is_none());
+        assert!(wireless_voyager_among(&[booting]).is_none());
         // A bootloader that names no keyboard at all is not it either.
         let mut generic = plugged_in(None, 0xDF11);
         generic.vid = 0x0483;
         generic.bootloader = Some(BootloaderKind::Stm32Dfu);
-        assert!(voyager2_among(&[generic]).is_none());
-        assert!(voyager2_among(&[]).is_none());
+        assert!(wireless_voyager_among(&[generic]).is_none());
+        assert!(wireless_voyager_among(&[]).is_none());
     }
 }

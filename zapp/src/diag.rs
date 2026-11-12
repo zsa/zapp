@@ -44,7 +44,7 @@ pub fn run() -> Result<()> {
 pub(crate) fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
     let voyagers: Vec<&UsbDevice> = devices
         .iter()
-        .filter(|device| device.keyboard == Some(Keyboard::Voyager2))
+        .filter(|device| device.keyboard == Some(Keyboard::WirelessVoyager))
         .collect();
     let running: Vec<&UsbDevice> = voyagers
         .iter()
@@ -86,16 +86,16 @@ mod tests {
     }
 
     #[test]
-    fn only_a_voyager_2_running_its_firmware_is_picked() {
+    fn only_a_wireless_voyager_running_its_firmware_is_picked() {
         let other = || usb(Some(Keyboard::Voyager), None, 0x1977);
         let booting = || {
             usb(
-                Some(Keyboard::Voyager2),
+                Some(Keyboard::WirelessVoyager),
                 Some(BootloaderKind::IgnitionV2),
                 0x0792,
             )
         };
-        let running = || usb(Some(Keyboard::Voyager2), None, 0x1978);
+        let running = || usb(Some(Keyboard::WirelessVoyager), None, 0x1978);
 
         assert_eq!(refused(&[other()]), "No Wireless Voyager found on USB.");
         assert!(refused(&[other(), booting()]).contains("is in its bootloader"));

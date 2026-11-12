@@ -62,7 +62,7 @@ use crate::confirm::{reverted, single, Landed, PairConfirm};
 use crate::error::{classify, in_half, kind_of, ErrorKind, UpdateError};
 use crate::event::{Chip, Event, Phase, Reporter, Wait};
 use crate::guard::{going_backwards, ordering_of};
-use crate::probe::{attached, usb_telemetry, voyager2_among};
+use crate::probe::{attached, usb_telemetry, wireless_voyager_among};
 use crate::text::{named, short, titled};
 use crate::{Cancel, Options, Outcome};
 
@@ -1907,7 +1907,7 @@ fn keep_looking(
 /// One look: is there a keyboard on USB, and does it answer for both halves?
 fn both_halves_report() -> bool {
     let attached = attached().unwrap_or_default();
-    let Some(keyboard) = voyager2_among(&attached) else {
+    let Some(keyboard) = wireless_voyager_among(&attached) else {
         log::debug!("no keyboard on USB yet");
         return false;
     };

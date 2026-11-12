@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(
             snapshot[0].keyboard,
-            Some(zapp_core::device::ids::Keyboard::Voyager2)
+            Some(zapp_core::device::ids::Keyboard::WirelessVoyager)
         );
     }
 }

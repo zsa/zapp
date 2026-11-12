@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn a_board_carries_its_product_through_from_the_sighting() {
         let board = BleBoard::from_sighting(&bonded()).expect("a bonded ZSA board");
-        assert_eq!(board.keyboard, Some(Keyboard::Voyager2));
+        assert_eq!(board.keyboard, Some(Keyboard::WirelessVoyager));
         assert_eq!(board.presence, Presence::Paired);
         assert_eq!(board.name.as_deref(), Some("Voyager"));
     }

@@ -66,7 +66,7 @@ pub fn geometry_for(keyboard: Keyboard, pid: u16) -> &'static str {
     match keyboard {
         // The Wireless Voyager keeps the Voyager's key layout, so Oryx serves both from
         // the one geometry.
-        Keyboard::Voyager | Keyboard::Voyager2 => "voyager",
+        Keyboard::Voyager | Keyboard::WirelessVoyager => "voyager",
         Keyboard::Moonlander => "moonlander",
         Keyboard::PlanckEz => "planck-ez",
         Keyboard::ErgodoxEz => match pid {

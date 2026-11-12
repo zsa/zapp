@@ -167,7 +167,7 @@ enum Commands {
             bootloader.",
         after_long_help = "Examples:\n  \
             zapp diag\n  \
-            zapp diag > voyager2-diag.txt"
+            zapp diag > wireless-voyager-diag.txt"
     )]
     Diag,
     /// Write a Wireless Voyager report file for ZSA support
@@ -448,7 +448,7 @@ fn ble_radio(
         .address
         .as_deref()
         .is_some_and(|address| on_usb.iter().any(|wired| wired == address));
-    if board.keyboard != Some(ids::Keyboard::Voyager2)
+    if board.keyboard != Some(ids::Keyboard::WirelessVoyager)
         || board.presence != Presence::Connected
         || on_cable
     {
@@ -511,7 +511,7 @@ fn radio_offer(radio: &RadioInfo, latest: &Release, over: Transport) -> Option<S
 /// nothing. Only the Wireless Voyager has a battery or pointing-device header to report
 /// on; the rest have neither, so there is nothing worth asking them.
 fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
-    if device.keyboard != Some(ids::Keyboard::Voyager2) {
+    if device.keyboard != Some(ids::Keyboard::WirelessVoyager) {
         return WiredReport::default();
     }
     wired_report_from(usb_report(device, verbose, true, verbose), verbose)
@@ -520,7 +520,7 @@ fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
 /// The left half's unread freeze record notice, for a wired Wireless Voyager
 /// running its keyboard firmware. Silent for firmware without the command.
 fn wired_freeze_notice(device: &UsbDevice) -> Option<String> {
-    if device.keyboard != Some(ids::Keyboard::Voyager2) || device.bootloader.is_some() {
+    if device.keyboard != Some(ids::Keyboard::WirelessVoyager) || device.bootloader.is_some() {
         return None;
     }
     let conn = zapp_core::hid::HidConnection::open(device.vid, device.pid).ok()?;
@@ -673,9 +673,9 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
     // one it picked; everything else is a wired update and has nothing to pick
     // between.
     if let Firmware::DfuBinary { data, pid, .. } = &fw
-        && is_voyager2_image(*pid)
+        && is_wireless_voyager_image(*pid)
     {
-        return flash_voyager2_image(&fw, data, device);
+        return flash_wireless_voyager_image(&fw, data, device);
     }
 
     print_firmware_info(&fw, Transport::Usb);
@@ -687,7 +687,7 @@ fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<(
 }
 
 /// Whether a DFU suffix names a Wireless Voyager, either revision.
-fn is_voyager2_image(pid: u16) -> bool {
+fn is_wireless_voyager_image(pid: u16) -> bool {
     matches!(pid, 0x1978 | 0x0792)
 }
 
@@ -696,7 +696,7 @@ fn is_voyager2_image(pid: u16) -> bool {
 /// The cable whenever the Wireless Voyager is on it, Bluetooth only for a keyboard
 /// that is not plugged in at all. Over the cable `named` is ignored, as there
 /// is only ever one keyboard plugged in.
-fn flash_voyager2_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
+fn flash_wireless_voyager_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
     let over = route();
     print_firmware_info(fw, over);
     if over == Transport::Usb {
@@ -1603,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn a_board_that_is_not_a_voyager_2_is_never_asked_for_telemetry() {
+    fn a_board_that_is_not_a_wireless_voyager_is_never_asked_for_telemetry() {
         // The original Voyager has no battery and no nav header at all, so
         // there is nothing to report and nothing worth asking it for.
         let device = UsbDevice {

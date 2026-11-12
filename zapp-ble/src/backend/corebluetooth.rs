@@ -1850,7 +1850,7 @@ mod tests {
         assert_eq!(modalias, "usb:v3297p1978d0100");
         assert_eq!(
             identity::keyboard_from_modalias(&modalias),
-            Some(zapp_core::device::ids::Keyboard::Voyager2)
+            Some(zapp_core::device::ids::Keyboard::WirelessVoyager)
         );
         assert_eq!(
             modalias_from_pnp(&[0x01, 0x97, 0x32, 0x78, 0x19, 0x00, 0x01]).as_deref(),

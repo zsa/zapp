@@ -1134,7 +1134,7 @@ fn charging() -> bool {
     device::list_devices().is_ok_and(|devices| {
         devices
             .iter()
-            .any(|device| device.keyboard == Some(Keyboard::Voyager2))
+            .any(|device| device.keyboard == Some(Keyboard::WirelessVoyager))
     })
 }
 

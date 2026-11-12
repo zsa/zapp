@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn voyager2_image_is_rejected_on_other_bases() {
+    fn wireless_voyager_image_is_rejected_on_other_bases() {
         let fw = dfu_binary(ids::ZSA_VID, 0x0792);
         assert!(check(BootloaderKind::IgnitionStm32, 0x0791, &fw).is_err());
         assert!(check(BootloaderKind::IgnitionGd32, 0x1791, &fw).is_err());
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn other_images_are_rejected_on_voyager2() {
+    fn other_images_are_rejected_on_wireless_voyager() {
         for (vid, pid) in [
             (ids::ZSA_VID, 0x0791),
             (ids::ZSA_VID, 0x1791),

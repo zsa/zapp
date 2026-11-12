@@ -70,7 +70,7 @@ mod tests {
             key: "dev_E8_6B_FC_47_E2_64".into(),
             name: Some("Voyager".into()),
             address: Some("E8:6B:FC:47:E2:64".into()),
-            keyboard: Some(Keyboard::Voyager2),
+            keyboard: Some(Keyboard::WirelessVoyager),
             presence,
             battery: crate::Battery::default(),
         }

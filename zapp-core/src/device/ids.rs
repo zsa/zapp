@@ -27,7 +27,7 @@ pub enum Keyboard {
     PlanckEz,
     Moonlander,
     Voyager,
-    Voyager2,
+    WirelessVoyager,
 }
 
 impl std::fmt::Display for Keyboard {
@@ -37,7 +37,7 @@ impl std::fmt::Display for Keyboard {
             Self::PlanckEz => write!(f, "Planck EZ"),
             Self::Moonlander => write!(f, "Moonlander"),
             Self::Voyager => write!(f, "Voyager"),
-            Self::Voyager2 => write!(f, "Wireless Voyager"),
+            Self::WirelessVoyager => write!(f, "Wireless Voyager"),
         }
     }
 }
@@ -89,7 +89,7 @@ pub fn keyboard_for_bootloader(vid: u16, pid: u16) -> Option<Keyboard> {
         (HALFKAY_VID, HALFKAY_PID) => Some(Keyboard::ErgodoxEz),
         (STM32_VID, STM32_DFU_PID) => None, // generic, could be any STM32 keyboard
         (ZSA_VID, 0x0791 | 0x1791) => Some(Keyboard::Voyager),
-        (ZSA_VID, 0x0792) => Some(Keyboard::Voyager2),
+        (ZSA_VID, 0x0792) => Some(Keyboard::WirelessVoyager),
         (ZSA_VID, 0x2000..=0x2002) => Some(Keyboard::ErgodoxEz),
         (ZSA_VID, 0x2003) => Some(Keyboard::Moonlander),
         _ => None,
@@ -123,7 +123,7 @@ pub fn identify_keyboard(vid: u16, pid: u16) -> Option<Keyboard> {
         0x6060 | 0xC6CE | 0xC6CF => Some(Keyboard::PlanckEz),
         0x1969 | 0x1972 => Some(Keyboard::Moonlander),
         0x1977 => Some(Keyboard::Voyager),
-        0x1978 => Some(Keyboard::Voyager2),
+        0x1978 => Some(Keyboard::WirelessVoyager),
         _ => None,
     }
 }
@@ -135,7 +135,7 @@ pub fn identify_keyboard(vid: u16, pid: u16) -> Option<Keyboard> {
 /// PnP id instead, which carries the same PID `identify_keyboard` takes.
 pub fn keyboard_for_ble_identity(uuid: u128) -> Option<Keyboard> {
     match uuid {
-        0x32970101_e5aa_4f42_a596_1ea5a0200001 => Some(Keyboard::Voyager2),
+        0x32970101_e5aa_4f42_a596_1ea5a0200001 => Some(Keyboard::WirelessVoyager),
         _ => None,
     }
 }
@@ -226,15 +226,18 @@ mod tests {
         assert_eq!(keyboard_for_bootloader(STM32_VID, STM32_DFU_PID), None);
         assert_eq!(
             keyboard_for_bootloader(ZSA_VID, 0x0792),
-            Some(Keyboard::Voyager2)
+            Some(Keyboard::WirelessVoyager)
         );
     }
 
     #[test]
-    fn the_voyager_2_has_its_own_product_id() {
+    fn the_wireless_voyager_has_its_own_product_id() {
         // qmk voyager/keyboard.json is 0x1977, wireless_voyager/keyboard.json 0x1978.
         assert_eq!(identify_keyboard(ZSA_VID, 0x1977), Some(Keyboard::Voyager));
-        assert_eq!(identify_keyboard(ZSA_VID, 0x1978), Some(Keyboard::Voyager2));
+        assert_eq!(
+            identify_keyboard(ZSA_VID, 0x1978),
+            Some(Keyboard::WirelessVoyager)
+        );
         assert_eq!(target_name_for_pid(0x1977), "Voyager");
         assert_eq!(target_name_for_pid(0x1978), "Wireless Voyager");
     }
@@ -243,7 +246,7 @@ mod tests {
     fn the_advertised_identity_uuid_names_the_product() {
         assert_eq!(
             keyboard_for_ble_identity(0x32970101_e5aa_4f42_a596_1ea5a0200001),
-            Some(Keyboard::Voyager2)
+            Some(Keyboard::WirelessVoyager)
         );
         // The DFU service says "a ZSA board", never which one.
         assert_eq!(keyboard_for_ble_identity(ZSA_BLE_DFU_SERVICE), None);

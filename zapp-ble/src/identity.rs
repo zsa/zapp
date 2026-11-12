@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use zapp_core::device::ids::ZSA_BLE_DFU_SERVICE;
 
-    const VOYAGER2_IDENTITY: u128 = 0x32970101_e5aa_4f42_a596_1ea5a0200001;
+    const WIRELESS_VOYAGER_IDENTITY: u128 = 0x32970101_e5aa_4f42_a596_1ea5a0200001;
     const HID: u128 = 0x00001812_0000_1000_8000_00805f9b34fb;
     const BATTERY: u128 = 0x0000180f_0000_1000_8000_00805f9b34fb;
 
@@ -94,11 +94,11 @@ mod tests {
     fn an_advertising_board_is_ours_by_its_identity_uuid() {
         // Nothing has connected, so there is no service list at all.
         let sighting = BleSighting {
-            advertised: vec![HID, BATTERY, VOYAGER2_IDENTITY],
+            advertised: vec![HID, BATTERY, WIRELESS_VOYAGER_IDENTITY],
             ..BleSighting::default()
         };
         assert!(is_zsa_board(&sighting));
-        assert_eq!(keyboard_for(&sighting), Some(Keyboard::Voyager2));
+        assert_eq!(keyboard_for(&sighting), Some(Keyboard::WirelessVoyager));
     }
 
     #[test]
@@ -108,7 +108,7 @@ mod tests {
             modalias: Some("usb:v3297p1978d0100".into()),
             ..BleSighting::default()
         };
-        assert_eq!(keyboard_for(&sighting), Some(Keyboard::Voyager2));
+        assert_eq!(keyboard_for(&sighting), Some(Keyboard::WirelessVoyager));
     }
 
     #[test]
@@ -126,11 +126,11 @@ mod tests {
     #[test]
     fn the_advertised_identity_wins_over_the_modalias() {
         let sighting = BleSighting {
-            advertised: vec![VOYAGER2_IDENTITY],
+            advertised: vec![WIRELESS_VOYAGER_IDENTITY],
             modalias: Some("usb:v3297p1977d0100".into()),
             ..BleSighting::default()
         };
-        assert_eq!(keyboard_for(&sighting), Some(Keyboard::Voyager2));
+        assert_eq!(keyboard_for(&sighting), Some(Keyboard::WirelessVoyager));
     }
 
     #[test]
@@ -153,7 +153,7 @@ mod tests {
     fn modalias_forms_that_name_nothing() {
         assert_eq!(
             keyboard_from_modalias("usb:v3297p1978d0100"),
-            Some(Keyboard::Voyager2)
+            Some(Keyboard::WirelessVoyager)
         );
         // The version suffix is optional.
         assert_eq!(
