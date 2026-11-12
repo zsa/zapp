@@ -4,8 +4,9 @@
 use zapp_core::device::UsbDevice;
 use zapp_core::device::ids::{self as ids, target_name_for_pid};
 use zapp_core::hid::{
-    BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-    EsbLink, HostSlot, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo, Telemetry,
+    BatteryDetail, BatteryReading, BleIdentity, ChargeIssue, ChargeTelemetry, ChargerFault,
+    ChargerStatus, EsbLink, HostSlot, Nav, NavReport, PmicRails, PmicRailsReport, RadioInfo,
+    Telemetry,
 };
 
 use crate::probe::UsbTelemetry;
@@ -121,20 +122,39 @@ pub fn wired_charge(telemetry: &Telemetry, detail: Option<&ChargeTelemetry>) -> 
     })
     .collect();
 
-    format!(" · {}", halves.join(" · "))
+    match telemetry.charge_issue.is_some_and(ChargeIssue::is_unstable) {
+        true => format!(
+            " · {} · charging unstable on this USB port, try another port",
+            halves.join(" · ")
+        ),
+        false => format!(" · {}", halves.join(" · ")),
+    }
 }
 
 /// The lines under a wired board that stand on their own: the Bluetooth
-/// identity it is using, how the halves are linked, and which pointing devices
-/// the build carries and which of them answer. Only `--verbose` asks for these.
+/// identity it is using, how the halves are linked, what the board did about
+/// unstable charging on its USB port, and which pointing devices the build
+/// carries and which of them answer. Only `--verbose` asks for these.
 pub fn describe_telemetry(telemetry: &Telemetry) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(ble) = &telemetry.ble {
         lines.push(format!("{:<8} · {}", "bluetooth", ble_identity(ble)));
     }
     lines.extend(halves_line(telemetry));
+    lines.extend(charge_issue_line(telemetry));
     lines.push(features_line(&telemetry.nav()));
     lines
+}
+
+/// What the board did about unstable charging on its USB port, or nothing
+/// while charging is stable or the board did not say.
+pub fn charge_issue_line(telemetry: &Telemetry) -> Option<String> {
+    let said = match telemetry.charge_issue? {
+        ChargeIssue::Reduced => "charging power lowered",
+        ChargeIssue::AtFloor => "at lowest charging power",
+        ChargeIssue::None | ChargeIssue::Other(_) => return None,
+    };
+    Some(format!("{:<8} · {said}", "usb"))
 }
 
 /// How the halves are linked: the cable, or the radio between them. The radio

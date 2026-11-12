@@ -140,6 +140,7 @@ mod telemetry_offset {
     pub const NAV_BUS: usize = 27;
     pub const TRRS: usize = 28;
     pub const ESB_LINK: usize = 29;
+    pub const CHARGE_ISSUE: usize = 30;
 }
 
 /// Bytes in the address the identity block carries.
@@ -178,6 +179,11 @@ const TELEMETRY_ESB_LINKED: u8 = 1;
 const TELEMETRY_ESB_MISMATCH: u8 = 2;
 #[cfg(test)]
 const TELEMETRY_ESB_UNKNOWN: u8 = 0xFF;
+/// Charging trouble on the USB port, wired only.
+const TELEMETRY_CHARGE_ISSUE_NONE: u8 = 0;
+const TELEMETRY_CHARGE_ISSUE_REDUCED: u8 = 1;
+const TELEMETRY_CHARGE_ISSUE_AT_FLOOR: u8 = 2;
+const TELEMETRY_CHARGE_ISSUE_UNKNOWN: u8 = 0xFF;
 
 /// Charge-telemetry format this host understands, and refused whole when it is
 /// anything else — same rule, and for the same reason, as [`TELEMETRY_VERSION`].
@@ -457,6 +463,36 @@ impl EsbLink {
     }
 }
 
+/// Charging trouble the board saw on its USB port. Reset to [`Self::None`]
+/// when USB goes away, so it only means something while plugged in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeIssue {
+    None,
+    /// Charging was unstable; the board lowered its charging power.
+    Reduced,
+    /// Still unstable at the lowest charging power.
+    AtFloor,
+    /// An issue this host has no name for: firmware newer than it.
+    Other(u8),
+}
+
+impl ChargeIssue {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            TELEMETRY_CHARGE_ISSUE_UNKNOWN => None,
+            TELEMETRY_CHARGE_ISSUE_NONE => Some(Self::None),
+            TELEMETRY_CHARGE_ISSUE_REDUCED => Some(Self::Reduced),
+            TELEMETRY_CHARGE_ISSUE_AT_FLOOR => Some(Self::AtFloor),
+            other => Some(Self::Other(other)),
+        }
+    }
+
+    /// Charging on this port is unstable, whatever the board did about it.
+    pub fn is_unstable(self) -> bool {
+        matches!(self, Self::Reduced | Self::AtFloor)
+    }
+}
+
 /// What a board says about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Telemetry {
@@ -479,6 +515,9 @@ pub struct Telemetry {
     /// The radio link between the halves. `None` when the board cannot tell,
     /// or from a firmware that predates the field.
     pub esb_link: Option<EsbLink>,
+    /// `None` when the board cannot tell, or from a firmware that predates the
+    /// field.
+    pub charge_issue: Option<ChargeIssue>,
     /// `None` from a firmware that predates the field, and from a board that
     /// has no identity in its active slot yet.
     pub ble: Option<BleIdentity>,
@@ -1856,6 +1895,7 @@ pub fn parse_telemetry(params: &[u8]) -> Option<Telemetry> {
             _ => None,
         }),
         esb_link: telemetry_field(params, at::ESB_LINK).and_then(EsbLink::from_raw),
+        charge_issue: telemetry_field(params, at::CHARGE_ISSUE).and_then(ChargeIssue::from_raw),
         ble: telemetry_ble(params),
     })
 }
@@ -2660,6 +2700,50 @@ mod tests {
             payload[29] = raw;
             let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
             assert_eq!(telemetry.esb_link, expected, "raw {raw:#04x}");
+        }
+    }
+
+    /// A len 28 payload: everything up to and including the radio field.
+    fn telemetry_payload_with_esb() -> Vec<u8> {
+        let mut payload = telemetry_payload_with_trrs();
+        payload[1] = 28;
+        payload.push(TELEMETRY_ESB_LINKED);
+        payload
+    }
+
+    #[test]
+    fn a_board_from_before_the_charge_issue_field_says_nothing_about_it() {
+        // len 28 ends at the radio field. The byte after it is not the charge
+        // issue field, whatever it holds.
+        let payload = telemetry_payload_with_esb();
+        let telemetry =
+            telemetry_from_report(&telemetry_report(&payload, TELEMETRY_CHARGE_ISSUE_REDUCED));
+
+        assert_eq!(telemetry.charge_issue, None);
+        assert_eq!(telemetry.esb_link, Some(EsbLink::Linked));
+    }
+
+    #[test]
+    fn the_charge_issue_field_follows_the_radio_field() {
+        let mut payload = telemetry_payload_with_esb();
+        payload[1] = 29;
+        payload.push(TELEMETRY_CHARGE_ISSUE_REDUCED);
+        assert_eq!(payload.len(), 31);
+        let data = telemetry_report(&payload, 0);
+        assert_eq!(data[31], TELEMETRY_CHARGE_ISSUE_REDUCED, "report byte 31");
+        let telemetry = telemetry_from_report(&data);
+        assert_eq!(telemetry.charge_issue, Some(ChargeIssue::Reduced));
+        assert_eq!(telemetry.esb_link, Some(EsbLink::Linked));
+
+        for (raw, expected) in [
+            (TELEMETRY_CHARGE_ISSUE_NONE, Some(ChargeIssue::None)),
+            (TELEMETRY_CHARGE_ISSUE_AT_FLOOR, Some(ChargeIssue::AtFloor)),
+            (TELEMETRY_CHARGE_ISSUE_UNKNOWN, None),
+            (3, Some(ChargeIssue::Other(3))),
+        ] {
+            payload[30] = raw;
+            let telemetry = telemetry_from_report(&telemetry_report(&payload, 0));
+            assert_eq!(telemetry.charge_issue, expected, "raw {raw:#04x}");
         }
     }
 

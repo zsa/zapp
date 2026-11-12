@@ -978,9 +978,9 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
 mod tests {
     use super::*;
     use zapp_core::hid::{
-        BatteryDetail, BatteryReading, BleIdentity, ChargeTelemetry, ChargerFault, ChargerStatus,
-        Charging, EsbLink, HalfDetail, Nav, NavReport, PmicRails, PmicRailsReport, Source,
-        VbusInStatus,
+        BatteryDetail, BatteryReading, BleIdentity, ChargeIssue, ChargeTelemetry, ChargerFault,
+        ChargerStatus, Charging, EsbLink, HalfDetail, Nav, NavReport, PmicRails, PmicRailsReport,
+        Source, VbusInStatus,
     };
 
     #[test]
@@ -1085,6 +1085,7 @@ mod tests {
             nav_bus: Some(Nav::default()),
             trrs: None,
             esb_link: None,
+            charge_issue: None,
             charging: Charging {
                 budget_ma: Some(1500),
                 ..Charging::default()
@@ -1295,6 +1296,41 @@ mod tests {
             wired_charge(&telemetry, Some(&detail)),
             " · left 99% topping up · right 56% fast charging"
         );
+    }
+
+    #[test]
+    fn unstable_charging_on_the_port_goes_on_the_board_line() {
+        let mut telemetry = Telemetry {
+            version: 1,
+            left: charging_reading(Some(57), Source::Nrf),
+            right: reading(Some(64), Source::Wired),
+            charge_issue: Some(ChargeIssue::Reduced),
+            ..Telemetry::default()
+        };
+        let unstable = " · left 57% charging · right 64% · charging unstable on this USB port, try another port";
+        assert_eq!(wired_charge(&telemetry, None), unstable);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "usb      · charging power lowered"
+        );
+
+        telemetry.charge_issue = Some(ChargeIssue::AtFloor);
+        assert_eq!(wired_charge(&telemetry, None), unstable);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "usb      · at lowest charging power"
+        );
+
+        // No issue, a value this host has no name for, or a firmware from
+        // before the field: nothing said.
+        for issue in [Some(ChargeIssue::None), Some(ChargeIssue::Other(3)), None] {
+            telemetry.charge_issue = issue;
+            assert_eq!(
+                wired_charge(&telemetry, None),
+                " · left 57% charging · right 64%"
+            );
+            assert_eq!(describe_telemetry(&telemetry).len(), 1);
+        }
     }
 
     /// One half's charge detail, with its charger reading `raw`.
