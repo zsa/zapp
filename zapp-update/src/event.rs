@@ -103,7 +103,7 @@ impl Wait {
             Wait::Bootloader => "Waiting for keyboard in bootloader mode...",
             Wait::RightHalf => "Waiting for the right half...",
             Wait::RightHalfCable => {
-                "Waiting for the right half, make sure both halves are connected with a TRRS cable..."
+                "Waiting for the right half. Check the cable between the halves..."
             }
             Wait::KeyboardRestart => "Waiting for the keyboard to restart...",
         }

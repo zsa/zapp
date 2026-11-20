@@ -609,7 +609,7 @@ fn right_ready<B: Board>(link: &mut Link<B>, declaration: &Declaration) -> Resul
         return Err(right_rejected());
     }
     if seen {
-        bail!("The right half did not settle on the written image within {waited} s.");
+        bail!("The right half did not switch to the new image within {waited} s.");
     }
     bail!("The right half did not come back within {waited} s of its restart.")
 }
@@ -1117,7 +1117,7 @@ fn check_battery(battery: Battery, charging: bool) -> Result<()> {
         ErrorKind::LowBattery,
         None,
         anyhow!(
-            "Batteries low, please charge both halves to at least {}% to flash over Bluetooth.",
+            "Batteries too low to update over Bluetooth. Charge both halves to at least {}%.",
             bundle::MIN_SOC_PERCENT
         ),
     ))
@@ -1187,7 +1187,7 @@ fn flash_stm32_inner(image: &[u8], options: &Options, reporter: &mut Reporter) -
     // says what to do about it.
     if image.len() > dfu::MAX_IMAGE {
         bail!(
-            "The image is {} bytes; the STM32's application region holds {} bytes.",
+            "The image is too large ({} bytes, maximum {}).",
             image.len(),
             dfu::MAX_IMAGE
         );
@@ -1570,7 +1570,7 @@ mod tests {
         let err = check_battery(battery, false).unwrap_err().to_string();
         assert_eq!(
             err,
-            "Batteries low, please charge both halves to at least 30% to flash over Bluetooth."
+            "Batteries too low to update over Bluetooth. Charge both halves to at least 30%."
         );
     }
 
@@ -1584,7 +1584,7 @@ mod tests {
         let err = check_battery(battery, false).unwrap_err().to_string();
         assert_eq!(
             err,
-            "Batteries low, please charge both halves to at least 30% to flash over Bluetooth."
+            "Batteries too low to update over Bluetooth. Charge both halves to at least 30%."
         );
     }
 

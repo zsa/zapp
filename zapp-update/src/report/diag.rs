@@ -30,8 +30,7 @@ const REFETCH_SETTLE: Duration = Duration::from_secs(1);
 /// Slack on a left page's age before it counts as older than the fetch.
 const FRESH_SLACK_MS: u128 = 100;
 
-const NO_ANSWER: &str = "The keyboard firmware did not answer the diagnostic request. \
-    It may predate this feature; update it and retry.";
+const NO_ANSWER: &str = "The keyboard firmware did not answer. Update it and retry.";
 
 /// The rendered records, and what is wrong with the STM32 one.
 pub struct Read {
@@ -205,10 +204,7 @@ impl<C: Borrow<HidConnection>> Session<C> {
         match reply.version {
             DIAG_PAGE_VERSION => {}
             0 => bail!("The keyboard firmware has no diagnostics. Update it and retry."),
-            other => bail!(
-                "The keyboard answers in diagnostic format {other}, which this zapp cannot \
-                 read. Update zapp."
-            ),
+            other => bail!("Unsupported diagnostic format {other}. Update zapp."),
         }
         thread::sleep(FETCH_SETTLE);
 

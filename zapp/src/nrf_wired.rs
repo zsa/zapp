@@ -13,7 +13,7 @@ use zapp_update::wired::{self, HalfKey, MatchState, ShowReport};
 use zapp_update::{Bundle, Cancel, Half, Options, Outcome};
 
 use crate::screen::Screen;
-use crate::zsab::UP_TO_DATE;
+use crate::zsab::{FLASHED, UP_TO_DATE};
 
 /// Whether a successful run should leave the STM32 in Ignition rather than
 /// restart it into the keyboard firmware, which would overwrite the RAM a
@@ -76,7 +76,7 @@ pub fn flash(bundle: &Bundle, force: bool) -> Result<()> {
         Outcome::UpToDate => println!("{UP_TO_DATE}"),
         // Left in Ignition, the keyboard was not checked.
         Outcome::Flashed if options.keep_ignition => {}
-        Outcome::Flashed => println!("Done!"),
+        Outcome::Flashed => println!("{FLASHED}"),
     }
     Ok(())
 }
@@ -174,10 +174,7 @@ fn describe_config(config: &EsbConfig) {
 fn prove_bond(came_back: bool) {
     if came_back {
         println!();
-        println!(
-            "The pairing key was written and read back on both halves; both halves answered \
-             after the restart."
-        );
+        println!("Pairing successful.");
     } else {
         println!();
         println!("{}", unproven_bond());
@@ -187,9 +184,7 @@ fn prove_bond(came_back: bool) {
 
 /// What a bond whose halves did not come back on USB says.
 fn unproven_bond() -> String {
-    "The pairing key was written and read back on both halves, but the keyboard did not come \
-     back on USB with both halves answering."
-        .to_string()
+    "Pairing key written, but the keyboard did not restart.".to_string()
 }
 
 /// The line one half's key reads as, fingerprint only.
@@ -254,8 +249,8 @@ mod tests {
     #[test]
     fn the_unproven_bond_message_says_what_did_not_happen() {
         let said = unproven_bond();
-        assert!(said.contains("read back on both halves"), "{said}");
-        assert!(said.contains("did not come back"), "{said}");
+        assert!(said.contains("Pairing key written"), "{said}");
+        assert!(said.contains("did not restart"), "{said}");
         assert!(!said.contains("run bond again"), "{said}");
     }
 }

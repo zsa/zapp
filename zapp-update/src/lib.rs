@@ -194,7 +194,7 @@ pub fn load_bundle(path: &Path) -> Result<Bundle, UpdateError> {
 /// Parses a `.zsab` bundle already in memory. `name` is what messages call it.
 pub fn parse_bundle(blob: &[u8], name: &str) -> Result<Bundle, UpdateError> {
     zapp_smp::bundle::parse(blob)
-        .with_context(|| format!("{name} is not a bundle this build can read"))
+        .with_context(|| format!("Cannot read the bundle {name}"))
         .map_err(|err| error::classify(error::kind_of(ErrorKind::Bundle, None, err)))
 }
 

@@ -275,8 +275,7 @@ impl GattChannel for FdChannel {
         // place an oversized write can be noticed at all.
         if value.len() > self.mtu {
             return Err(BleError::Platform(format!(
-                "a {}-byte write will not fit the {}-byte ATT payload and would be \
-                 dropped without a word",
+                "a {}-byte write will not fit the {}-byte ATT payload",
                 value.len(),
                 self.mtu
             )));

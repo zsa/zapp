@@ -152,14 +152,9 @@ impl Fault {
         match self {
             Fault::None => "no fault",
             Fault::Erase => "the STM32's flash could not be erased",
-            Fault::Write => {
-                "the image stopped reaching the STM32 part-way; the old firmware is erased"
-            }
+            Fault::Write => "the write stopped part-way; the old firmware is erased",
             Fault::Locked => "another update is in progress",
-            Fault::BadLength => {
-                "the keyboard refused the image's length: it is empty, or larger than the \
-                 STM32's application region"
-            }
+            Fault::BadLength => "the image is empty or too large",
             Fault::Verify => "the image failed its CRC check",
             Fault::Enter => "the STM32 did not reach its bootloader",
             Fault::Unknown(_) => "an unrecognised fault",
@@ -292,10 +287,7 @@ pub enum DfuError {
     #[error("the STM32 did not reach its bootloader within {waited:?}")]
     NotReady { waited: Duration },
 
-    #[error(
-        "the image is {size} bytes; the STM32's application region holds {MAX_IMAGE} \
-         ({} KiB)", MAX_IMAGE / 1024
-    )]
+    #[error("the image is too large ({size} bytes, maximum {MAX_IMAGE})")]
     ImageTooLarge { size: usize },
 
     #[error("the image is empty")]
@@ -507,7 +499,7 @@ mod tests {
         };
         assert!(refused(Fault::Verify).to_string().contains("CRC check"));
         assert!(refused(Fault::Locked).to_string().contains("in progress"));
-        assert!(refused(Fault::BadLength).to_string().contains("larger"));
+        assert!(refused(Fault::BadLength).to_string().contains("too large"));
     }
 
     #[test]

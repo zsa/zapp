@@ -50,7 +50,7 @@ pub enum WiredError {
     /// Its own variant rather than a [`Self::Usb`] string, because right after
     /// a reset it is usually a moment rather than a fault: on Linux the node
     /// appears as root's and the udev rule opens it up shortly after.
-    #[error("the ZSA bootloader is plugged in but this user may not open it: {0}")]
+    #[error("no permission to open the ZSA bootloader: {0}")]
     AccessDenied(String),
 
     #[error("vendor request {request:#04x} failed: {reason}")]
@@ -80,8 +80,7 @@ pub enum WiredError {
     ShortStatus { got: usize },
 
     #[error(
-        "this build reads version {expected} of ignition's status and the board sent \
-         version {got}",
+        "unsupported bootloader status version {got} (expected {expected})",
         expected = ignition::STATUS_VERSION
     )]
     StatusVersion { got: u8 },
@@ -96,8 +95,7 @@ pub enum WiredError {
     ShortVersion { got: usize },
 
     #[error(
-        "this build reads layout {expected} of ignition's version and the board sent \
-         layout {got}",
+        "unsupported bootloader version layout {got} (expected {expected})",
         expected = ignition::VERSION_LAYOUT
     )]
     VersionLayout { got: u8 },

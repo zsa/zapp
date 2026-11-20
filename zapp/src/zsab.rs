@@ -11,7 +11,10 @@ use crate::screen::Screen;
 
 /// A keyboard that already carries the bundle, said the same way whichever way
 /// the bundle was going to travel.
-pub(crate) const UP_TO_DATE: &str = "The keyboard is up to date, skipping the flash.";
+pub(crate) const UP_TO_DATE: &str = "Radio firmware is already up to date.";
+
+/// A bundle that was written and kept, said the same way over both routes.
+pub(crate) const FLASHED: &str = "Radio firmware flashing was successful.";
 
 /// Updates both halves from a bundle.
 ///
@@ -28,7 +31,7 @@ pub fn update(bundle: &Bundle, force: bool, device: Option<&str>) -> Result<()> 
     let mut screen = Screen::default();
     match ble::update_bundle(bundle, &options, &mut |event| screen.show(event))? {
         Outcome::UpToDate => println!("{UP_TO_DATE}"),
-        Outcome::Flashed => println!("Done!"),
+        Outcome::Flashed => println!("{FLASHED}"),
     }
     Ok(())
 }

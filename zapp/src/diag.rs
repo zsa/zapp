@@ -55,9 +55,8 @@ pub(crate) fn pick(devices: &[UsbDevice]) -> Result<(&UsbDevice, usize)> {
         Some(device) => Ok((device, running.len())),
         None if voyagers.is_empty() => bail!("No Wireless Voyager found on USB."),
         None => bail!(
-            "The Wireless Voyager is in its bootloader. Restart it into the keyboard \
-             firmware (hold any left-half key for 5 seconds, or run a zapp command that \
-             restarts it), then run `zapp diag` again."
+            "The Wireless Voyager is in its bootloader. Hold any left-half key for 5 seconds \
+             to restart it, then run `zapp diag` again."
         ),
     }
 }

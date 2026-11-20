@@ -575,15 +575,12 @@ impl Central {
             Some(CBManagerState::PoweredOn) => Ok(()),
             Some(CBManagerState::PoweredOff) => Err(BleError::Platform("Bluetooth is off".into())),
             Some(CBManagerState::Unauthorized) => Err(BleError::Platform(
-                "this app is not allowed to use Bluetooth: allow it under System Settings > \
-                 Privacy & Security > Bluetooth (for a terminal, it is the terminal that needs \
-                 the permission)"
+                "no Bluetooth permission: allow it under System Settings > Privacy & Security > \
+                 Bluetooth (for zapp, allow your terminal)"
                     .into(),
             )),
             Some(CBManagerState::Unsupported) => Err(BleError::NoAdapter),
-            _ => Err(BleError::Platform(
-                "Bluetooth did not come up: macOS never said whether it is on".into(),
-            )),
+            _ => Err(BleError::Platform("Bluetooth is not available".into())),
         }
     }
 

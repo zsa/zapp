@@ -751,10 +751,7 @@ fn flash_bundle(
 fn bundle_route() -> Result<Transport> {
     let over = route();
     if over == Transport::Bluetooth && !BLUETOOTH_BUNDLES {
-        bail!(
-            "A radio firmware update needs the keyboard fully wired: plugged into your \
-             computer with the USB cable, and both halves connected with their cable."
-        );
+        bail!("Connect the keyboard with the USB cable and connect both halves with their cable.");
     }
     Ok(over)
 }

@@ -44,19 +44,16 @@ pub const MIN_SOC_PERCENT: u8 = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
-    #[error("a bundle header is {HEADER_LEN} bytes and this file is {0}")]
+    #[error("the file is too short to be a bundle ({0} bytes)")]
     TooShort(usize),
 
     #[error("not a .zsab bundle: it starts {0}, not \"ZSAB\"")]
     BadMagic(String),
 
-    #[error("this bundle is format version {0}, and this build reads version {FORMAT_VERSION}")]
+    #[error("unsupported bundle format version {0}")]
     BadFormat(u16),
 
-    #[error(
-        "the bundle puts its {half} image at {offset} + {size} bytes, past the end of a \
-         {len}-byte file; the file is truncated"
-    )]
+    #[error("the bundle's {half} image is truncated")]
     Overrun {
         half: Half,
         offset: u32,
@@ -67,10 +64,7 @@ pub enum BundleError {
     #[error("the bundle's {0} image is empty")]
     EmptyImage(Half),
 
-    #[error(
-        "the bundle says it was built with key {header:08x} but its {half} image carries \
-         {image:08x}"
-    )]
+    #[error("the bundle's {half} image is signed with a different key")]
     KeyMismatch { half: Half, header: u32, image: u32 },
 }
 

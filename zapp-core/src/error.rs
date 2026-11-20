@@ -51,9 +51,9 @@ pub enum ZappError {
 /// they are what grants access.
 fn access_denied(err: &nusb::Error) -> String {
     let hint = if cfg!(target_os = "linux") {
-        " The udev rules for ZSA devices (udev/50-zsa.rules) are missing or not applied."
+        " Install the ZSA udev rules (udev/50-zsa.rules)."
     } else {
         ""
     };
-    format!("The bootloader is plugged in but this user may not open it ({err}).{hint}")
+    format!("No permission to open the ZSA bootloader ({err}).{hint}")
 }

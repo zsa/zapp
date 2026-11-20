@@ -682,14 +682,14 @@ fn read_once<L: IgnitionLink>(
         // refusing anything: a session still open, or a bootloader from before
         // the tunnel existed.
         let wedged = matches!(err, WiredError::Stalled { .. }) && !probe_bridge(ignition);
-        let why = format!("The {half} half could not be asked what it is running: {err}.");
+        let why = format!("Could not query the {half} half: {err}.");
         return (Landed::Gone { why }, wedged);
     }
     match poll_confirm(ignition, half, ConfirmMode::Read, wanted, EXCHANGE) {
         Ok(result) => (read_landed(result, half), false),
         Err(err) => {
             let wedged = matches!(err, WiredError::Stalled { .. }) && !probe_bridge(ignition);
-            let why = format!("The {half} half's answer could not be read back: {err}.");
+            let why = format!("Could not read the {half} half's answer: {err}.");
             (Landed::Gone { why }, wedged)
         }
     }
@@ -744,14 +744,11 @@ fn exchange_failed(result: &ConfirmResult, half: Half) -> Option<Landed> {
         ConfirmRc::Timeout => {
             format!("The {half} half did not answer the bootloader within 2 s.")
         }
-        ConfirmRc::Transport => format!("The {half} half could not be reached to ask it anything."),
-        ConfirmRc::BadReply => {
-            format!("The {half} half answered with something this build cannot read.")
+        ConfirmRc::Transport => format!("The {half} half could not be reached."),
+        ConfirmRc::BadReply => format!("The {half} half sent an unreadable answer."),
+        ConfirmRc::Unrecognised(code) => {
+            format!("The bootloader returned an unknown code for the {half} half ({code}).")
         }
-        ConfirmRc::Unrecognised(code) => format!(
-            "The bootloader ended the {half} half's exchange with code {code}, which this \
-             build does not know."
-        ),
     };
     Some(Landed::Gone { why })
 }
@@ -769,7 +766,7 @@ fn read_landed(result: ConfirmResult, half: Half) -> Landed {
     // not an answer about this half either.
     if result.target != Some(half) {
         return Landed::Gone {
-            why: format!("The {half} half's read came back naming another half."),
+            why: format!("The {half} half's answer named the other half."),
         };
     }
     if let Some(gone) = exchange_failed(&result, half) {
@@ -801,13 +798,10 @@ fn read_landed(result: ConfirmResult, half: Half) -> Landed {
             version: String::new(),
         },
         ConfirmStatus::WriteFail => Landed::Gone {
-            why: format!("The {half} half answered a read with a write-failure status."),
+            why: format!("The {half} half reported a write failure."),
         },
         ConfirmStatus::Unrecognised(code) => Landed::Gone {
-            why: format!(
-                "The {half} half answered its read with status {code:#04x}, which this build \
-                 does not know."
-            ),
+            why: format!("The {half} half returned an unknown status ({code:#04x})."),
         },
     }
 }
@@ -888,12 +882,11 @@ fn poll_confirm<L: IgnitionLink>(
         if Instant::now() >= deadline {
             let reason = match last {
                 ConfirmState::Idle => format!(
-                    "the bootloader never took the confirm: sent {} times and its result \
-                     block stayed idle",
+                    "the bootloader never took the confirm (sent {} times)",
                     resent + 1
                 ),
                 _ => format!(
-                    "the bootloader was still working on the confirm {} s after it was asked",
+                    "the bootloader did not finish the confirm within {} s",
                     pacing.limit.as_secs()
                 ),
             };
@@ -918,9 +911,9 @@ fn commit_once<L: IgnitionLink>(
 ) -> Result<()> {
     ignition
         .confirm_start(half, ConfirmMode::Commit, wanted)
-        .map_err(|err| anyhow!("The {half} half could not be told to keep its image: {err}"))?;
+        .map_err(|err| anyhow!("Could not tell the {half} half to keep the new image: {err}"))?;
     let result = poll_confirm(ignition, half, ConfirmMode::Commit, wanted, EXCHANGE)
-        .map_err(|err| anyhow!("The {half} half's keep could not be read back: {err}"))?;
+        .map_err(|err| anyhow!("Could not read the {half} half's answer: {err}"))?;
     commit_outcome(result, half)
 }
 
@@ -930,7 +923,7 @@ fn commit_once<L: IgnitionLink>(
 /// there is nothing more to do but say so.
 fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
     if result.target != Some(half) {
-        bail!("The {half} half's keep came back naming another half.");
+        bail!("The {half} half's answer named the other half.");
     }
     if let Some(gone) = exchange_failed(&result, half) {
         bail!("{}", gone.why(half));
@@ -945,17 +938,11 @@ fn commit_outcome(result: ConfirmResult, half: Half) -> Result<()> {
         ConfirmStatus::Unreadable => {
             bail!("The {half} half could not read the hash of what it is running.")
         }
-        ConfirmStatus::WriteFail => bail!(
-            "The {half} half is running the image that was written and could not keep it: \
-             writing its trailer failed."
-        ),
-        ConfirmStatus::Running => bail!(
-            "The {half} half reported it is only running its image, not keeping it."
-        ),
-        ConfirmStatus::Unrecognised(code) => bail!(
-            "The {half} half answered its keep with status {code:#04x}, which this build does \
-             not know."
-        ),
+        ConfirmStatus::WriteFail => bail!("The {half} half could not keep the new image."),
+        ConfirmStatus::Running => bail!("The {half} half did not keep the new image."),
+        ConfirmStatus::Unrecognised(code) => {
+            bail!("The {half} half returned an unknown status ({code:#04x}).")
+        }
     }
 }
 
@@ -1535,7 +1522,7 @@ fn wait_active<L: IgnitionLink>(
             }
             SessionState::Unrecognised(code) => {
                 return Err(NotOpened::fatal(anyhow!(
-                    "The bootloader reports session state {code}, which this build does not know."
+                    "The bootloader returned an unknown session state ({code})."
                 )));
             }
         }
@@ -1624,7 +1611,6 @@ fn installed(slots: &[ImageSlot], wanted: &[u8]) -> bool {
 /// What the half is running once it has is not a question for a bootloader any
 /// more — [`confirm_both`] asks the firmware itself.
 fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
-    let lead = format!("The {half} half took the whole image and then reported");
     // A slot MCUboot cannot validate is left out of its listing (or listed
     // without a hash): the whole image arrived and the bootloader refused it.
     let rejected = || {
@@ -1642,7 +1628,7 @@ fn landed(slots: &[ImageSlot], wanted: &[u8], half: Half) -> Result<()> {
     }
     if slot.hash != wanted {
         bail!(
-            "{lead} {} in its spare slot, not the {} that was sent.",
+            "The {half} half received {} instead of {}.",
             short(&slot.hash),
             short(wanted),
         );
@@ -1853,9 +1839,7 @@ fn finish(outcome: Outcome, look: impl FnOnce() -> bool) -> Result<()> {
 /// keyboard works, and the difference matters to someone deciding what to do
 /// about it.
 fn unproven() -> String {
-    "Both halves kept the update but the keyboard did not come back on USB with both halves \
-     reporting."
-        .to_string()
+    "The update was kept, but the keyboard did not restart.".to_string()
 }
 
 /// Whether the keyboard came back on its own firmware, with both halves in it.
@@ -2071,18 +2055,14 @@ fn open_waiting(
 fn access_denied(cause: &str) -> anyhow::Error {
     if cfg!(target_os = "linux") {
         anyhow!(
-            "The ZSA bootloader is plugged in, but this user is not allowed to open it \
-             ({cause}). The udev rule for ZSA devices (vendor 3297) is missing or has not \
-             been applied. It should read:\n\n    \
+            "No permission to open the ZSA bootloader ({cause}). Add this udev rule under \
+             /etc/udev/rules.d/:\n\n    \
              SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"3297\", MODE:=\"0666\"\n\n\
-             Install it under /etc/udev/rules.d/, then run `sudo udevadm control \
-             --reload-rules && sudo udevadm trigger` and replug the keyboard."
+             Then run `sudo udevadm control --reload-rules && sudo udevadm trigger` and \
+             replug the keyboard."
         )
     } else {
-        anyhow!(
-            "The ZSA bootloader is plugged in, but this user is not allowed to open it \
-             ({cause})."
-        )
+        anyhow!("No permission to open the ZSA bootloader ({cause}).")
     }
 }
 
@@ -2916,7 +2896,7 @@ mod tests {
             ..ScriptedConfirm::default()
         });
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("still working"), "{err}");
+        assert!(err.to_string().contains("did not finish"), "{err}");
         assert_eq!(link.starts, 1, "a busy bridge holds the request; it is not repeated");
     }
 
@@ -3240,7 +3220,7 @@ mod tests {
         let err = classify(result.unwrap_err());
         assert_eq!(err.half(), Some(Half::Right));
         assert_eq!(err.kind(), &ErrorKind::Other);
-        assert!(err.message().contains("took the whole image"), "{err}");
+        assert!(err.message().contains("instead of"), "{err}");
     }
 
     /// Every `(group, command)` of a given kind the device was sent.
@@ -3314,8 +3294,8 @@ mod tests {
         });
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("took the whole image"), "{err}");
-        assert!(err.contains("not the"), "{err}");
+        assert!(err.contains("received"), "{err}");
+        assert!(err.contains("instead of"), "{err}");
         // It got as far as writing: one upload, then the read that caught it.
         // The mark never runs, because nothing worth arming is there.
         assert!(count(&device, (img::GROUP, img::CMD_UPLOAD)) > 0, "{err}");
@@ -3333,8 +3313,8 @@ mod tests {
         });
 
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("in its spare slot"), "{err}");
-        assert!(err.contains("not the"), "{err}");
+        assert!(err.contains("received"), "{err}");
+        assert!(err.contains("instead of"), "{err}");
     }
 
     #[test]
@@ -3887,8 +3867,8 @@ mod tests {
         for (rc, phrase) in [
             (1u8, "did not answer the bootloader"),
             (2, "could not be reached"),
-            (3, "cannot read"),
-            (9, "does not know"),
+            (3, "unreadable answer"),
+            (9, "unknown code"),
         ] {
             let verdict = verdict(rc, 0xFF, &[]);
             assert!(matches!(verdict, Landed::Gone { .. }), "rc {rc}: {verdict:?}");
@@ -3910,7 +3890,7 @@ mod tests {
         // as this half being fine.
         let verdict = read_landed(answered(0, 0x05, 1, &BUNDLE_HASH), Half::Right);
         assert!(matches!(verdict, Landed::Gone { .. }), "{verdict:?}");
-        assert!(verdict.why(Half::Right).contains("naming another half"));
+        assert!(verdict.why(Half::Right).contains("named the other half"));
     }
 
     #[test]
@@ -3928,9 +3908,9 @@ mod tests {
         for (status, phrase) in [
             (0x02u8, "no longer running the image that was written"),
             (0x03, "could not read the hash"),
-            (0x04, "writing its trailer failed"),
-            (0x05, "only running its image, not keeping it"),
-            (0x7f, "does not know"),
+            (0x04, "could not keep the new image"),
+            (0x05, "did not keep the new image"),
+            (0x7f, "unknown status"),
         ] {
             let err = commit_outcome(answered(0, status, 2, &BUNDLE_HASH), Half::Right)
                 .expect_err("a status that kept nothing was read as kept");
@@ -3946,7 +3926,7 @@ mod tests {
         // And a reply about the other half is not trusted.
         let other = commit_outcome(answered(0, 0x00, 1, &BUNDLE_HASH), Half::Right)
             .expect_err("a reply naming another half was trusted");
-        assert!(format!("{other}").contains("naming another half"), "{other}");
+        assert!(format!("{other}").contains("named the other half"), "{other}");
     }
 
     #[test]
@@ -4075,7 +4055,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(wrong.contains("right"), "{wrong}");
-        assert!(wrong.contains("not the"), "{wrong}");
+        assert!(wrong.contains("instead of"), "{wrong}");
 
         // A slot MCUboot could not verify reports no hash at all (or is left
         // out of the listing): the bootloader rejected what arrived.
@@ -4402,10 +4382,10 @@ mod tests {
         let err = finish(Outcome::Flashed, || false)
             .expect_err("a keyboard that never came back is not a finished update");
         let said = format!("{err}");
-        assert!(said.contains("did not come back on USB"), "{said}");
+        assert!(said.contains("did not restart"), "{said}");
         // And it says the images were kept rather than about to disappear:
         // over the cable nothing reverts.
-        assert!(said.contains("kept the update"), "{said}");
+        assert!(said.contains("update was kept"), "{said}");
         assert!(!said.contains("old firmware back"), "{said}");
     }
 

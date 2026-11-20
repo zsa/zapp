@@ -99,7 +99,7 @@ pub enum SmpError {
     #[error("{0} bytes per request leaves no room for image data")]
     ChunkTooSmall(usize),
 
-    #[error("the reply is about group {}, command {} — this asked group {}, command {}",
+    #[error("the reply is for group {}, command {}, expected group {}, command {}",
         .got.0, .got.1, .expected.0, .expected.1)]
     Mismatch {
         expected: (u16, u8),
