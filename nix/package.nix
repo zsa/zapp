@@ -17,7 +17,7 @@ let
         ../zapp-core
         ../zapp-oryx
       ]
-      ++ lib.optional (!stdenv.isDarwin) ../udev
+      ++ lib.optional (!stdenv.hostPlatform.isDarwin) ../udev
     );
   };
   cargoToml = builtins.fromTOML (builtins.readFile ../zapp/Cargo.toml);
@@ -31,7 +31,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ libusb1 ];
 
-  postInstall = lib.optionalString stdenv.isLinux ''
+  postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
     install -Dm644 udev/50-zsa.rules $out/lib/udev/rules.d/50-zsa.rules
   '';
 
