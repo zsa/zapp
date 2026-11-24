@@ -12,13 +12,23 @@ pub enum OryxError {
     Firmware(#[from] zapp_core::ZappError),
 }
 
+impl OryxError {
+    /// Whether Oryx answered with HTTP 404: it has no such layout or revision.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::Network(err) => err.status() == Some(reqwest::StatusCode::NOT_FOUND),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct LatestResponse {
     latest: String,
 }
 
 /// Oryx's API host, serving firmware builds and the GraphQL endpoint.
-const ORYX_API_URL: &str = "https://oryx.zsa.io";
+pub const ORYX_API_URL: &str = "https://oryx.zsa.io";
 
 /// The layout editor front end, where the URLs users copy come from.
 const CONFIGURE_URL: &str = "https://configure.zsa.io/";
@@ -54,7 +64,9 @@ struct GqlRevision {
 /// MCUs, and Oryx models them as separate geometries.
 pub fn geometry_for(keyboard: Keyboard, pid: u16) -> &'static str {
     match keyboard {
-        Keyboard::Voyager => "voyager",
+        // The Wireless Voyager keeps the Voyager's key layout, so Oryx serves both from
+        // the one geometry.
+        Keyboard::Voyager | Keyboard::WirelessVoyager => "voyager",
         Keyboard::Moonlander => "moonlander",
         Keyboard::PlanckEz => "planck-ez",
         Keyboard::ErgodoxEz => match pid {
@@ -73,6 +85,16 @@ pub fn fetch_revision_note(
     revision_id: &str,
     geometry: &str,
 ) -> Result<Option<String>, OryxError> {
+    fetch_revision_note_at(ORYX_API_URL, layout_id, revision_id, geometry)
+}
+
+/// [`fetch_revision_note`] against the Oryx API at `base`.
+pub fn fetch_revision_note_at(
+    base: &str,
+    layout_id: &str,
+    revision_id: &str,
+    geometry: &str,
+) -> Result<Option<String>, OryxError> {
     let body = serde_json::json!({
         "query": REVISION_NOTE_QUERY,
         "variables": {
@@ -83,7 +105,7 @@ pub fn fetch_revision_note(
     });
 
     let resp: GqlResponse = reqwest::blocking::Client::new()
-        .post(format!("{ORYX_API_URL}/graphql"))
+        .post(format!("{base}/graphql"))
         .json(&body)
         .send()?
         .error_for_status()?
@@ -146,6 +168,16 @@ pub fn resolve_revision(
     layout_id: &str,
     revision_id: Option<&str>,
 ) -> Result<String, OryxError> {
+    resolve_revision_at(ORYX_API_URL, geometry, layout_id, revision_id)
+}
+
+/// [`resolve_revision`] against the Oryx API at `base`.
+pub fn resolve_revision_at(
+    base: &str,
+    geometry: &str,
+    layout_id: &str,
+    revision_id: Option<&str>,
+) -> Result<String, OryxError> {
     if let Some(rev) = revision_id {
         return Ok(rev.to_string());
     }
@@ -153,9 +185,9 @@ pub fn resolve_revision(
     // Every geometry has a stock layout, and they all share the id "default",
     // so the geometry is what disambiguates them.
     let url = if layout_id == "default" {
-        format!("{ORYX_API_URL}/firmware/latest/{geometry}/default")
+        format!("{base}/firmware/latest/{geometry}/default")
     } else {
-        format!("{ORYX_API_URL}/firmware/latest/{layout_id}")
+        format!("{base}/firmware/latest/{layout_id}")
     };
 
     let resp: LatestResponse = reqwest::blocking::get(&url)?.error_for_status()?.json()?;
@@ -194,7 +226,16 @@ pub fn download_firmware(
     revision_id: &str,
     variant: FirmwareVariant,
 ) -> Result<Firmware, OryxError> {
-    let url = format!("{ORYX_API_URL}/firmware/{revision_id}{}", variant.query());
+    download_firmware_at(ORYX_API_URL, revision_id, variant)
+}
+
+/// [`download_firmware`] from the Oryx API at `base`.
+pub fn download_firmware_at(
+    base: &str,
+    revision_id: &str,
+    variant: FirmwareVariant,
+) -> Result<Firmware, OryxError> {
+    let url = format!("{base}/firmware/{revision_id}{}", variant.query());
 
     let fw_bytes = reqwest::blocking::get(&url)?.error_for_status()?.bytes()?;
 
@@ -204,6 +245,67 @@ pub fn download_firmware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A server on localhost that answers one request with `status` and
+    /// `body`, and the base URL it listens on.
+    fn answer_once(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        base
+    }
+
+    #[test]
+    fn a_404_is_not_found() {
+        let base = answer_once("404 Not Found", "");
+        let err = download_firmware_at(&base, "AX1", FirmwareVariant::Standard).unwrap_err();
+        assert!(err.is_not_found(), "{err}");
+    }
+
+    #[test]
+    fn a_server_error_is_not_not_found() {
+        let base = answer_once("502 Bad Gateway", "");
+        let err = download_firmware_at(&base, "AX1", FirmwareVariant::Standard).unwrap_err();
+        assert!(!err.is_not_found(), "{err}");
+    }
+
+    #[test]
+    fn no_server_is_not_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let err = resolve_revision_at(&base, "voyager", "abcde", None).unwrap_err();
+        assert!(!err.is_not_found(), "{err}");
+        assert!(!OryxError::InvalidUrl.is_not_found());
+    }
+
+    #[test]
+    fn latest_resolves_against_the_given_base() {
+        let base = answer_once("200 OK", r#"{"latest":"Zz9"}"#);
+        let latest = resolve_revision_at(&base, "voyager", "abcde", None).unwrap();
+        assert_eq!(latest, "Zz9");
+    }
+
+    #[test]
+    fn a_note_is_read_from_the_given_base() {
+        let base = answer_once(
+            "200 OK",
+            r#"{"data":{"layout":{"revision":{"title":"  Swap Esc  "}}}}"#,
+        );
+        let note = fetch_revision_note_at(&base, "abcde", "Zz9", "voyager").unwrap();
+        assert_eq!(note.as_deref(), Some("Swap Esc"));
+    }
 
     #[test]
     fn test_parse_url_bare_layout() {

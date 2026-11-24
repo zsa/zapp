@@ -1,13 +1,30 @@
 [package]
 name = "zapp"
-version = "1.0.2"
+version = "1.1.17"
 edition = "2024"
 
 [dependencies]
+zapp-ble = { path = "../zapp-ble" }
 zapp-core = { path = "../zapp-core" }
 zapp-oryx = { path = "../zapp-oryx" }
+zapp-smp = { path = "../zapp-smp" }
+zapp-update = { path = "../zapp-update" }
+zapp-wired = { path = "../zapp-wired" }
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 env_logger = "0.11"
 indicatif = "0.17"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 log = "0.4"
+flate2 = "1"
+self-replace = "1"
+tar = "0.4"
+tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+# The wired orchestration is tested against the in-memory keyboard rather than
+# against a board, which needs the loopback stack compiled into the library.
+zapp-wired = { path = "../zapp-wired", features = ["loopback"] }

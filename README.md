@@ -150,6 +150,14 @@ zapp flash firmware.bin
 zapp flash firmware.hex
 ```
 
+### Update to the latest radio firmware (Wireless Voyager)
+
+Downloads the newest radio firmware bundle from ZSA's update server, checks its signature, and flashes it like a `.zsab` file (keyboard fully wired):
+
+```sh
+zapp update radio
+```
+
 ### Flash from an Oryx URL
 
 Paste your layout URL directly from [Oryx](https://configure.zsa.io) — zapp will download and flash the firmware for you:
@@ -179,6 +187,16 @@ zapp update
 This reads the layout and revision from the keyboard's USB serial number, checks the Oryx API, and flashes automatically if an update is available.
 
 > **Note:** This only works if your keyboard is currently flashed with firmware from Oryx and is not in bootloader mode.
+
+### Update zapp itself
+
+```sh
+zapp upgrade          # show what's new and ask before installing
+zapp upgrade --check  # only report
+zapp upgrade --yes    # install without asking
+```
+
+Copies installed through Nix, Homebrew, mise or a Linux package manager are updated through that package manager instead.
 
 ### Flashing process
 

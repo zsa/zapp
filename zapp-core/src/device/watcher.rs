@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
-use nusb::MaybeFuture;
 use nusb::hotplug::HotplugEvent;
+use nusb::{Device, DeviceInfo, MaybeFuture};
 
+use super::access::{ACCESS_RETRY, AccessGrace, permission_denied};
 use super::ids::{
     BootloaderDevice, BootloaderKind, Keyboard, identify_bootloader, identify_keyboard,
     keyboard_for_bootloader,
@@ -15,6 +16,49 @@ pub struct ConnectedKeyboard {
     pub keyboard: Keyboard,
     pub serial: String,
     pub pid: u16,
+}
+
+/// A ZSA device attached right now, in either mode.
+pub struct UsbDevice {
+    /// `None` for a bootloader that names no keyboard, such as the generic
+    /// STM32 DFU any STM32 board can present.
+    pub keyboard: Option<Keyboard>,
+    /// The mode it is in: `None` means it is running keyboard firmware.
+    pub bootloader: Option<BootloaderKind>,
+    /// `layoutId/revisionId` for a keyboard; bootloaders carry none.
+    pub serial: Option<String>,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+/// Every ZSA device attached right now, keyboards and bootloaders alike.
+pub fn list_devices() -> Result<Vec<UsbDevice>, ZappError> {
+    let mut devices = Vec::new();
+
+    for dev_info in nusb::list_devices().wait()? {
+        let vid = dev_info.vendor_id();
+        let pid = dev_info.product_id();
+
+        if let Some(keyboard) = identify_keyboard(vid, pid) {
+            devices.push(UsbDevice {
+                keyboard: Some(keyboard),
+                bootloader: None,
+                serial: dev_info.serial_number().map(str::to_string),
+                vid,
+                pid,
+            });
+        } else if let Some(kind) = identify_bootloader(vid, pid) {
+            devices.push(UsbDevice {
+                keyboard: keyboard_for_bootloader(vid, pid),
+                bootloader: Some(kind),
+                serial: None,
+                vid,
+                pid,
+            });
+        }
+    }
+
+    Ok(devices)
 }
 
 /// Scan USB for the first ZSA keyboard in normal mode.
@@ -102,7 +146,7 @@ pub fn wait_for_bootloader(
                     // Small delay for device to be ready (especially on Windows)
                     std::thread::sleep(Duration::from_millis(500));
 
-                    let device = dev_info.open().wait()?;
+                    let device = open_bootloader(&dev_info)?;
                     on_status(WatchStatus::Found {
                         keyboard,
                         kind,
@@ -129,7 +173,7 @@ fn try_find_bootloader_in_list() -> Result<Option<BootloaderDevice>, ZappError> 
 
         if let Some(kind) = identify_bootloader(vid, pid) {
             let keyboard = keyboard_for_bootloader(vid, pid);
-            let device = dev_info.open().wait()?;
+            let device = open_bootloader(&dev_info)?;
 
             return Ok(Some(BootloaderDevice {
                 device,
@@ -141,4 +185,22 @@ fn try_find_bootloader_in_list() -> Result<Option<BootloaderDevice>, ZappError> 
         }
     }
     Ok(None)
+}
+
+/// Opens a bootloader, giving a node that has just appeared a moment for the
+/// udev rule to open it up.
+fn open_bootloader(dev_info: &DeviceInfo) -> Result<Device, ZappError> {
+    let mut grace = AccessGrace::default();
+    loop {
+        match dev_info.open().wait() {
+            Err(err) if permission_denied(&err) => {
+                if !grace.retry(Instant::now()) {
+                    return Err(ZappError::AccessDenied(err));
+                }
+                log::debug!("the bootloader refused to open ({err}), trying again");
+                std::thread::sleep(ACCESS_RETRY);
+            }
+            result => return Ok(result?),
+        }
+    }
 }

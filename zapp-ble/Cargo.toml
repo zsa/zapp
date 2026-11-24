@@ -1,0 +1,50 @@
+[package]
+name = "zapp-ble"
+version = "0.1.0"
+edition = "2021"
+description = "BLE discovery for ZSA keyboards"
+
+[dependencies]
+log = "0.4"
+thiserror = "2"
+zapp-core = { path = "../zapp-core" }
+zapp-hid-proto = { path = "../zapp-hid-proto" }
+zapp-smp = { path = "../zapp-smp" }
+
+[dev-dependencies]
+# The mtu_probe example builds its own CBOR echo payloads.
+ciborium = "0.2"
+# The watch example turns RUST_LOG on, which is how the backends are diagnosed
+# on a machine where a board is not showing up.
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure Rust D-Bus, so BlueZ costs no system library at build time. The blocking
+# API keeps the crate free of an async runtime.
+zbus = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreBluetooth through objc2's generated bindings. The central runs on a
+# dispatch queue of its own, so nothing here needs a run loop or an async
+# runtime: the delegate hands each callback to a blocking caller.
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-core-bluetooth = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSUUID", "NSValue"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# WinRT's Bluetooth namespaces through windows-rs. The async operations are
+# waited on where they are made, so this needs no runtime either; the future
+# and collection crates are where windows-rs keeps `join` and `IIterable`.
+windows = { version = "0.62", features = [
+  "Devices_Bluetooth",
+  "Devices_Bluetooth_Advertisement",
+  "Devices_Bluetooth_GenericAttributeProfile",
+  "Devices_Enumeration",
+  "Devices_Radios",
+  "Foundation_Collections",
+  "Storage_Streams",
+  "Win32_System_Com",
+] }
+windows-collections = "0.3"
+windows-future = "0.3"

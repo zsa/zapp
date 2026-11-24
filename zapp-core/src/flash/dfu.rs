@@ -7,7 +7,7 @@ use nusb::transfer::ControlType;
 use nusb::transfer::Recipient;
 
 use crate::ZappError;
-use crate::device::BootloaderDevice;
+use crate::device::{BootloaderDevice, BootloaderKind};
 use crate::firmware::Firmware;
 
 use super::FlashProgress;
@@ -20,7 +20,11 @@ const BLOCK_SIZE: usize = 2048;
 const STM32_START_ADDRESS: u32 = 0x0800_0000;
 const STM32_END_ADDRESS: u32 = 0x0804_0000;
 const IGNITION_START_ADDRESS: u32 = 0x0800_2000;
-const IGNITION_END_ADDRESS: u32 = 0x0804_2000;
+const IGNITION_END_ADDRESS: u32 = 0x0804_0000;
+// Ignition v2 (Wireless Voyager) reserves 16 KiB for the bootloader and exposes
+// 120 * 2 KiB above it, ending at the top of the STM32F303CCT6's 256 KiB flash.
+const IGNITION_V2_START_ADDRESS: u32 = 0x0800_4000;
+const IGNITION_V2_END_ADDRESS: u32 = 0x0804_0000;
 
 // DFU class requests
 const DFU_DNLOAD: u8 = 0x01;
@@ -44,13 +48,28 @@ struct DfuStatus {
     b_state: u8,
 }
 
+/// Flash region `(start, end)` the application occupies for a bootloader kind.
+///
+/// HALFKAY does not flash via DFU; it maps to the plain STM32 region so the
+/// match stays total.
+pub fn flash_region(kind: BootloaderKind) -> (u32, u32) {
+    match kind {
+        BootloaderKind::Stm32Dfu | BootloaderKind::Halfkay => {
+            (STM32_START_ADDRESS, STM32_END_ADDRESS)
+        }
+        BootloaderKind::IgnitionStm32 | BootloaderKind::IgnitionGd32 => {
+            (IGNITION_START_ADDRESS, IGNITION_END_ADDRESS)
+        }
+        BootloaderKind::IgnitionV2 => (IGNITION_V2_START_ADDRESS, IGNITION_V2_END_ADDRESS),
+    }
+}
+
 /// Perform DFU flashing on a device.
 ///
-/// If `ignition` is true, uses Ignition address offsets (0x0800_2000).
+/// The flash region comes from the device's bootloader kind.
 pub fn flash_dfu(
     device: &BootloaderDevice,
     firmware: &Firmware,
-    ignition: bool,
     on_progress: &dyn Fn(FlashProgress),
 ) -> Result<(), ZappError> {
     let firmware_data = match firmware {
@@ -68,21 +87,12 @@ pub fn flash_dfu(
         }
         Firmware::IntelHex { .. } => {
             return Err(ZappError::InvalidFirmware(
-                "cannot flash Intel HEX via DFU; expected a .bin file".into(),
+                "Intel HEX cannot be flashed via DFU".into(),
             ));
         }
     };
 
-    let start_address = if ignition {
-        IGNITION_START_ADDRESS
-    } else {
-        STM32_START_ADDRESS
-    };
-    let max_address = if ignition {
-        IGNITION_END_ADDRESS
-    } else {
-        STM32_END_ADDRESS
-    };
+    let (start_address, max_address) = flash_region(device.kind);
 
     let end_address = start_address + firmware_data.len() as u32 + BLOCK_SIZE as u32;
     if end_address > max_address {
@@ -107,7 +117,7 @@ pub fn flash_dfu(
 
         if status.b_status == DFU_ERROR {
             return Err(ZappError::Dfu(
-                "failed to clear error status — try unplugging and replugging the device".into(),
+                "failed to clear error status".into(),
             ));
         }
     }

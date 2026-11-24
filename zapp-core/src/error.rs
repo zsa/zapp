@@ -26,6 +26,11 @@ pub enum ZappError {
     #[error("Unsupported device: VID={vid:#06x} PID={pid:#06x}")]
     UnsupportedDevice { vid: u16, pid: u16 },
 
+    /// A bootloader that is plugged in and still refused to open once the
+    /// udev rule had had time to reach it.
+    #[error("{}", access_denied(.0))]
+    AccessDenied(nusb::Error),
+
     #[error("Timeout waiting for bootloader")]
     Timeout,
 
@@ -40,4 +45,15 @@ pub enum ZappError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// The sentence for [`ZappError::AccessDenied`], naming the udev rules where
+/// they are what grants access.
+fn access_denied(err: &nusb::Error) -> String {
+    let hint = if cfg!(target_os = "linux") {
+        " Install the ZSA udev rules (udev/50-zsa.rules)."
+    } else {
+        ""
+    };
+    format!("No permission to open the ZSA bootloader ({err}).{hint}")
 }

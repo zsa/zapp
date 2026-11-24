@@ -1,14 +1,39 @@
-use std::path::PathBuf;
+mod diag;
+mod flash_log;
+mod nrf_wired;
+mod report;
+mod screen;
+mod upgrade;
+mod zsab;
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use zapp_core::device::ids::{is_moonlander_revb, target_name_for_pid};
-use zapp_core::device::{self, WatchStatus};
+use zapp_ble::{Battery, BleMonitor, ChargeDetail, Level, Presence};
+use zapp_core::device::ids::{self as ids, is_moonlander_revb, target_name_for_pid};
+use zapp_core::device::{self, UsbDevice, WatchStatus};
 use zapp_core::firmware::{self, Firmware};
 use zapp_core::flash::{self, FlashProgress};
+use zapp_core::hid::{HidEvent, HostSlot, RadioInfo, Telemetry};
 use zapp_oryx::FirmwareVariant;
+use zapp_wired::ignition::{bcd_version, usb::UsbLink};
+use zapp_wired::Ignition;
+use zapp_update::cloud::{radio_offered, Release, RunningRadio};
+use zapp_update::probe::{ble_report as ble_oryx_report, usb_report};
+use zapp_update::report::devices::*;
+use zapp_update::report::freeze;
+use zapp_update::{route, Transport};
+
+use crate::screen::Screen;
 
 #[derive(Parser)]
 #[command(name = "zapp", version, about = format!("⚡ Flash ZSA keyboards — v{}", env!("CARGO_PKG_VERSION")))]
@@ -17,58 +42,750 @@ struct Cli {
     command: Commands,
 }
 
+/// What `zapp update` updates besides the Oryx layout.
+#[derive(Clone, Copy, ValueEnum)]
+enum UpdateTarget {
+    /// The latest Wireless Voyager radio firmware.
+    Radio,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Flash firmware from a local file or Oryx URL
+    /// Flash firmware from a local file or an Oryx URL
     #[command(
-        long_about = "Flash firmware from a local file or Oryx URL.\n\n\
-            Supports .bin (DFU) and .hex (Intel HEX) firmware files, as well as \
-            Oryx layout URLs. When given a URL, the firmware is downloaded and \
-            flashed directly.",
+        long_about = "Flash firmware from a local file or an Oryx URL.\n\n\
+            Supports .bin (DFU) and .hex (Intel HEX) keyboard firmware, .zsab \
+            bundles carrying both wireless halves, and Oryx layout URLs. For the \
+            latest Wireless Voyager radio firmware, run `zapp update radio`. A \
+            Wireless Voyager keyboard image goes over the cable when the keyboard is \
+            on USB and over Bluetooth otherwise. A .zsab bundle goes over the \
+            cable only. Any other keyboard's firmware goes over the cable. A \
+            bundle's two halves are written together, the right one first.",
         after_long_help = "Examples:\n  \
             zapp flash firmware.bin\n  \
+            zapp flash .build/zsa_wireless_voyager_default.bin\n  \
+            zapp flash .build/zsa_wireless_voyager_default.bin --device \"Voyager\"\n  \
+            zapp flash voyager2_0.1.9.zsab\n  \
+            zapp flash voyager2_0.1.9.zsab --force\n  \
             zapp flash https://configure.zsa.io/voyager/layouts/default/latest\n  \
             zapp flash https://configure.zsa.io/moonlander/layouts/default/abc123"
     )]
     Flash {
-        /// Path to firmware file (.bin or .hex), or an Oryx URL.
+        /// Path to a firmware file (.bin, .hex or .zsab), or an Oryx URL.
         firmware: String,
+        /// Write a half even if it already carries the image, or the bundle is
+        /// older than what is installed. Applies to .zsab bundles only.
+        #[arg(long)]
+        force: bool,
+        /// Which board, by advertised name or by the handle the device list
+        /// shows. Applies to keyboard images over Bluetooth only.
+        #[arg(long, short = 'd')]
+        device: Option<String>,
     },
-    /// Check Oryx for updates on your layout and flash if available
+    /// Check Oryx for updates on your layout and flash if available, or update the radio firmware
     #[command(
         long_about = "Check Oryx for updates on your layout and flash if available.\n\n\
-            Detects a connected ZSA keyboard, reads its layout and revision from the \
-            USB serial number, and checks Oryx for a newer firmware revision. If an \
-            update is available, it is downloaded and flashed automatically. \n\
-            Note: This only works if your keyboard is currently flashed with a firmware \
-            coming from Oryx and is not currently in bootloader mode."
+            Reads a connected ZSA keyboard's layout and revision from its USB serial \
+            number, and downloads and flashes the newest revision Oryx has for it.\n\n\
+            `zapp update radio` downloads the latest Wireless Voyager radio firmware bundle \
+            from the ZSA update server and flashes it like a .zsab file, with the \
+            keyboard fully wired.",
+        after_long_help = "Examples:\n  \
+            zapp update\n  \
+            zapp update radio\n  \
+            zapp update radio --force"
     )]
-    Update,
+    Update {
+        /// What to update instead of the Oryx layout.
+        #[arg(value_enum)]
+        target: Option<UpdateTarget>,
+        /// Write a half even if it already carries the radio firmware, or the
+        /// download is older than what is installed. Radio only.
+        #[arg(long, requires = "target")]
+        force: bool,
+    },
+    /// List the ZSA keyboards this machine can see, wired and wireless
+    #[command(long_about = "List the ZSA keyboards this machine can see.\n\n\
+            Wired boards are read straight from USB. Bluetooth boards are listed \
+            when they are connected to this machine, bonded to it, or advertising \
+            in range, and --scan holds a discovery window open for boards that have \
+            never been paired. --skip-bluetooth lists the USB boards only.")]
+    Devices {
+        /// Scan for boards that have never been paired to this machine
+        #[arg(long)]
+        scan: bool,
+        /// Only list boards on USB; skip the Bluetooth search
+        #[arg(long, conflicts_with = "scan")]
+        skip_bluetooth: bool,
+        /// Also ask each half what its cell and its charger are reading
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// Pair the two halves by provisioning their shared ESB key over the cable
+    #[command(
+        long_about = "Provision the ESB pairing key onto both halves over the cable.\n\n\
+            Writes one fresh 30-byte key to both halves through the bootloader, reads \
+            it back off each, then reboots the keyboard and waits for both halves to \
+            report over USB. --key writes a specific key instead of generating one, \
+            and --show reads what the two halves carry without writing anything.",
+        after_long_help = "Examples:\n  \
+            zapp bond\n  \
+            zapp bond --show\n  \
+            zapp bond --key 4a1b2c...  (60 hex characters)"
+    )]
+    Bond {
+        /// Write this exact 30-byte key (60 hex characters) instead of generating one
+        #[arg(long, value_name = "HEX")]
+        key: Option<String>,
+        /// Read both halves' current key and report whether they match, writing nothing
+        #[arg(long)]
+        show: bool,
+    },
+    /// Print the Oryx live events a board sends over Bluetooth
+    #[command(
+        long_about = "Print the Oryx live events a board sends over Bluetooth.\n\n\
+            Opens the live session on a bonded board and prints one line per \
+            event until Ctrl-C or the link closes.",
+        after_long_help = "Examples:\n  \
+            zapp live\n  \
+            zapp live --device \"Voyager\""
+    )]
+    Live {
+        /// Which board, by advertised name or by the handle the device list
+        /// shows.
+        #[arg(long, short = 'd')]
+        device: Option<String>,
+    },
+    /// Read a Wireless Voyager's diagnostic records over USB
+    #[command(
+        long_about = "Read a Wireless Voyager's diagnostic records over USB.\n\n\
+            Asks the keyboard over the cable for what its keyboard MCU (STM32) \
+            and its left half (nRF) recorded about this boot and the previous \
+            one: uptime, reset reason, link state, error counters and stalls. \
+            Prints them as plain text, with anything unusual listed at the \
+            end. The keyboard must be running its own firmware, not its \
+            bootloader.",
+        after_long_help = "Examples:\n  \
+            zapp diag\n  \
+            zapp diag > wireless-voyager-diag.txt"
+    )]
+    Diag,
+    /// Write a Wireless Voyager report file for ZSA support
+    #[command(
+        long_about = "Write a Wireless Voyager report file for ZSA support.\n\n\
+            Collects into one plain-text file the zapp version, the keyboard's \
+            firmware and radio versions, the `zapp diag` records, and the left \
+            half's freeze record and event log. Then marks the freeze record \
+            as reported. The keyboard must be on USB and running its own \
+            firmware.",
+        after_long_help = "Examples:\n  \
+            zapp report\n  \
+            zapp report -o voyager-report.txt"
+    )]
+    Report {
+        /// File to write; defaults to zapp-report-<date>-<time>.txt here
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Update zapp itself to the newest release
+    #[command(
+        long_about = "Update zapp itself to the newest release.\n\n\
+            Asks the ZSA update server for a newer zapp, shows its release \
+            notes, and on confirmation downloads it, checks its signature and \
+            replaces this zapp with it. --check only reports.",
+        after_long_help = "Examples:\n  \
+            zapp upgrade\n  \
+            zapp upgrade --check\n  \
+            zapp upgrade --yes"
+    )]
+    Upgrade {
+        /// Install without asking
+        #[arg(long, short = 'y', conflicts_with = "check")]
+        yes: bool,
+        /// Only report whether a newer zapp exists
+        #[arg(long)]
+        check: bool,
+    },
 }
 
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp(None)
-        .init();
-
+/// Runs the command the arguments name, and says one line about a failure.
+fn main() {
     let cli = Cli::parse();
+    flash_log::init(matches!(cli.command, Commands::Flash { .. } | Commands::Update { .. }));
 
-    match cli.command {
-        Commands::Flash { firmware } => {
-            if zapp_oryx::is_oryx_url(&firmware) {
-                cmd_flash_url(&firmware)
-            } else {
-                cmd_flash_file(&PathBuf::from(firmware))
-            }
-        }
-        Commands::Update => cmd_update(),
+    let result = dispatch(cli.command);
+    flash_log::finish(&result);
+    if let Err(err) = result {
+        eprintln!("Error: {err:#}");
+        std::process::exit(1);
     }
 }
 
-fn cmd_flash_file(path: &PathBuf) -> Result<()> {
+/// One command, run to whatever it comes to.
+fn dispatch(command: Commands) -> Result<()> {
+    match command {
+        Commands::Flash {
+            firmware,
+            force,
+            device,
+        } => {
+            if zapp_oryx::is_oryx_url(&firmware) {
+                cmd_flash_url(&firmware)
+            } else {
+                cmd_flash_file(&PathBuf::from(firmware), force, device.as_deref())
+            }
+        }
+        Commands::Update { target: None, .. } => cmd_update(),
+        Commands::Update {
+            target: Some(UpdateTarget::Radio),
+            force,
+        } => cmd_update_radio(force),
+        Commands::Devices {
+            scan,
+            skip_bluetooth,
+            verbose,
+        } => cmd_devices(scan, skip_bluetooth, verbose),
+        Commands::Live { device } => cmd_live(device.as_deref()),
+        Commands::Diag => diag::run(),
+        Commands::Report { output } => report::run(output),
+        Commands::Upgrade { yes, check } => upgrade::run(yes, check),
+        Commands::Bond { key, show } => {
+            if show {
+                if key.is_some() {
+                    anyhow::bail!("--show and --key cannot be combined.");
+                }
+                nrf_wired::bond_show()
+            } else {
+                nrf_wired::bond(key.as_deref())
+            }
+        }
+    }
+}
+
+/// How often `live` checks for Ctrl-C between events.
+const LIVE_POLL: Duration = Duration::from_millis(100);
+
+fn cmd_live(device: Option<&str>) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handler_stop = stop.clone();
+    ctrlc::set_handler(move || handler_stop.store(true, Ordering::Relaxed))
+        .context("cannot catch Ctrl-C")?;
+
+    let (connection, payload) = zapp_ble::oryx::open_session(device)?;
+    // The channel reports ATT payload; the ATT MTU adds the 3-byte header.
+    println!("ATT MTU: {}", payload + 3);
+
+    while !stop.load(Ordering::Relaxed) {
+        let Some(event) = connection.recv_timeout(LIVE_POLL) else {
+            continue;
+        };
+        match event {
+            HidEvent::FirmwareVersion {
+                layout_id,
+                revision_id,
+            } => println!("handshake: layout {layout_id}, revision {revision_id}"),
+            HidEvent::ProtocolVersion(version) => println!("protocol version: {version:#04x}"),
+            HidEvent::LayerChanged(layer) => println!("layer: {layer}"),
+            HidEvent::Key {
+                column,
+                row,
+                pressed,
+            } => println!(
+                "key {}: column {column}, row {row}",
+                if pressed { "down" } else { "up" }
+            ),
+            HidEvent::ToggleSmartLayer => println!("smart layer: toggle"),
+            HidEvent::TriggerSmartLayer => println!("smart layer: trigger"),
+            HidEvent::PairingFail => println!("pairing failed"),
+            HidEvent::Disconnected => {
+                println!("link closed");
+                break;
+            }
+            other => println!("other: {other:?}"),
+        }
+    }
+
+    // Joins the reader, so the channels are dropped (BlueZ StopNotify) before exit.
+    connection.close();
+    Ok(())
+}
+
+/// How long to give the radio. Without `--scan`, just long enough for the first
+/// answer, which already carries every bonded board; with it, long enough for a
+/// discovery window to open and close.
+const BLE_SETTLE: Duration = Duration::from_millis(750);
+const BLE_SCAN: Duration = Duration::from_secs(7);
+
+fn cmd_devices(scan: bool, skip_bluetooth: bool, verbose: bool) -> Result<()> {
+    let wired = device::list_devices();
+
+    // The Bluetooth identities the boards on the cable named, which the roster
+    // below matches its bonded entries against.
+    let mut on_usb: Vec<String> = Vec::new();
+    let mut feed = RadioFeed::default();
+
+    println!("USB");
+    match &wired {
+        Ok(devices) if devices.is_empty() => println!("  none"),
+        Ok(devices) => {
+            for device in devices {
+                let report = wired_report(device, verbose);
+                println!(
+                    "  {}{}{}",
+                    describe_usb(device),
+                    bootloader_version(device),
+                    report.charge
+                );
+                for line in &report.lines {
+                    println!("    {line}");
+                }
+                if let Some(radio) = &report.radio {
+                    for line in radio_lines(radio, verbose, &mut feed, Transport::Usb) {
+                        println!("    {line}");
+                    }
+                }
+                if let Some(line) = wired_freeze_notice(device) {
+                    println!("    {line}");
+                }
+                on_usb.extend(report.ble_address);
+            }
+        }
+        Err(err) => println!("  cannot scan: {err}"),
+    }
+
+    if skip_bluetooth {
+        return Ok(());
+    }
+
+    let monitor = BleMonitor::start(&[]);
+    let wait = if scan { BLE_SCAN } else { BLE_SETTLE };
+    let spinner = new_spinner("Looking for Bluetooth boards...");
+    thread::sleep(wait);
+    spinner.finish_and_clear();
+
+    println!();
+    println!("Bluetooth");
+    let boards = monitor.snapshot();
+    if boards.is_empty() {
+        println!("  none");
+    }
+    for board in boards {
+        let name = board
+            .keyboard
+            .map(|keyboard| keyboard.to_string())
+            .unwrap_or_else(|| "ZSA keyboard".to_string());
+        let known_as = board.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        // The address only when the platform handle spells one out.
+        let address = match &board.address {
+            Some(address) => format!(" · {address}"),
+            None => String::new(),
+        };
+        // Read once: the same detail words the summary line and fills the
+        // lines under it.
+        let detail = ble_charge_detail(&board, verbose);
+        println!(
+            "  {name} · {} · {known_as:?}{address}{}",
+            state(board.presence, board.address.as_deref(), &on_usb),
+            charge(board.battery, detail.as_ref()),
+        );
+        for line in ble_report(detail.as_ref()) {
+            println!("    {line}");
+        }
+        let (radio, telemetry, slots) = ble_radio(&board, &on_usb, verbose);
+        if let Some(line) = telemetry.as_ref().and_then(halves_line) {
+            println!("    {line}");
+        }
+        for line in host_slot_lines(&slots) {
+            println!("    {line}");
+        }
+        if let Some(radio) = radio {
+            for line in radio_lines(&radio, verbose, &mut feed, Transport::Bluetooth) {
+                println!("    {line}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// How long `zapp devices` waits on the update server.
+const FEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The latest radio firmware release, asked for at most once per run.
+#[derive(Default)]
+struct RadioFeed(Option<Option<Release>>);
+
+impl RadioFeed {
+    /// The latest release, or `None` when the server could not be asked.
+    fn latest(&mut self) -> Option<&Release> {
+        self.0.get_or_insert_with(latest_radio).as_ref()
+    }
+}
+
+fn latest_radio() -> Option<Release> {
+    let spinner = new_spinner("Checking for radio firmware...");
+    let latest = zapp_update::cloud::quick_client(
+        concat!("zapp/", env!("CARGO_PKG_VERSION")),
+        FEED_TIMEOUT,
+    )
+    .and_then(|client| zapp_update::cloud::check_radio(&client, None));
+    spinner.finish_and_clear();
+    latest
+        .inspect_err(|err| log::debug!("could not check for radio firmware: {err:#}"))
+        .ok()
+        .flatten()
+}
+
+/// What a Bluetooth Wireless Voyager runs, and its telemetry under `verbose`,
+/// asked over its Oryx service. Only for a board connected to this machine and
+/// not already read over the cable.
+fn ble_radio(
+    board: &zapp_ble::BleBoard,
+    on_usb: &[String],
+    verbose: bool,
+) -> (Option<RadioInfo>, Option<Telemetry>, Vec<HostSlot>) {
+    let on_cable = board
+        .address
+        .as_deref()
+        .is_some_and(|address| on_usb.iter().any(|wired| wired == address));
+    if board.keyboard != Some(ids::Keyboard::WirelessVoyager)
+        || board.presence != Presence::Connected
+        || on_cable
+    {
+        return (None, None, Vec::new());
+    }
+    let spinner = new_spinner("Asking for radio firmware...");
+    let report = ble_oryx_report(&board.key, verbose);
+    spinner.finish_and_clear();
+    report
+}
+
+/// The lines about a board's radio firmware: what each half runs, then a
+/// newer release when the feed has one.
+fn radio_lines(
+    radio: &RadioInfo,
+    verbose: bool,
+    feed: &mut RadioFeed,
+    over: Transport,
+) -> Vec<String> {
+    let mut lines = vec![radio_line(radio, verbose)];
+    if radio.left.is_some()
+        && let Some(latest) = feed.latest()
+        && let Some(offer) = radio_offer(radio, latest, over)
+    {
+        lines.push(offer);
+    }
+    lines
+}
+
+/// The line saying `latest` is newer than what the board runs, if it is.
+fn radio_offer(radio: &RadioInfo, latest: &Release, over: Transport) -> Option<String> {
+    let left = radio.left.as_ref()?;
+    let version = left.version.to_string();
+    let running = RunningRadio {
+        left_version: &version,
+        left_hash: &left.hash,
+        right_tag: radio.right.as_ref().map(|right| right.tag.as_slice()),
+    };
+    if !radio_offered(&running, &latest.version, None) {
+        return None;
+    }
+    Some(match over {
+        Transport::Usb => format!(
+            "Radio firmware {} available. Run `zapp update radio`.",
+            latest.version
+        ),
+        Transport::Bluetooth => format!(
+            "Radio firmware {} available. Connect the USB cable and run `zapp update radio`.",
+            latest.version
+        ),
+    })
+}
+
+/// Ask a wired board about itself, and say what it answered.
+///
+/// A board is preferred over the radio for its own state: plugged in, it can
+/// read both halves directly, and the Bluetooth view of a wired board is
+/// whatever the radio last carried. Firmware without the command simply never
+/// answers, so an empty result here is the normal old-firmware case and says
+/// nothing. Only the Wireless Voyager has a battery or pointing-device header to report
+/// on; the rest have neither, so there is nothing worth asking them.
+fn wired_report(device: &UsbDevice, verbose: bool) -> WiredReport {
+    if device.keyboard != Some(ids::Keyboard::WirelessVoyager) {
+        return WiredReport::default();
+    }
+    wired_report_from(usb_report(device, verbose, true, verbose), verbose)
+}
+
+/// The left half's unread freeze record notice, for a wired Wireless Voyager
+/// running its keyboard firmware. Silent for firmware without the command.
+fn wired_freeze_notice(device: &UsbDevice) -> Option<String> {
+    if device.keyboard != Some(ids::Keyboard::WirelessVoyager) || device.bootloader.is_some() {
+        return None;
+    }
+    let conn = zapp_core::hid::HidConnection::open(device.vid, device.pid).ok()?;
+    let notice = freeze::notice(&conn);
+    conn.close();
+    notice
+}
+
+/// What a Bluetooth board's charge-detail characteristic says, when the detail
+/// was asked for.
+///
+/// Only a connected board can be read at all, and only one whose firmware
+/// serves the characteristic answers; anything else says nothing, which is the
+/// same silence an old wired firmware gives.
+fn ble_charge_detail(board: &zapp_ble::BleBoard, verbose: bool) -> Option<ChargeDetail> {
+    if !verbose || board.presence != Presence::Connected {
+        return None;
+    }
+    zapp_ble::read_charge_detail(&board.key)
+}
+
+/// The lines under a Bluetooth board, out of the detail that was read.
+fn ble_report(detail: Option<&ChargeDetail>) -> Vec<String> {
+    let Some(detail) = detail else {
+        return Vec::new();
+    };
+
+    // A board on the radio is a board off the cable, so what it is heading for
+    // is empty. The radio read carries no VBUS flag either.
+    // The radio read carries no VBUS flag, so the halves' own rails and charger
+    // say which way the board is going.
+    let going = heading_for([
+        (&detail.left, detail.left_rails),
+        (&detail.right, detail.right_rails),
+    ]);
+    let mut lines: Vec<String> = detail.nav.iter().map(features_line).collect();
+    lines.extend(table(&[
+        detail_header(going),
+        detail_row("left", &detail.left, going, None, detail.left_rails),
+        detail_row("right", &detail.right, going, None, detail.right_rails),
+    ]));
+    lines
+}
+
+/// What the halves have left, and what each half's charger is doing when the
+/// detail was read.
+///
+/// A half the board does not publish is left out; one it publishes without a
+/// level is named and called unknown, because a half that is there and quiet is
+/// worth saying and a half that is not there is not.
+///
+/// The phase words this line the same way the wired summary is worded, off the
+/// same bits, so the two paths say the same thing for the same state. The radio
+/// read carries no VBUS flag and no source budget, so a half with no phase is
+/// only a level and a charge is never called fast or slow here.
+fn charge(battery: Battery, detail: Option<&ChargeDetail>) -> String {
+    let halves: Vec<String> = [
+        ("left", battery.left, detail.map(|detail| detail.left)),
+        ("right", battery.right, detail.map(|detail| detail.right)),
+    ]
+    .into_iter()
+    .filter(|(_, level, _)| !level.is_absent())
+    .map(|(half, level, detail)| {
+        let phase = detail
+            .and_then(|detail| detail.charger)
+            .and_then(|status| phase_as(status, None, None));
+        match phase {
+            Some(phase) => format!("{half} {} {phase}", said(level)),
+            None => format!("{half} {}", said(level)),
+        }
+    })
+    .collect();
+
+    match halves.is_empty() {
+        false => format!(" · {}", halves.join(" · ")),
+        // A board with one battery, which reports only the whole.
+        true => match battery.keyboard {
+            Level::Percent(level) => format!(" · {level}%"),
+            _ => String::new(),
+        },
+    }
+}
+
+fn said(level: Level) -> String {
+    match level {
+        Level::Percent(level) => format!("{level}%"),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// How reachable a bonded board is. A bonded entry whose address is one a board
+/// on the cable named is that board, so it is not out of range.
+fn state(presence: Presence, address: Option<&str>, on_usb: &[String]) -> &'static str {
+    match presence {
+        Presence::Connected => "connected",
+        Presence::Nearby => "in range",
+        Presence::Paired => {
+            match address.is_some_and(|address| on_usb.iter().any(|wired| wired == address)) {
+                true => "on USB, Bluetooth off",
+                false => "paired, not in range",
+            }
+        }
+    }
+}
+
+/// " · ignition 2.0.3 (fa2b805b6f)" for a Wireless Voyager sitting in Ignition, and
+/// nothing for anything else. Asked over the bridge's own vendor interface,
+/// so a bootloader another program has open falls back to its descriptor.
+fn bootloader_version(device: &UsbDevice) -> String {
+    if device.bootloader != Some(ids::BootloaderKind::IgnitionV2) {
+        return String::new();
+    }
+    let version = match UsbLink::open_bare() {
+        Ok(link) => zapp_update::wired::ignition_version(&mut Ignition::new(link)),
+        Err(err) => {
+            log::debug!("could not open ignition to ask its version: {err}");
+            match UsbLink::attached_bcd() {
+                Some(bcd) => format!("{} (from its descriptor)", bcd_version(bcd)),
+                None => return String::new(),
+            }
+        }
+    };
+    format!(" · ignition {version}")
+}
+
+fn cmd_flash_file(path: &PathBuf, force: bool, device: Option<&str>) -> Result<()> {
+    // A bundle carries both halves' wireless firmware and goes over the cable
+    // through the bootloader; everything else is a keyboard image for the
+    // STM32. Told apart by what the file says it is rather than by its name,
+    // so a renamed bundle still does the right thing instead of failing deep
+    // inside the DFU loader.
+    if is_bundle(path) {
+        let over = bundle_route()?;
+        let bundle = zapp_update::load_bundle(path)?;
+        let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or_default();
+        log::debug!("{} · {len} bytes", path.display());
+        return flash_bundle(&bundle, over, force, device);
+    }
+
+    if force {
+        // Said rather than ignored: a keyboard image is always written, so the
+        // flag is not doing anything here and silently accepting it would
+        // suggest otherwise.
+        println!("--force is ignored for a keyboard image.");
+    }
+
     let fw = firmware::load_firmware(path).context("Failed to load firmware")?;
-    print_firmware_info(&fw);
+
+    // A Wireless Voyager image can go either way, so it picks the way and says which
+    // one it picked; everything else is a wired update and has nothing to pick
+    // between.
+    if let Firmware::DfuBinary { data, pid, .. } = &fw
+        && is_wireless_voyager_image(*pid)
+    {
+        return flash_wireless_voyager_image(&fw, data, device);
+    }
+
+    print_firmware_info(&fw, Transport::Usb);
+
+    if device.is_some() {
+        println!("--device is ignored over the cable.");
+    }
     wait_and_flash(&fw)
+}
+
+/// Whether a DFU suffix names a Wireless Voyager, either revision.
+fn is_wireless_voyager_image(pid: u16) -> bool {
+    matches!(pid, 0x1978 | 0x0792)
+}
+
+/// A Wireless Voyager keyboard image, over whichever way the keyboard is reachable.
+///
+/// The cable whenever the Wireless Voyager is on it, Bluetooth only for a keyboard
+/// that is not plugged in at all. Over the cable `named` is ignored, as there
+/// is only ever one keyboard plugged in.
+fn flash_wireless_voyager_image(fw: &Firmware, data: &[u8], named: Option<&str>) -> Result<()> {
+    let over = route();
+    print_firmware_info(fw, over);
+    if over == Transport::Usb {
+        return wait_and_flash(fw);
+    }
+
+    let options = zapp_update::Options {
+        device: named.map(str::to_string),
+        ..zapp_update::Options::default()
+    };
+    let mut screen = Screen::default();
+    zapp_update::ble::flash_stm32(data, &options, &mut |event| screen.show(event))?;
+    Ok(())
+}
+
+/// Whether a .zsab bundle may go over Bluetooth. Off for now: a bundle needs
+/// the keyboard on the cable. The Bluetooth path stays in place behind this.
+const BLUETOOTH_BUNDLES: bool = false;
+
+/// A bundle, over the way `bundle_route` picked: the cable, or Bluetooth when
+/// `BLUETOOTH_BUNDLES` is on.
+///
+/// The cable wins whenever the Wireless Voyager is on it, whether it is already in its
+/// bootloader or still running its own firmware — the wired path waits for the
+/// bootloader and asks for the reset press. Bluetooth is for a keyboard that
+/// is not plugged in at all, not for one that is plugged in and simply has not
+/// been put in its bootloader yet: that one is a cable update the user is part
+/// way through, and sending it over the radio instead would be a surprise.
+///
+/// The model is what decides, not "some ZSA board is on USB": a user with an
+/// original Voyager on the cable and a Wireless Voyager on Bluetooth has to get
+/// the radio, or the update goes down a wire the bundle can never reach the
+/// board through and stops asking for a reset button that would not help.
+///
+/// With `BLUETOOTH_BUNDLES` off, a keyboard not on the cable is an error.
+///
+/// `named` picks between bonded boards over Bluetooth. The cable ignores it:
+/// there is only ever one keyboard plugged in.
+fn flash_bundle(
+    bundle: &zapp_update::Bundle,
+    over: Transport,
+    force: bool,
+    named: Option<&str>,
+) -> Result<()> {
+    match over {
+        Transport::Usb => nrf_wired::flash(bundle, force),
+        Transport::Bluetooth => zsab::update(bundle, force, named),
+    }
+}
+
+/// The way a bundle goes (see `flash_bundle`), or an error when it has none.
+fn bundle_route() -> Result<Transport> {
+    let over = route();
+    if over == Transport::Bluetooth && !BLUETOOTH_BUNDLES {
+        bail!("Connect the keyboard with the USB cable and connect both halves with their cable.");
+    }
+    Ok(over)
+}
+
+/// The `flash` argument that names the latest radio firmware.
+/// Downloads the latest radio firmware and flashes it as a bundle.
+fn cmd_update_radio(force: bool) -> Result<()> {
+    let over = bundle_route()?;
+    let client = zapp_update::cloud::client(concat!("zapp/", env!("CARGO_PKG_VERSION")))?;
+    let spinner = new_spinner("Checking for radio firmware...");
+    let release = zapp_update::cloud::check_radio(&client, None);
+    spinner.finish_and_clear();
+    let release = release?.context("The update server has no radio firmware release.")?;
+
+    println!("Radio firmware {}", release.version);
+    if let Some(notes) = release.notes() {
+        println!();
+        println!("{notes}");
+        println!();
+    }
+
+    let spinner = new_spinner(&format!("Downloading radio firmware {}...", release.version));
+    let radio = zapp_update::cloud::download_radio(&client, release);
+    spinner.finish_and_clear();
+    let radio = radio?;
+    flash_bundle(&radio.bundle, over, force, None)
+}
+
+/// Whether the file leads with the .zsab magic.
+fn is_bundle(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok_and(|()| &magic == b"ZSAB")
 }
 
 /// Download a revision's firmware, showing a spinner while it transfers.
@@ -95,7 +812,7 @@ fn cmd_flash_url(url: &str) -> Result<()> {
     };
 
     let fw = download_firmware(&revision, variant)?;
-    print_firmware_info(&fw);
+    print_firmware_info(&fw, Transport::Usb);
     wait_and_flash(&fw)
 }
 
@@ -105,15 +822,11 @@ fn cmd_update() -> Result<()> {
 
     // Parse serial number as "layoutId/revisionId"
     let Some((layout_id, revision_id)) = connected.serial.split_once('/') else {
-        bail!(
-            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
-        );
+        bail!("The keyboard is not running an Oryx firmware.");
     };
 
     if layout_id.is_empty() || revision_id.is_empty() {
-        bail!(
-            "Updates only work if your keyboard is currently flashed with a firmware coming from Oryx."
-        );
+        bail!("The keyboard is not running an Oryx firmware.");
     }
 
     println!("Layout: {layout_id}, revision: {revision_id}");
@@ -139,7 +852,7 @@ fn cmd_update() -> Result<()> {
     };
 
     let fw = download_firmware(&latest, variant)?;
-    print_firmware_info(&fw);
+    print_firmware_info(&fw, Transport::Usb);
     wait_and_flash(&fw)
 }
 
@@ -159,7 +872,7 @@ fn print_revision_note(label: &str, layout_id: &str, revision_id: &str, geometry
     println!("  {label:<7} {revision_id}: {note}");
 }
 
-fn print_firmware_info(fw: &Firmware) {
+fn print_firmware_info(fw: &Firmware, over: Transport) {
     let desc = match fw {
         Firmware::DfuBinary { data, pid, .. } => {
             format!("{} ({} bytes)", target_name_for_pid(*pid), data.len())
@@ -177,10 +890,10 @@ fn print_firmware_info(fw: &Firmware) {
             format!("Ergodox EZ ({} bytes)", data.len())
         }
     };
-    println!("Firmware loaded: {desc}");
+    println!("Firmware loaded: {desc} flashing over {}", over.label());
 }
 
-fn new_spinner(msg: &str) -> ProgressBar {
+pub(crate) fn new_spinner(msg: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -191,6 +904,28 @@ fn new_spinner(msg: &str) -> ProgressBar {
     spinner.set_message(msg.to_string());
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
     spinner
+}
+
+/// The one bar every flash draws, so a bundle's two halves and a keyboard image
+/// look like the same program.
+///
+/// `total` is what the position is measured against; every caller counts in
+/// percent. `prefix` names the half on a bundle's two bars, padded so they line
+/// up under each other, and is empty for a lone image.
+pub(crate) fn flash_bar(total: u64, prefix: &str) -> ProgressBar {
+    let bar = ProgressBar::new(total);
+    let template = match prefix.is_empty() {
+        true => "⚡ {bar:40.cyan/blue} {pos}% {msg}",
+        false => "⚡ {prefix:<5} {bar:40.cyan/blue} {pos}% {msg}",
+    };
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template(template)
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+    bar.set_prefix(prefix.to_string());
+    bar
 }
 
 fn wait_and_flash(fw: &Firmware) -> Result<()> {
@@ -204,13 +939,7 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
     })
     .context("Failed to detect bootloader")?;
 
-    let pb = ProgressBar::new(100);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("⚡ {bar:40.cyan/blue} {pos}% {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
+    let pb = flash_bar(100, "");
 
     flash::flash_device(&device, fw, &|progress| match progress {
         FlashProgress::Erasing {
@@ -240,4 +969,1201 @@ fn wait_and_flash(fw: &Firmware) -> Result<()> {
     .context("Flash failed")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zapp_core::hid::{
+        BatteryDetail, BatteryReading, BleIdentity, ChargeIssue, ChargeTelemetry, ChargerFault,
+        ChargerStatus, Charging, EsbLink, HalfDetail, Nav, NavReport, PmicRails, PmicRailsReport,
+        Source, VbusInStatus,
+    };
+
+    #[test]
+    fn host_slots_are_counted_from_one() {
+        let slot = |slot: u8, paired: bool, connected: bool, address: Option<&str>| HostSlot {
+            slot,
+            slot_count: 5,
+            paired,
+            connected,
+            address: address.map(str::to_string),
+            random: true,
+        };
+        let slots = [
+            slot(0, true, true, Some("C4:12:9A:33:0E:7B")),
+            slot(1, true, false, Some("E8:51:06:BF:22:91")),
+            slot(2, false, false, Some("F0:7D:4C:18:A6:05")),
+            slot(3, true, false, None),
+        ];
+        assert_eq!(
+            host_slot_lines(&slots),
+            [
+                "slot 1: C4:12:9A:33:0E:7B  paired, connected",
+                "slot 2: E8:51:06:BF:22:91  paired",
+                "slot 3: F0:7D:4C:18:A6:05  free",
+                "slot 4: unknown",
+            ]
+        );
+        assert!(host_slot_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn both_halves_of_a_split_board_are_named() {
+        let battery = Battery {
+            left: Level::Percent(0),
+            right: Level::Percent(27),
+            keyboard: Level::Percent(0),
+        };
+        assert_eq!(charge(battery, None), " · left 0% · right 27%");
+    }
+
+    #[test]
+    fn a_half_that_is_there_and_would_not_say_is_called_unknown() {
+        let battery = Battery {
+            left: Level::Percent(36),
+            right: Level::Unknown,
+            keyboard: Level::Percent(36),
+        };
+        assert_eq!(charge(battery, None), " · left 36% · right unknown");
+    }
+
+    #[test]
+    fn a_half_the_board_does_not_have_is_left_out() {
+        // Not the same as one that would not say: naming it would invent a half.
+        let battery = Battery {
+            left: Level::Percent(36),
+            right: Level::Absent,
+            keyboard: Level::Percent(36),
+        };
+        assert_eq!(charge(battery, None), " · left 36%");
+    }
+
+    #[test]
+    fn a_board_with_one_battery_reports_the_whole() {
+        let battery = Battery {
+            keyboard: Level::Percent(80),
+            ..Battery::default()
+        };
+        assert_eq!(charge(battery, None), " · 80%");
+    }
+
+    fn reading(level: Option<u8>, source: Source) -> BatteryReading {
+        BatteryReading {
+            level,
+            charging: Some(false),
+            usb: Some(false),
+            source: Some(source),
+        }
+    }
+
+    fn charging_reading(level: Option<u8>, source: Source) -> BatteryReading {
+        BatteryReading {
+            charging: Some(true),
+            ..reading(level, source)
+        }
+    }
+
+    #[test]
+    fn a_wired_board_says_what_each_half_is_doing() {
+        let telemetry = Telemetry {
+            version: 1,
+            left: reading(Some(87), Source::Nrf),
+            right: charging_reading(Some(64), Source::Wired),
+            nav_build: Some(Nav {
+                trackball: true,
+                trackpad: false,
+            }),
+            nav_left: Some(Nav::default()),
+            nav_right: Some(Nav {
+                trackball: true,
+                trackpad: false,
+            }),
+            nav_bus: Some(Nav::default()),
+            trrs: None,
+            esb_link: None,
+            charge_issue: None,
+            charging: Charging {
+                budget_ma: Some(1500),
+                ..Charging::default()
+            },
+            ble: None,
+        };
+        // Firmware that answers no detail at all, so the summary's own
+        // charging flag words the board's line.
+        assert_eq!(
+            wired_charge(&telemetry, None),
+            " · left 87% · right 64% fast charging"
+        );
+        // The board named no Bluetooth identity, so nothing is said about one.
+        assert_eq!(
+            describe_telemetry(&telemetry),
+            vec!["features · Trackball (connected, right), Trackpad (not supported)"]
+        );
+    }
+
+    #[test]
+    fn a_wired_board_says_which_bluetooth_identity_it_is_on() {
+        let telemetry = Telemetry {
+            version: 1,
+            ble: Some(BleIdentity {
+                address: "FE:DB:E9:A8:B1:36".into(),
+                random: true,
+                slot: 2,
+                slot_count: 6,
+            }),
+            ..Telemetry::default()
+        };
+        // Above the features, and the address alone: the slot the board named
+        // is not printed.
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "bluetooth · FE:DB:E9:A8:B1:36"
+        );
+    }
+
+    #[test]
+    fn a_wired_board_says_whether_the_halves_are_cabled() {
+        let mut telemetry = Telemetry {
+            version: 1,
+            trrs: Some(true),
+            ..Telemetry::default()
+        };
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "halves   · cable plugged"
+        );
+
+        telemetry.trrs = Some(false);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "halves   · cable unplugged"
+        );
+
+        // Unknown, or a firmware from before the field: no line.
+        telemetry.trrs = None;
+        assert_eq!(describe_telemetry(&telemetry).len(), 1);
+    }
+
+    #[test]
+    fn the_cable_hides_the_radio() {
+        // The right half stops the radio with the cable plugged.
+        for link in [
+            None,
+            Some(EsbLink::Linked),
+            Some(EsbLink::Absent),
+            Some(EsbLink::Mismatch),
+        ] {
+            let telemetry = Telemetry {
+                trrs: Some(true),
+                esb_link: link,
+                ..Telemetry::default()
+            };
+            assert_eq!(
+                halves_line(&telemetry).as_deref(),
+                Some("halves   · cable plugged")
+            );
+        }
+    }
+
+    #[test]
+    fn halves_off_the_cable_say_how_the_radio_is() {
+        let line = |trrs, esb_link| {
+            halves_line(&Telemetry {
+                trrs,
+                esb_link,
+                ..Telemetry::default()
+            })
+        };
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Linked)).as_deref(),
+            Some("halves   · cable unplugged, radio linked")
+        );
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Absent)).as_deref(),
+            Some("halves   · cable unplugged, radio not linked")
+        );
+        assert_eq!(
+            line(Some(false), Some(EsbLink::Mismatch)).as_deref(),
+            Some("halves   · cable unplugged, radio key mismatch")
+        );
+        assert_eq!(
+            line(Some(false), None).as_deref(),
+            Some("halves   · cable unplugged")
+        );
+        // Cable state unknown: the radio alone.
+        assert_eq!(
+            line(None, Some(EsbLink::Linked)).as_deref(),
+            Some("halves   · radio linked")
+        );
+        assert_eq!(
+            line(None, Some(EsbLink::Absent)).as_deref(),
+            Some("halves   · radio not linked")
+        );
+        assert_eq!(
+            line(None, Some(EsbLink::Mismatch)).as_deref(),
+            Some("halves   · radio key mismatch")
+        );
+        // Neither known, or a firmware from before both fields: no line.
+        assert_eq!(line(None, None), None);
+    }
+
+    #[test]
+    fn a_wired_board_puts_the_halves_line_after_the_identity() {
+        let telemetry = Telemetry {
+            ble: Some(BleIdentity {
+                address: "FE:DB:E9:A8:B1:36".into(),
+                random: true,
+                slot: 0,
+                slot_count: 6,
+            }),
+            trrs: Some(false),
+            esb_link: Some(EsbLink::Linked),
+            ..Telemetry::default()
+        };
+        let lines = describe_telemetry(&telemetry);
+        assert_eq!(lines[1], "halves   · cable unplugged, radio linked");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn a_board_that_named_no_slot_gives_the_same_line() {
+        let telemetry = Telemetry {
+            version: 1,
+            ble: Some(BleIdentity {
+                address: "FE:DB:E9:A8:B1:36".into(),
+                random: false,
+                slot: 0,
+                slot_count: 0,
+            }),
+            ..Telemetry::default()
+        };
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "bluetooth · FE:DB:E9:A8:B1:36"
+        );
+    }
+
+    #[test]
+    fn a_detail_read_words_the_summary_line() {
+        // The flag says both halves are charging; the phase says one of them
+        // finished and the other is only trickling.
+        let telemetry = Telemetry {
+            version: 1,
+            left: charging_reading(Some(57), Source::Nrf),
+            right: charging_reading(Some(99), Source::Wired),
+            charging: Charging {
+                budget_ma: Some(1500),
+                ..Charging::default()
+            },
+            ..Telemetry::default()
+        };
+        let detail = ChargeTelemetry {
+            version: 1,
+            left: half_in(0x01 | 0x04),
+            right: half_in(0x01 | 0x02),
+            ..ChargeTelemetry::default()
+        };
+
+        assert_eq!(
+            wired_charge(&telemetry, Some(&detail)),
+            " · left 57% trickle charging · right 99% full"
+        );
+    }
+
+    #[test]
+    fn a_half_holding_at_voltage_is_topping_up_rather_than_charging_fast() {
+        let telemetry = Telemetry {
+            version: 1,
+            left: charging_reading(Some(99), Source::Nrf),
+            right: charging_reading(Some(56), Source::Wired),
+            charging: Charging {
+                budget_ma: Some(1500),
+                ..Charging::default()
+            },
+            ..Telemetry::default()
+        };
+        let detail = ChargeTelemetry {
+            version: 1,
+            left: half_in(0x01 | 0x10),
+            right: half_in(0x01 | 0x08),
+        };
+
+        assert_eq!(
+            wired_charge(&telemetry, Some(&detail)),
+            " · left 99% topping up · right 56% fast charging"
+        );
+    }
+
+    #[test]
+    fn unstable_charging_on_the_port_goes_on_the_board_line() {
+        let mut telemetry = Telemetry {
+            version: 1,
+            left: charging_reading(Some(57), Source::Nrf),
+            right: reading(Some(64), Source::Wired),
+            charge_issue: Some(ChargeIssue::Reduced),
+            ..Telemetry::default()
+        };
+        let unstable = " · left 57% charging · right 64% · charging unstable on this USB port, try another port";
+        assert_eq!(wired_charge(&telemetry, None), unstable);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "usb      · charging power lowered"
+        );
+
+        telemetry.charge_issue = Some(ChargeIssue::AtFloor);
+        assert_eq!(wired_charge(&telemetry, None), unstable);
+        assert_eq!(
+            describe_telemetry(&telemetry)[0],
+            "usb      · at lowest charging power"
+        );
+
+        // No issue, a value this host has no name for, or a firmware from
+        // before the field: nothing said.
+        for issue in [Some(ChargeIssue::None), Some(ChargeIssue::Other(3)), None] {
+            telemetry.charge_issue = issue;
+            assert_eq!(
+                wired_charge(&telemetry, None),
+                " · left 57% charging · right 64%"
+            );
+            assert_eq!(describe_telemetry(&telemetry).len(), 1);
+        }
+    }
+
+    /// One half's charge detail, with its charger reading `raw`.
+    fn ble_half(raw: u8) -> BatteryDetail {
+        BatteryDetail {
+            charger: Some(ChargerStatus::from_bits(raw)),
+            ..BatteryDetail::default()
+        }
+    }
+
+    #[test]
+    fn a_bluetooth_summary_says_what_the_detail_read_said() {
+        let battery = Battery {
+            left: Level::Percent(99),
+            right: Level::Percent(54),
+            keyboard: Level::Percent(54),
+        };
+        let detail = ChargeDetail {
+            left: ble_half(0x01 | 0x02),
+            right: ble_half(0x01 | 0x08),
+            ..ChargeDetail::default()
+        };
+        // The same words the cable gives for the same bits. The radio carries
+        // no source budget, so a charge is neither fast nor slow here.
+        assert_eq!(
+            charge(battery, Some(&detail)),
+            " · left 99% full · right 54% charging"
+        );
+
+        let topping = ChargeDetail {
+            left: ble_half(0x01 | 0x10),
+            right: ble_half(0x01 | 0x04),
+            ..ChargeDetail::default()
+        };
+        assert_eq!(
+            charge(battery, Some(&topping)),
+            " · left 99% topping up · right 54% trickle charging"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_half_on_battery_is_only_a_level() {
+        let battery = Battery {
+            left: Level::Percent(99),
+            right: Level::Percent(54),
+            keyboard: Level::Percent(54),
+        };
+        // No phase and no VBUS flag on the radio: nothing to say about a
+        // charger, and a half the read did not reach is left as it was.
+        let detail = ChargeDetail {
+            left: ble_half(0x01),
+            right: BatteryDetail::default(),
+            ..ChargeDetail::default()
+        };
+        assert_eq!(charge(battery, Some(&detail)), " · left 99% · right 54%");
+
+        // And with no detail read at all the line is the level alone.
+        assert_eq!(charge(battery, None), " · left 99% · right 54%");
+    }
+
+    /// One half whose charger reads `raw`, on USB.
+    fn half_in(raw: u8) -> HalfDetail {
+        HalfDetail {
+            source: Some(Source::Nrf),
+            detail: BatteryDetail {
+                charger: Some(ChargerStatus::from_bits(raw)),
+                ..BatteryDetail::default()
+            },
+        }
+    }
+
+    /// One half on USB, read at `level`.
+    fn on_usb(level: u8) -> BatteryReading {
+        BatteryReading {
+            usb: Some(true),
+            ..charging_reading(Some(level), Source::Nrf)
+        }
+    }
+
+    #[test]
+    fn the_phase_words_each_half_of_the_summary() {
+        let said = |raw: u8, speed| read_in_phase(on_usb(57), ChargerStatus::from_bits(raw), speed);
+
+        assert_eq!(said(0x01 | 0x02, Some("fast")), "57% full");
+        assert_eq!(said(0x01 | 0x08, Some("fast")), "57% fast charging");
+        assert_eq!(said(0x01 | 0x08, Some("slow")), "57% slow charging");
+        assert_eq!(said(0x01 | 0x08, None), "57% charging");
+        // The tail of the charge is never fast, whatever the source offered.
+        assert_eq!(said(0x01 | 0x10, Some("fast")), "57% topping up");
+        assert_eq!(said(0x01 | 0x10, None), "57% topping up");
+        // A trickle is never fast, whatever the source offered.
+        assert_eq!(said(0x01 | 0x04, Some("fast")), "57% trickle charging");
+        assert_eq!(said(0x01 | 0x20, Some("fast")), "57% charging");
+        assert_eq!(said(0x01 | 0x40, Some("fast")), "57% charging paused (hot)");
+        assert_eq!(said(0x00, Some("fast")), "57% no battery detected");
+        assert_eq!(said(0x01, Some("fast")), "57% not charging");
+    }
+
+    #[test]
+    fn a_half_off_the_cable_is_only_a_level() {
+        // Nothing is filling it, so no charger word belongs on the line, and
+        // the no-cell bit means nothing off a source.
+        let idle = ChargerStatus::from_bits(0x00);
+        for usb in [Some(false), None] {
+            let reading = BatteryReading { usb, ..on_usb(57) };
+            assert_eq!(read_in_phase(reading, idle, Some("fast")), "57%");
+        }
+    }
+
+    #[test]
+    fn only_a_high_power_source_charges_fast() {
+        // The port's declared capacity decides this, and a source that never
+        // said what it is decides nothing.
+        assert_eq!(charge_speed(Some(1500)), Some("fast"));
+        assert_eq!(charge_speed(Some(500)), Some("slow"));
+        assert_eq!(charge_speed(Some(0)), None);
+        assert_eq!(charge_speed(None), None);
+    }
+
+    #[test]
+    fn a_level_that_was_not_read_is_not_a_flat_one() {
+        assert_eq!(read_as(reading(None, Source::Wired), None), "unknown");
+        assert_eq!(read_as(reading(Some(0), Source::Wired), None), "0%");
+    }
+
+    #[test]
+    fn unknown_flags_do_not_become_a_confident_no() {
+        let unsure = BatteryReading {
+            level: Some(50),
+            charging: None,
+            usb: None,
+            source: Some(Source::Nrf),
+        };
+        assert_eq!(read_as(unsure, None), "50%");
+        // A speed says nothing about a half that is not charging.
+        assert_eq!(read_as(unsure, Some("fast")), "50%");
+
+        let charging = BatteryReading {
+            charging: Some(true),
+            ..unsure
+        };
+        assert_eq!(read_as(charging, None), "50% charging");
+        assert_eq!(read_as(charging, Some("fast")), "50% fast charging");
+    }
+
+    const NONE: Option<Nav> = Some(Nav {
+        trackball: false,
+        trackpad: false,
+    });
+    const BALL: Option<Nav> = Some(Nav {
+        trackball: true,
+        trackpad: false,
+    });
+    const PAD: Option<Nav> = Some(Nav {
+        trackball: false,
+        trackpad: true,
+    });
+    const BOTH: Option<Nav> = Some(Nav {
+        trackball: true,
+        trackpad: true,
+    });
+    const UNKNOWN: Option<Nav> = None;
+
+    /// Scenario, left, right, bus, and the features line it gives.
+    type Case = (&'static str, Option<Nav>, Option<Nav>, Option<Nav>, &'static str);
+
+    fn nav(build: Option<Nav>, left: Option<Nav>, right: Option<Nav>, bus: Option<Nav>) -> NavReport {
+        NavReport {
+            build,
+            left,
+            right,
+            bus,
+        }
+    }
+
+    #[test]
+    fn each_pointing_device_says_whether_and_where_it_is_connected() {
+        // A build with both devices.
+        let modes: [Case; 15] = [
+            // Cable plugged: no side, the bus says what is there.
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (disconnected)"),
+            ("plugged, ball", UNKNOWN, UNKNOWN, BALL, "Trackball (connected), Trackpad (disconnected)"),
+            ("plugged, pad", UNKNOWN, UNKNOWN, PAD, "Trackball (disconnected), Trackpad (connected)"),
+            ("plugged, both", UNKNOWN, UNKNOWN, BOTH, "Trackball (connected), Trackpad (connected)"),
+            ("plugged, unknown", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (unknown)"),
+            // Cable unplugged: per side, bus empty.
+            ("unplugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (disconnected)"),
+            ("ball left", BALL, NONE, NONE, "Trackball (connected, left), Trackpad (disconnected)"),
+            ("ball right", NONE, BALL, NONE, "Trackball (connected, right), Trackpad (disconnected)"),
+            ("pad left", PAD, NONE, NONE, "Trackball (disconnected), Trackpad (connected, left)"),
+            ("pad right", NONE, PAD, NONE, "Trackball (disconnected), Trackpad (connected, right)"),
+            ("ball left, pad right", BALL, PAD, NONE, "Trackball (connected, left), Trackpad (connected, right)"),
+            ("pad left, ball right", PAD, BALL, NONE, "Trackball (connected, right), Trackpad (connected, left)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (unknown), Trackpad (unknown)"),
+            ("right unknown, ball left", BALL, UNKNOWN, NONE, "Trackball (connected, left), Trackpad (unknown)"),
+            // Firmware without the bus field: unplugged reads per side, plugged
+            // sent unknown for both halves.
+            ("old, ball right", NONE, BALL, UNKNOWN, "Trackball (connected, right), Trackpad (disconnected)"),
+        ];
+        for (scenario, left, right, bus, want) in modes {
+            assert_eq!(features(&nav(BOTH, left, right, bus)), want, "{scenario}");
+        }
+
+        // The build decides first, whatever the halves say.
+        for (scenario, left, right, bus, _) in modes {
+            assert_eq!(
+                features(&nav(NONE, left, right, bus)),
+                "Trackball (not supported), Trackpad (not supported)",
+                "no devices, {scenario}"
+            );
+            assert_eq!(
+                features(&nav(UNKNOWN, left, right, bus)),
+                "Trackball (unknown), Trackpad (unknown)",
+                "build unknown, {scenario}"
+            );
+        }
+
+        // A trackball-only build: the pad is not supported, the ball as above.
+        let ball_build: [Case; 7] = [
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (disconnected), Trackpad (not supported)"),
+            ("plugged, ball", UNKNOWN, UNKNOWN, BALL, "Trackball (connected), Trackpad (not supported)"),
+            ("plugged, unknown", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (not supported)"),
+            ("ball left", BALL, NONE, NONE, "Trackball (connected, left), Trackpad (not supported)"),
+            ("ball right", NONE, BALL, NONE, "Trackball (connected, right), Trackpad (not supported)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (unknown), Trackpad (not supported)"),
+            ("old, plugged", UNKNOWN, UNKNOWN, UNKNOWN, "Trackball (unknown), Trackpad (not supported)"),
+        ];
+        for (scenario, left, right, bus, want) in ball_build {
+            assert_eq!(features(&nav(BALL, left, right, bus)), want, "{scenario}");
+        }
+
+        // A trackpad-only build.
+        let pad_build: [Case; 6] = [
+            ("plugged, nothing", NONE, NONE, NONE, "Trackball (not supported), Trackpad (disconnected)"),
+            ("plugged, pad", UNKNOWN, UNKNOWN, PAD, "Trackball (not supported), Trackpad (connected)"),
+            ("pad left", PAD, NONE, NONE, "Trackball (not supported), Trackpad (connected, left)"),
+            ("pad right", NONE, PAD, NONE, "Trackball (not supported), Trackpad (connected, right)"),
+            ("right unknown, left nothing", NONE, UNKNOWN, NONE, "Trackball (not supported), Trackpad (unknown)"),
+            ("old, pad left", PAD, NONE, UNKNOWN, "Trackball (not supported), Trackpad (connected, left)"),
+        ];
+        for (scenario, left, right, bus, want) in pad_build {
+            assert_eq!(features(&nav(PAD, left, right, bus)), want, "{scenario}");
+        }
+
+        // Both halves report the same device: the sides win over the bus.
+        assert_eq!(
+            features(&nav(BOTH, BALL, BALL, BALL)),
+            "Trackball (connected, left and right), Trackpad (disconnected)"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_board_prints_the_features_line_when_it_sent_one() {
+        let without = ChargeDetail::default();
+        assert!(!ble_report(Some(&without))
+            .iter()
+            .any(|line| line.starts_with("features")));
+
+        let with = ChargeDetail {
+            nav: Some(nav(BOTH, PAD, BALL, NONE)),
+            ..ChargeDetail::default()
+        };
+        let lines = ble_report(Some(&with));
+        assert_eq!(
+            lines[0],
+            "features · Trackball (connected, right), Trackpad (connected, left)"
+        );
+        assert_eq!(&lines[1..], &ble_report(Some(&without))[..]);
+    }
+
+    #[test]
+    fn a_bonded_entry_that_is_the_board_on_the_cable_is_not_out_of_range() {
+        let on_usb = vec!["C6:14:15:90:63:EC".to_string()];
+
+        assert_eq!(
+            state(Presence::Paired, Some("C6:14:15:90:63:EC"), &on_usb),
+            "on USB, Bluetooth off"
+        );
+        // Another bonded board, and one whose handle spells out no address.
+        assert_eq!(
+            state(Presence::Paired, Some("FE:DB:E9:A8:B1:36"), &on_usb),
+            "paired, not in range"
+        );
+        assert_eq!(
+            state(Presence::Paired, None, &on_usb),
+            "paired, not in range"
+        );
+        // Nothing on the cable named an identity.
+        assert_eq!(
+            state(Presence::Paired, Some("C6:14:15:90:63:EC"), &[]),
+            "paired, not in range"
+        );
+    }
+
+    #[test]
+    fn a_reachable_board_is_worded_the_same_whatever_is_on_the_cable() {
+        let on_usb = vec!["C6:14:15:90:63:EC".to_string()];
+        for presence in [Presence::Connected, Presence::Nearby] {
+            assert_eq!(
+                state(presence, Some("C6:14:15:90:63:EC"), &on_usb),
+                state(presence, Some("C6:14:15:90:63:EC"), &[])
+            );
+        }
+        assert_eq!(state(Presence::Connected, None, &on_usb), "connected");
+        assert_eq!(state(Presence::Nearby, None, &on_usb), "in range");
+    }
+
+    #[test]
+    fn a_board_that_is_not_a_wireless_voyager_is_never_asked_for_telemetry() {
+        // The original Voyager has no battery and no nav header at all, so
+        // there is nothing to report and nothing worth asking it for.
+        let device = UsbDevice {
+            keyboard: Some(ids::Keyboard::Voyager),
+            bootloader: None,
+            serial: None,
+            vid: 0,
+            pid: 0,
+        };
+        assert_eq!(wired_report(&device, true), WiredReport::default());
+    }
+
+    #[test]
+    fn a_board_with_nothing_to_report_keeps_its_single_line() {
+        // Nothing to append and nothing to print under it, so the board keeps
+        // the one line `describe_usb` gives it, verbose or not.
+        let report = WiredReport::default();
+        assert_eq!(report.charge, "");
+        assert!(report.lines.is_empty());
+        assert_eq!(report.ble_address, None);
+    }
+
+    /// One half filling on the cable, with nothing latched.
+    fn filling(voltage_mv: u16, current_ma: i16, temp_cdeg: i16, ttf_min: u16) -> BatteryDetail {
+        BatteryDetail {
+            voltage_mv: Some(voltage_mv),
+            current_ma: Some(current_ma),
+            temp_cdeg: Some(temp_cdeg),
+            tte_min: None,
+            ttf_min: Some(ttf_min),
+            charger: Some(ChargerStatus::from_bits(0x01 | 0x08)),
+            fault: Some(ChargerFault::default()),
+        }
+    }
+
+    #[test]
+    fn a_wired_board_lays_the_two_halves_out_under_headings() {
+        let telemetry = ChargeTelemetry {
+            version: 1,
+            left: HalfDetail {
+                source: Some(Source::Nrf),
+                detail: filling(4020, 512, 2850, 80),
+            },
+            right: HalfDetail {
+                source: Some(Source::Wired),
+                detail: filling(3980, 298, 2790, 125),
+            },
+        };
+        let summary = Telemetry {
+            charging: Charging {
+                budget_ma: Some(1500),
+                input_limit_ma: Some(700),
+                charge_current_ma: Some(550),
+                state: None,
+            },
+            ..Telemetry::default()
+        };
+
+        // The rates the summary carries are decoded and not printed. No rails
+        // were read, so both rail columns are n/a for want of a measurement.
+        assert_eq!(
+            describe_charge(&summary, &telemetry, None),
+            vec![
+                "       cell    current  temp     VBUS  VSYS  full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  n/a   n/a   1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  n/a   n/a   2 h 05 min  constant current  none",
+            ]
+        );
+    }
+
+    /// Both halves filling on the cable, as the two per-half reads see them.
+    fn wired_pair() -> (Telemetry, ChargeTelemetry) {
+        let telemetry = ChargeTelemetry {
+            version: 1,
+            left: HalfDetail {
+                source: Some(Source::Nrf),
+                detail: filling(4020, 512, 2850, 80),
+            },
+            right: HalfDetail {
+                source: Some(Source::Wired),
+                detail: filling(3980, 298, 2790, 125),
+            },
+        };
+        let summary = Telemetry {
+            charging: Charging {
+                budget_ma: Some(1500),
+                ..Charging::default()
+            },
+            ..Telemetry::default()
+        };
+        (summary, telemetry)
+    }
+
+    /// One half's rails on a cable. The flags come off the wire with the two
+    /// rails and are not printed.
+    fn rails() -> PmicRails {
+        PmicRails {
+            vbus_mv: 5030,
+            vsys_mv: 4960,
+            vbusin: VbusInStatus::from_bits(0x21),
+            charger_enabled: Some(true),
+            boost_off: Some(false),
+            charge_reduced: true,
+        }
+    }
+
+    #[test]
+    fn a_wired_board_puts_each_half_s_rails_in_its_own_row() {
+        let (summary, telemetry) = wired_pair();
+        let report = PmicRailsReport {
+            version: 1,
+            left: Some(PmicRails {
+                vbus_mv: 4620,
+                vsys_mv: 4550,
+                ..rails()
+            }),
+            right: Some(PmicRails {
+                vbus_mv: 4580,
+                vsys_mv: 4510,
+                vbusin: VbusInStatus::from_bits(0x01),
+                ..rails()
+            }),
+        };
+
+        assert_eq!(
+            describe_charge(&summary, &telemetry, Some(report)),
+            vec![
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  4.62 V  4.55 V  1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  4.58 V  4.51 V  2 h 05 min  constant current  none",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_half_with_no_rails_has_n_a_in_both_rail_columns() {
+        // An older firmware answers the rails command with nothing for a half,
+        // and that half's two rail columns say so rather than dropping out.
+        let (summary, telemetry) = wired_pair();
+        let report = PmicRailsReport {
+            version: 1,
+            left: None,
+            right: Some(PmicRails {
+                vbus_mv: 4580,
+                vsys_mv: 4510,
+                vbusin: VbusInStatus::from_bits(0x01),
+                ..rails()
+            }),
+        };
+
+        assert_eq!(
+            describe_charge(&summary, &telemetry, Some(report)),
+            vec![
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.02 V  +512 mA  28.5 °C  n/a     n/a     1 h 20 min  constant current  none",
+                "right  3.98 V  +298 mA  27.9 °C  4.58 V  4.51 V  2 h 05 min  constant current  none",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_board_on_the_cable_counts_down_to_full() {
+        // One half finished and one still filling: the column is headed once
+        // for the board, and the finished half has no time to name.
+        let (summary, mut telemetry) = wired_pair();
+        telemetry.left.detail = BatteryDetail {
+            voltage_mv: Some(4170),
+            current_ma: Some(0),
+            temp_cdeg: Some(3440),
+            ttf_min: None,
+            charger: Some(ChargerStatus::from_bits(0x01 | 0x02)),
+            ..filling(4170, 0, 3440, 0)
+        };
+        telemetry.right.detail = filling(3990, 161, 3620, 386);
+        let report = PmicRailsReport {
+            version: 1,
+            left: Some(rails()),
+            right: Some(PmicRails {
+                vbus_mv: 4680,
+                vsys_mv: 4680,
+                vbusin: VbusInStatus::from_bits(0x01),
+                ..rails()
+            }),
+        };
+
+        assert_eq!(
+            describe_charge(&summary, &telemetry, Some(report)),
+            vec![
+                "       cell    current  temp     VBUS    VSYS    full in     charger           fault",
+                "left   4.17 V  +0 mA    34.4 °C  5.03 V  4.96 V  n/a         charge complete   none",
+                "right  3.99 V  +161 mA  36.2 °C  4.68 V  4.68 V  6 h 26 min  constant current  none",
+            ]
+        );
+    }
+
+    /// One half running down on battery, with nothing latched.
+    fn running_down(voltage_mv: u16, current_ma: i16, temp_cdeg: i16, tte_min: u16) -> BatteryDetail {
+        BatteryDetail {
+            voltage_mv: Some(voltage_mv),
+            current_ma: Some(current_ma),
+            temp_cdeg: Some(temp_cdeg),
+            tte_min: Some(tte_min),
+            ttf_min: None,
+            charger: Some(ChargerStatus::from_bits(0x01)),
+            fault: Some(ChargerFault::default()),
+        }
+    }
+
+    /// One half's rails on battery: nothing attached, so the input rail reads
+    /// zero because there is no input.
+    fn off_a_source(vsys_mv: u16) -> PmicRails {
+        PmicRails {
+            vbus_mv: 0,
+            vsys_mv,
+            vbusin: VbusInStatus::from_bits(0x00),
+            charger_enabled: Some(false),
+            ..rails()
+        }
+    }
+
+    #[test]
+    fn a_board_on_battery_counts_down_to_empty() {
+        // No half on a source and no charger phase anywhere: the column is
+        // headed the other way, and the input rail is n/a on both rows.
+        let detail = ChargeDetail {
+            left: running_down(4140, -40, 3120, 369),
+            right: running_down(3880, -31, 3050, 130),
+            left_rails: Some(off_a_source(4140)),
+            right_rails: Some(off_a_source(3880)),
+            nav: None,
+        };
+
+        assert_eq!(
+            ble_report(Some(&detail)),
+            vec![
+                "       cell    current  temp     VBUS  VSYS    empty in    charger       fault",
+                "left   4.14 V  -40 mA   31.2 °C  n/a   4.14 V  6 h 09 min  charger idle  none",
+                "right  3.88 V  -31 mA   30.5 °C  n/a   3.88 V  2 h 10 min  charger idle  none",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_half_with_no_estimate_the_column_asks_for_says_n_a() {
+        // Heading for full, and the half only knows how long until empty.
+        let mut detail = filling(4020, 512, 2850, 80);
+        detail.ttf_min = None;
+        detail.tte_min = Some(45);
+        assert_eq!(Estimate::Full.minutes(&detail), None);
+        assert_eq!(Estimate::Empty.minutes(&detail), Some(45));
+
+        // And a finished charge is not filling, whatever the gauge carries.
+        let mut done = filling(4170, 0, 3520, 30);
+        done.charger = Some(ChargerStatus::from_bits(0x01 | 0x02));
+        assert_eq!(Estimate::Full.minutes(&done), None);
+    }
+
+    #[test]
+    fn an_estimate_under_a_minute_is_not_zero_minutes() {
+        assert_eq!(duration(0), "under a minute");
+
+        let detail = filling(4200, 131, 3500, 0);
+        assert_eq!(
+            detail_row("left", &detail, Estimate::Full, Some(true), None)[6],
+            "under a minute"
+        );
+    }
+
+    #[test]
+    fn a_board_is_filling_while_anything_says_it_is_on_a_source() {
+        let idle = running_down(4020, -45, 2850, 750);
+        let attached = off_a_source(4020);
+
+        // Nothing attached and no phase anywhere.
+        assert_eq!(
+            heading_for([(&idle, Some(attached)), (&idle, Some(attached))]),
+            Estimate::Empty
+        );
+        // One half's rails say an input is attached.
+        assert_eq!(
+            heading_for([(&idle, Some(attached)), (&idle, Some(rails()))]),
+            Estimate::Full
+        );
+        // Or one half's charger names a phase, with no rails read at all.
+        let charging = filling(4020, 512, 2850, 80);
+        assert_eq!(
+            heading_for([(&idle, None), (&charging, None)]),
+            Estimate::Full
+        );
+        assert_eq!(heading_for([(&idle, None), (&idle, None)]), Estimate::Empty);
+        // A completed charge is a board on a source too.
+        let mut done = charging;
+        done.charger = Some(ChargerStatus::from_bits(0x01 | 0x02));
+        assert_eq!(heading_for([(&idle, None), (&done, None)]), Estimate::Full);
+    }
+
+    #[test]
+    fn a_half_names_only_the_two_rails_it_measured() {
+        let detail = filling(3990, 161, 3620, 386);
+        let row = detail_row("right", &detail, Estimate::Full, Some(true), Some(rails()));
+        assert_eq!(row[4], "5.03 V");
+        assert_eq!(row[5], "4.96 V");
+
+        // What the input regulator, the charger register, the boost and the
+        // reduced-charge flag say is decoded and never printed.
+        let line = table(&[row]).remove(0);
+        for word in ["in:", "charger enabled", "boost", "charge reduced"] {
+            assert!(!line.contains(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_half_with_nothing_attached_names_only_its_system_rail() {
+        // On battery the input rail reads zero because there is no input, so
+        // its column is n/a and the system rail stays.
+        let detail = running_down(3990, -45, 3620, 386);
+        let row = detail_row("left", &detail, Estimate::Empty, None, Some(off_a_source(4150)));
+        assert_eq!(row[4], "n/a");
+        assert_eq!(row[5], "4.15 V");
+    }
+
+    #[test]
+    fn a_half_on_an_input_that_is_not_carrying_still_names_it() {
+        // Attached and suspended, or attached and held at its limit: there is
+        // an input to measure, so the column carries it.
+        let detail = filling(3990, 161, 3620, 386);
+        for raw in [0x01, 0x11, 0x03] {
+            let attached = PmicRails {
+                vbusin: VbusInStatus::from_bits(raw),
+                ..rails()
+            };
+            let row = detail_row("right", &detail, Estimate::Full, Some(true), Some(attached));
+            assert_eq!(row[4], "5.03 V", "{raw:#04x}");
+        }
+    }
+
+    #[test]
+    fn a_column_is_as_wide_as_the_widest_thing_in_it() {
+        let rows = [
+            vec!["".into(), "cell".into(), "fault".into()],
+            vec!["left".into(), "4.02 V".into(), "none".into()],
+            vec!["right".into(), "n/a".into(), "trickle timeout".into()],
+        ];
+        assert_eq!(
+            table(&rows),
+            vec![
+                "       cell    fault",
+                "left   4.02 V  none",
+                "right  n/a     trickle timeout",
+            ]
+        );
+        // Nothing trails the last column, whatever is under it.
+        for line in table(&rows) {
+            assert_eq!(line.trim_end(), line);
+        }
+    }
+
+    #[test]
+    fn a_half_with_no_cell_says_so_only_on_a_source() {
+        // The bit reads clear on battery power with a healthy cell, so it is
+        // only worth saying when the half is known to have USB.
+        let no_phase = ChargerStatus::from_bits(0x00);
+        assert_eq!(phase(no_phase, Some(true)), "no battery detected");
+        assert_eq!(phase(no_phase, None), "charger idle");
+        assert_eq!(phase(no_phase, Some(false)), "charger idle");
+
+        // Off a source the phase bits are read as they stand.
+        let charging = ChargerStatus::from_bits(0x08);
+        assert_eq!(phase(charging, Some(true)), "no battery detected");
+        assert_eq!(phase(charging, None), "constant current");
+        assert_eq!(phase(charging, Some(false)), "constant current");
+    }
+
+    #[test]
+    fn a_reading_the_board_did_not_take_keeps_its_column() {
+        // Every column n/a, so the row still lines up under a half that
+        // answered — and a flat cell is never invented from a missing one.
+        assert_eq!(
+            detail_row("right", &BatteryDetail::default(), Estimate::Full, None, None),
+            vec!["right", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"]
+        );
+    }
+
+    #[test]
+    fn hours_only_appear_once_there_is_one() {
+        assert_eq!(duration(0), "under a minute");
+        assert_eq!(duration(59), "59 min");
+        assert_eq!(duration(60), "1 h 00 min");
+        assert_eq!(duration(125), "2 h 05 min");
+        assert_eq!(duration(1439), "23 h 59 min");
+    }
+
+    #[test]
+    fn the_charger_phase_is_named() {
+        let phases = [
+            (0x02, "charge complete"),
+            (0x04, "trickle charging"),
+            (0x08, "constant current"),
+            (0x10, "constant voltage"),
+            (0x20, "recharging"),
+            (0x40, "paused (die temperature)"),
+            (0x00, "charger idle"),
+            (0x80, "charger idle"), // supplementing is not a phase
+        ];
+        for (raw, expected) in phases {
+            assert_eq!(
+                phase(ChargerStatus::from_bits(raw | 0x01), Some(true)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_latched_fault_says_what_it_was() {
+        // Under a heading of its own, so a clear register is "none" rather
+        // than a sentence.
+        assert_eq!(fault(ChargerFault::default()), "none");
+        assert_eq!(
+            fault(ChargerFault {
+                reason: 0x40,
+                sensor: 0x00
+            }),
+            "trickle timeout"
+        );
+        assert_eq!(
+            fault(ChargerFault {
+                reason: 0x20,
+                sensor: 0x08
+            }),
+            "charge timeout (NTC hot)"
+        );
+        // A bit with no name is still a fault, and says which one it was.
+        assert_eq!(
+            fault(ChargerFault {
+                reason: 0x80,
+                sensor: 0x00
+            }),
+            "0x80"
+        );
+    }
+
+    fn radio(left_confirmed: bool, right: bool) -> RadioInfo {
+        use zapp_core::hid::{LeftRadio, RadioVersion, RightRadio};
+        RadioInfo {
+            left: Some(LeftRadio {
+                version: RadioVersion {
+                    major: 0,
+                    minor: 1,
+                    revision: 20,
+                    build: 7,
+                },
+                hash: [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71],
+                confirmed: left_confirmed,
+            }),
+            right: right.then_some(RightRadio {
+                tag: [0x4e, 0x5f, 0x6a, 0x7b, 0x8c, 0x9d, 0x0e, 0x1f],
+                confirmed: true,
+            }),
+        }
+    }
+
+    fn radio_release(version: &str) -> Release {
+        Release {
+            version: version.into(),
+            notes: None,
+            url: "u".into(),
+            signature: "s".into(),
+        }
+    }
+
+    #[test]
+    fn each_half_s_radio_firmware_is_named() {
+        assert_eq!(
+            radio_line(&radio(true, true), false),
+            "radio    · left 0.1.20 · 0a1b2c3d · right 4e5f6a7b"
+        );
+        assert_eq!(
+            radio_line(&radio(true, true), true),
+            "radio    · left 0.1.20+7 · 0a1b2c3d4e5f6071 · confirmed · right 4e5f6a7b8c9d0e1f · confirmed"
+        );
+        assert_eq!(
+            radio_line(&radio(false, false), false),
+            "radio    · left 0.1.20 · 0a1b2c3d · not confirmed · right unknown"
+        );
+        assert_eq!(radio_line(&RadioInfo::default(), true), "radio    · unknown");
+    }
+
+    #[test]
+    fn a_newer_radio_release_is_offered() {
+        let board = radio(true, true);
+        assert_eq!(
+            radio_offer(&board, &radio_release("0.2.0"), Transport::Usb).as_deref(),
+            Some("Radio firmware 0.2.0 available. Run `zapp update radio`.")
+        );
+        assert_eq!(
+            radio_offer(&board, &radio_release("0.2.0"), Transport::Bluetooth).as_deref(),
+            Some("Radio firmware 0.2.0 available. Connect the USB cable and run `zapp update radio`.")
+        );
+        assert_eq!(radio_offer(&board, &radio_release("0.1.20"), Transport::Usb), None);
+        assert_eq!(radio_offer(&board, &radio_release("0.1.19"), Transport::Usb), None);
+        assert_eq!(
+            radio_offer(&RadioInfo::default(), &radio_release("0.2.0"), Transport::Usb),
+            None
+        );
+    }
+
+    #[test]
+    fn a_board_that_cannot_tell_never_asks_the_feed() {
+        // The feed holds a release; an unknown board must not reach it.
+        let mut feed = RadioFeed(Some(Some(radio_release("9.9.9"))));
+        assert_eq!(
+            radio_lines(&RadioInfo::default(), false, &mut feed, Transport::Usb),
+            vec!["radio    · unknown".to_string()]
+        );
+        let mut offline = RadioFeed(Some(None));
+        assert_eq!(radio_lines(&radio(true, true), false, &mut offline, Transport::Usb).len(), 1);
+        assert_eq!(radio_lines(&radio(true, true), false, &mut feed, Transport::Usb).len(), 2);
+    }
+
+    #[test]
+    fn a_board_that_said_nothing_says_nothing() {
+        assert_eq!(charge(Battery::default(), None), "");
+        // Including one connected but unreadable, which must not read as flat.
+        let battery = Battery {
+            keyboard: Level::Unknown,
+            ..Battery::default()
+        };
+        assert_eq!(charge(battery, None), "");
+    }
 }

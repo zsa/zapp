@@ -1,0 +1,32 @@
+[package]
+name = "zapp-wired"
+version = "0.1.0"
+edition = "2021"
+description = "Wired nRF updates over ignition's vendor interface"
+
+[dependencies]
+# MCUboot's serial recovery is line-based and base64, which is the one thing
+# in the codec worth taking from a crate rather than writing again.
+base64 = "0.22"
+log = "0.4"
+nusb = "0.2"
+thiserror = "2"
+# Telling a permission refusal apart from other open failures.
+zapp-core = { path = "../zapp-core" }
+zapp-smp = { path = "../zapp-smp" }
+
+[dev-dependencies]
+# The loopback stack drives zapp-smp's in-memory device, so the tests need it
+# compiled into the library.
+zapp-smp = { path = "../zapp-smp", features = ["test-double"] }
+# For examples/flash_left, the bring-up tool. Nothing in the library needs
+# these: indicatif draws the bar, and env_logger is what makes RUST_LOG=trace
+# show the lines going over the wire — which is the whole point of having the
+# example.
+env_logger = "0.11"
+indicatif = "0.17"
+
+[features]
+# Makes the loopback stack part of the library for callers other than this
+# crate's own tests.
+loopback = ["zapp-smp/test-double"]

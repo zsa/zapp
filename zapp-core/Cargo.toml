@@ -9,3 +9,4 @@ hidapi = "2"
 log = "0.4"
 nusb = "0.2"
 thiserror = "2"
+zapp-hid-proto = { path = "../zapp-hid-proto" }

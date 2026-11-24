@@ -1,0 +1,26 @@
+[package]
+name = "zapp-smp"
+version = "0.1.0"
+edition = "2021"
+description = "mcumgr SMP client for ZSA keyboards, over any transport"
+
+[dependencies]
+# SMP payloads are CBOR. Value-level, so a byte string stays a byte string
+# rather than becoming an array of integers the way a derived Serialize would.
+ciborium = "0.2"
+# An operator-supplied pairing key comes in as hex; a generated one is printed
+# as a fingerprint the same way.
+hex = "0.4"
+log = "0.4"
+# The system CSPRNG behind a freshly generated pairing key.
+rand = "0.9"
+# The image upload announces a SHA-256 of the image in its first request, and
+# the pairing key is fingerprinted the same way.
+sha2 = "0.10"
+thiserror = "2"
+zapp-core = { path = "../zapp-core" }
+
+[features]
+# Compiles the in-memory SMP device into the library, so another crate can
+# drive its own stack through it.
+test-double = []
