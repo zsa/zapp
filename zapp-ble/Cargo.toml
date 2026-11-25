@@ -3,13 +3,15 @@ name = "zapp-ble"
 version = "0.1.0"
 edition = "2021"
 description = "BLE discovery for ZSA keyboards"
+repository = "https://github.com/zsa/zapp"
+license-file = "../LICENSE.md"
 
 [dependencies]
 log = "0.4"
 thiserror = "2"
-zapp-core = { path = "../zapp-core" }
-zapp-hid-proto = { path = "../zapp-hid-proto" }
-zapp-smp = { path = "../zapp-smp" }
+zapp-core = { version = "0.1.1", path = "../zapp-core" }
+zapp-hid-proto = { version = "0.1.0", path = "../zapp-hid-proto" }
+zapp-smp = { version = "0.1.0", path = "../zapp-smp" }
 
 [dev-dependencies]
 # The mtu_probe example builds its own CBOR echo payloads.

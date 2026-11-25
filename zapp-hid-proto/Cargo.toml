@@ -3,5 +3,7 @@ name = "zapp-hid-proto"
 version = "0.1.0"
 edition = "2024"
 description = "Wire format of the ZSA 0xFF60 raw-HID protocol, free of any transport."
+repository = "https://github.com/zsa/zapp"
+license-file = "../LICENSE.md"
 
 [dependencies]

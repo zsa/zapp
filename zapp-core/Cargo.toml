@@ -2,6 +2,9 @@
 name = "zapp-core"
 version = "0.1.1"
 edition = "2024"
+description = "USB discovery, firmware flashing and the raw-HID connection for ZSA keyboards"
+repository = "https://github.com/zsa/zapp"
+license-file = "../LICENSE.md"
 
 [dependencies]
 futures-lite = "2"
@@ -9,4 +12,4 @@ hidapi = "2"
 log = "0.4"
 nusb = "0.2"
 thiserror = "2"
-zapp-hid-proto = { path = "../zapp-hid-proto" }
+zapp-hid-proto = { version = "0.1.0", path = "../zapp-hid-proto" }

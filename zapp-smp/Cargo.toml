@@ -3,6 +3,8 @@ name = "zapp-smp"
 version = "0.1.0"
 edition = "2021"
 description = "mcumgr SMP client for ZSA keyboards, over any transport"
+repository = "https://github.com/zsa/zapp"
+license-file = "../LICENSE.md"
 
 [dependencies]
 # SMP payloads are CBOR. Value-level, so a byte string stays a byte string
@@ -18,7 +20,7 @@ rand = "0.9"
 # the pairing key is fingerprinted the same way.
 sha2 = "0.10"
 thiserror = "2"
-zapp-core = { path = "../zapp-core" }
+zapp-core = { version = "0.1.1", path = "../zapp-core" }
 
 [features]
 # Compiles the in-memory SMP device into the library, so another crate can
