@@ -3,6 +3,7 @@
   rustPlatform,
   pkg-config,
   libusb1,
+  cacert,
   stdenv,
 }:
 let
@@ -16,6 +17,11 @@ let
         ../zapp
         ../zapp-core
         ../zapp-oryx
+        ../zapp-hid-proto
+        ../zapp-smp
+        ../zapp-update
+        ../zapp-wired
+        ../zapp-ble
       ]
       ++ lib.optional (!stdenv.isDarwin) ../udev
     );
@@ -29,7 +35,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ libusb1 ];
+  buildInputs = [ libusb1 cacert ];
 
   postInstall = lib.optionalString stdenv.isLinux ''
     install -Dm644 udev/50-zsa.rules $out/lib/udev/rules.d/50-zsa.rules
